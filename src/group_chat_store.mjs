@@ -1,0 +1,4307 @@
+import { createHash, randomBytes } from 'node:crypto';
+import pg from 'pg';
+
+import { HttpError } from './errors.mjs';
+import { runMigrations } from './migrations.mjs';
+
+const GENERATION_LEASE_DURATION_MS = 2 * 60 * 1000;
+const AGENT_RUNTIME_LEASE_DURATION_MS = 60 * 1000;
+const AGENT_MESSAGES_PER_CYCLE_LIMIT = 1;
+const ABSOLUTE_CONSECUTIVE_AI_LIMIT = 20;
+const REGENERATABLE_GENERATION_STATUSES = new Set([
+  'discarded',
+  'failed',
+  'cancelled',
+  'expired',
+]);
+
+function newId(prefix) {
+  return `${prefix}_${randomBytes(12).toString('base64url')}`;
+}
+
+function hash(value) {
+  return createHash('sha256').update(value).digest('hex');
+}
+
+function clone(value) {
+  return JSON.parse(JSON.stringify(value));
+}
+
+function iso(value) {
+  return value instanceof Date ? value.toISOString() : new Date(value).toISOString();
+}
+
+function safeInteger(value, label) {
+  const parsed = typeof value === 'number' ? value : Number(value);
+  if (!Number.isSafeInteger(parsed) || parsed < 0) {
+    throw new Error(`${label} is outside JavaScript's safe integer range`);
+  }
+  return parsed;
+}
+
+function publicUser(user) {
+  return {
+    userId: user.id,
+    handle: user.handle,
+    displayName: user.displayName,
+    avatarResourceId: user.avatarResourceId,
+    profileRevision: user.profileRevision,
+  };
+}
+
+function authenticatedUser(user, deviceId = user.deviceId) {
+  return { ...publicUser(user), deviceId };
+}
+
+function roomSnapshot(room) {
+  return {
+    id: room.id,
+    ownerUserId: room.ownerUserId,
+    title: room.title,
+    lastSeq: room.lastSeq,
+    revision: room.revision,
+    historyVisibility: 'after_join',
+    createdAt: room.createdAt,
+    updatedAt: room.updatedAt,
+  };
+}
+
+function membershipSnapshot(user, membership, includeReadSeq) {
+  return {
+    userId: membership.userId,
+    role: membership.role,
+    joinedSeq: membership.joinedSeq,
+    ...(includeReadSeq ? { readSeq: membership.readSeq } : {}),
+    displayName: user.displayName,
+    avatarResourceId: user.avatarResourceId,
+  };
+}
+
+function inviteSummary(invite) {
+  return {
+    id: invite.id,
+    roomId: invite.roomId,
+    createdByUserId: invite.createdByUserId,
+    expiresAt: invite.expiresAt,
+    maxUses: invite.maxUses,
+    remainingUses: invite.remainingUses,
+    createdAt: invite.createdAt,
+  };
+}
+
+function agentProfileSnapshot(profile) {
+  return {
+    id: profile.id,
+    ownerUserId: profile.ownerUserId,
+    displayName: profile.displayName,
+    avatarResourceId: profile.avatarResourceId,
+    shortBio: profile.shortBio,
+    profileRevision: profile.profileRevision,
+    createdAt: profile.createdAt,
+    updatedAt: profile.updatedAt,
+  };
+}
+
+function roomAgentBindingSnapshot(binding) {
+  return {
+    bindingId: binding.id,
+    roomId: binding.roomId,
+    ownerUserId: binding.ownerUserId,
+    agentProfileId: binding.agentProfileId,
+    participationMode: binding.participationMode,
+    publishMode: binding.publishMode,
+    triggerScope: binding.triggerScope,
+    preferredRuntimeDeviceId: binding.preferredRuntimeDeviceId,
+    generationLimitPer24h: binding.generationLimitPer24h,
+    policyRevision: binding.policyRevision,
+    updatedAt: binding.updatedAt,
+  };
+}
+
+function publicRoomAgentBindingSnapshot(binding, profileRevision) {
+  return {
+    bindingId: binding.id,
+    roomId: binding.roomId,
+    ownerUserId: binding.ownerUserId,
+    agentProfileId: binding.agentProfileId,
+    agentProfileRevision: profileRevision,
+    participationMode: binding.participationMode,
+    publishMode: binding.publishMode,
+    triggerScope: binding.triggerScope,
+    policyRevision: binding.policyRevision,
+    updatedAt: binding.updatedAt,
+  };
+}
+
+function agentRuntimeSnapshot(runtime) {
+  return {
+    bindingId: runtime.bindingId,
+    deviceId: runtime.deviceId,
+    readiness: runtime.readiness,
+    readyForBindingPolicyRevision: runtime.readyForBindingPolicyRevision,
+    runtimeCapabilitiesVersion: runtime.runtimeCapabilitiesVersion,
+    localConfigRevision: runtime.localConfigRevision,
+    updatedAt: runtime.updatedAt,
+  };
+}
+
+function agentActivationSnapshot(binding, profile) {
+  return {
+    roomId: binding.roomId,
+    bindingId: binding.id,
+    agentProfileId: profile.id,
+    profileRevision: profile.profileRevision,
+    policyRevision: binding.policyRevision,
+    deviceId: binding.runtimeLeaseDeviceId,
+    leaseId: binding.runtimeLeaseId,
+    leaseEpoch: binding.runtimeLeaseEpoch,
+    leaseExpiresAt: binding.runtimeLeaseExpiresAt,
+  };
+}
+
+function activeRuntimeLease(binding, now) {
+  return Boolean(
+    binding.runtimeLeaseDeviceId &&
+    binding.runtimeLeaseId &&
+    binding.runtimeLeaseExpiresAt &&
+    Date.parse(binding.runtimeLeaseExpiresAt) > now.getTime()
+  );
+}
+
+function acquireRuntimeLease(binding, user, now) {
+  if (activeRuntimeLease(binding, now) && binding.runtimeLeaseDeviceId !== user.deviceId) {
+    throw new HttpError(409, 'lease_conflict', 'Agent runtime lease is held by another device');
+  }
+  if (!activeRuntimeLease(binding, now)) {
+    binding.runtimeLeaseDeviceId = user.deviceId;
+    binding.runtimeLeaseId = newId('agent-lease');
+    binding.runtimeLeaseEpoch += 1;
+  }
+  binding.preferredRuntimeDeviceId = user.deviceId;
+  binding.runtimeLeaseExpiresAt = new Date(
+    now.getTime() + AGENT_RUNTIME_LEASE_DURATION_MS,
+  ).toISOString();
+}
+
+function requireRuntimeLease(binding, user, leaseId, leaseEpoch, now, { active = true } = {}) {
+  if (
+    binding.runtimeLeaseDeviceId !== user.deviceId ||
+    binding.runtimeLeaseId !== leaseId ||
+    binding.runtimeLeaseEpoch !== leaseEpoch ||
+    (active && !activeRuntimeLease(binding, now))
+  ) {
+    throw new HttpError(409, 'lease_conflict', 'Agent runtime lease is not current');
+  }
+}
+
+function requireEligibleAutomaticTriggers({
+  triggerScope,
+  agentProfileId,
+  triggers,
+  humanTriggersOnly = false,
+}) {
+  const ineligible = triggers.find((message) => {
+    if (humanTriggersOnly && message.sender?.kind !== 'human') return true;
+    if (triggerScope === 'allMessages') return false;
+    if (message.sender?.kind !== 'human') return true;
+    if (triggerScope === 'allHumanMessages') return false;
+    return !message.mentions?.some(
+      (mention) => mention.kind === 'agent' && mention.targetId === agentProfileId,
+    );
+  });
+  if (ineligible) {
+    throw new HttpError(
+      409,
+      'trigger_not_eligible',
+      'Trigger message is not eligible for this agent policy; stop and wait for a new eligible human message',
+    );
+  }
+}
+
+function requireAgentLoopCapacity({ messages, bindings, roomId, ownerUserId }) {
+  let cycleStartIndex = -1;
+  for (let index = messages.length - 1; index >= 0; index -= 1) {
+    if (messages[index].sender.kind === 'human') {
+      cycleStartIndex = index;
+      break;
+    }
+  }
+  const cycleAgentMessages = messages.slice(cycleStartIndex + 1).filter(
+    (message) => message.sender.kind === 'agent',
+  );
+  const ownerMessageCount = cycleAgentMessages.filter(
+    (message) => message.sender.userId === ownerUserId,
+  ).length;
+  if (ownerMessageCount >= AGENT_MESSAGES_PER_CYCLE_LIMIT) {
+    throw new HttpError(
+      409,
+      'agent_loop_limit_reached',
+      'Agent reply already published for the current human cycle; stop the current assistant turn',
+    );
+  }
+  const enabledAgentCount = [...bindings.values()].filter(
+    (binding) =>
+      binding.roomId === roomId && binding.participationMode === 'automatic',
+  ).length;
+  const roomLimit = Math.min(
+    Math.max(enabledAgentCount, 1) * AGENT_MESSAGES_PER_CYCLE_LIMIT,
+    ABSOLUTE_CONSECUTIVE_AI_LIMIT,
+  );
+  if (cycleAgentMessages.length >= roomLimit) {
+    throw new HttpError(
+      409,
+      'agent_loop_limit_reached',
+      'Room AI message limit reached for the current human cycle',
+    );
+  }
+}
+
+function generationRequestSnapshot(request) {
+  return {
+    id: request.id,
+    roomId: request.roomId,
+    bindingId: request.bindingId,
+    ownerUserId: request.ownerUserId,
+    source: request.source,
+    ...(request.clientGenerationRequestId
+      ? { clientGenerationRequestId: request.clientGenerationRequestId }
+      : {}),
+    ...(request.triggerBatchId ? { triggerBatchId: request.triggerBatchId } : {}),
+    triggerMessageIds: clone(request.triggerMessageIds),
+    triggerFromSeq: request.triggerFromSeq,
+    triggerThroughSeq: request.triggerThroughSeq,
+    contextThroughSeq: request.contextThroughSeq,
+    minVisibleSeq: request.minVisibleSeq,
+    historyPolicyRevision: request.historyPolicyRevision,
+    bindingPolicyRevision: request.bindingPolicyRevision,
+    status: request.status,
+    requestVersion: request.requestVersion,
+    ...(request.claimedDeviceId
+      ? { claimedDeviceId: request.claimedDeviceId }
+      : {}),
+    ...(request.leaseId ? { leaseId: request.leaseId } : {}),
+    leaseEpoch: request.leaseEpoch,
+    ...(request.leaseExpiresAt
+      ? { leaseExpiresAt: request.leaseExpiresAt }
+      : {}),
+    ...(request.draftDeviceId ? { draftDeviceId: request.draftDeviceId } : {}),
+    attempt: request.attempt,
+    ...(request.supersedesRequestId
+      ? { supersedesRequestId: request.supersedesRequestId }
+      : {}),
+    createdAt: request.createdAt,
+    updatedAt: request.updatedAt,
+  };
+}
+
+function activeInvite(invite, now) {
+  return !invite.revokedAt && invite.remainingUses > 0 &&
+    Date.parse(invite.expiresAt) > now.getTime();
+}
+
+function idempotencyConflict() {
+  return new HttpError(
+    409,
+    'idempotency_conflict',
+    'Idempotency key was reused with different input',
+  );
+}
+
+function requireOwnedAvatar(avatarResourceId) {
+  if (avatarResourceId !== null) {
+    throw new HttpError(
+      403,
+      'forbidden',
+      'Avatar resource ownership cannot be verified',
+    );
+  }
+}
+
+function requireMembership(room, userId) {
+  const membership = room.members.get(userId);
+  if (!membership) throw new HttpError(403, 'forbidden', 'Room membership required');
+  return membership;
+}
+
+function requireInviteManager(room, userId) {
+  const membership = requireMembership(room, userId);
+  if (membership.role !== 'owner' && membership.role !== 'admin') {
+    throw new HttpError(403, 'forbidden', 'Owner or admin role required');
+  }
+  return membership;
+}
+
+function requireGenerationVersion(request, expectedRequestVersion) {
+  if (request.requestVersion !== expectedRequestVersion) {
+    throw new HttpError(
+      409,
+      'request_version_conflict',
+      'Generation request version does not match',
+    );
+  }
+}
+
+function requireGenerationStatus(request, expectedStatus) {
+  if (request.status !== expectedStatus) {
+    throw new HttpError(
+      409,
+      'generation_state_conflict',
+      `Generation request must be ${expectedStatus}`,
+    );
+  }
+}
+
+function requireGenerationLease(request, user, leaseId, leaseEpoch, now) {
+  if (
+    request.claimedDeviceId !== user.deviceId ||
+    request.leaseId !== leaseId ||
+    request.leaseEpoch !== leaseEpoch ||
+    !request.leaseExpiresAt ||
+    Date.parse(request.leaseExpiresAt) <= now.getTime()
+  ) {
+    throw new HttpError(409, 'lease_conflict', 'Generation lease is not current');
+  }
+}
+
+export class MemoryGroupChatStore {
+  constructor({ clock = () => new Date() } = {}) {
+    this.clock = clock;
+    this.usersByDeviceId = new Map();
+    this.userDevices = new Set();
+    this.userIdByNicknameKey = new Map();
+    this.usersById = new Map();
+    this.sessions = new Map();
+    this.rooms = new Map();
+    this.invites = new Map();
+    this.messagesByRoom = new Map();
+    this.agentProfiles = new Map();
+    this.roomAgentBindings = new Map();
+    this.agentRuntimes = new Map();
+    this.generationRequests = new Map();
+    this.idempotency = new Map();
+    this.outbox = [];
+    this.nextOutboxId = 1;
+  }
+
+  async health() {}
+
+  async close() {}
+
+  _replay(principalId, operation, key, requestFingerprint) {
+    const recordKey = `${principalId}:${operation}:${key}`;
+    const record = this.idempotency.get(recordKey);
+    if (!record) return { recordKey };
+    if (record.requestFingerprint !== requestFingerprint) throw idempotencyConflict();
+    return { recordKey, response: clone(record.response) };
+  }
+
+  _saveReplay(recordKey, requestFingerprint, status, body) {
+    this.idempotency.set(recordKey, {
+      requestFingerprint,
+      response: { status, body: body === undefined ? null : clone(body) },
+    });
+  }
+
+  _room(roomId) {
+    const room = this.rooms.get(roomId);
+    if (!room) throw new HttpError(404, 'resource_not_found', 'Room not found');
+    return room;
+  }
+
+  _agentProfile(agentProfileId) {
+    const profile = this.agentProfiles.get(agentProfileId);
+    if (!profile) {
+      throw new HttpError(404, 'resource_not_found', 'Agent profile not found');
+    }
+    return profile;
+  }
+
+  _bindingKey(roomId, ownerUserId) {
+    return `${roomId}:${ownerUserId}`;
+  }
+
+  _bindingById(bindingId) {
+    const binding = [...this.roomAgentBindings.values()].find(
+      (candidate) => candidate.id === bindingId,
+    );
+    if (!binding) {
+      throw new HttpError(409, 'request_version_conflict', 'Agent binding is no longer current');
+    }
+    return binding;
+  }
+
+  _runtimeKey(bindingId, deviceId) {
+    return `${bindingId}:${deviceId}`;
+  }
+
+  _generationRequest(generationRequestId) {
+    const request = this.generationRequests.get(generationRequestId);
+    if (!request) {
+      throw new HttpError(404, 'resource_not_found', 'Generation request not found');
+    }
+    return request;
+  }
+
+  _requireReadyRuntime(binding, user) {
+    const runtime = this.agentRuntimes.get(this._runtimeKey(binding.id, user.deviceId));
+    if (
+      !runtime ||
+      runtime.readiness !== 'ready' ||
+      runtime.readyForBindingPolicyRevision !== binding.policyRevision ||
+      binding.preferredRuntimeDeviceId !== user.deviceId ||
+      binding.runtimeLeaseDeviceId !== user.deviceId ||
+      !activeRuntimeLease(binding, this.clock())
+    ) {
+      throw new HttpError(409, 'runtime_not_ready', 'Agent runtime is not ready');
+    }
+    return runtime;
+  }
+
+  _requireGenerationContext(request, user, { ready = false } = {}) {
+    if (request.ownerUserId !== user.userId) {
+      throw new HttpError(403, 'forbidden', 'Generation request owner required');
+    }
+    const room = this._room(request.roomId);
+    const membership = requireMembership(room, user.userId);
+    const binding = this._bindingById(request.bindingId);
+    if (
+      binding.roomId !== request.roomId ||
+      binding.ownerUserId !== user.userId ||
+      binding.participationMode === 'off'
+    ) {
+      throw new HttpError(409, 'generation_state_conflict', 'Agent binding is disabled');
+    }
+    if (binding.policyRevision !== request.bindingPolicyRevision) {
+      throw new HttpError(409, 'request_version_conflict', 'Binding policy has changed');
+    }
+    if (ready) this._requireReadyRuntime(binding, user);
+    return { room, membership, binding };
+  }
+
+  async createGuestSession({ deviceId, displayName }) {
+    const nicknameKey = displayName.normalize('NFKC').toLowerCase();
+    const existing = this.usersByDeviceId.get(deviceId);
+    const nicknameOwnerId = this.userIdByNicknameKey.get(nicknameKey);
+    if (nicknameOwnerId && nicknameOwnerId !== existing?.id) {
+      throw new HttpError(409, 'conflict', 'Nickname is already in use');
+    }
+    let user = existing;
+    if (user) {
+      if (user.displayName !== displayName) {
+        this.userIdByNicknameKey.delete(user.nicknameKey);
+        user.displayName = displayName;
+        user.nicknameKey = nicknameKey;
+        user.profileRevision += 1;
+      }
+    } else {
+      user = {
+        id: newId('usr'),
+        deviceId,
+        handle: `guest_${hash(deviceId).slice(0, 12)}`,
+        displayName,
+        nicknameKey,
+        avatarResourceId: null,
+        profileRevision: 1,
+      };
+      this.usersByDeviceId.set(deviceId, user);
+      this.usersById.set(user.id, user);
+    }
+    this.userDevices.add(`${user.id}:${deviceId}`);
+    this.userIdByNicknameKey.set(nicknameKey, user.id);
+    const accessToken = `dev_${randomBytes(24).toString('base64url')}`;
+    this.sessions.set(hash(accessToken), { userId: user.id, deviceId });
+    return { accessToken, tokenType: 'Bearer', user: publicUser(user) };
+  }
+
+  async authenticate(accessToken) {
+    const session = this.sessions.get(hash(accessToken));
+    const user = session ? this.usersById.get(session.userId) : null;
+    if (!user) throw new HttpError(401, 'session_revoked', 'Session is not valid');
+    return authenticatedUser(user, session.deviceId);
+  }
+
+  async listRooms(userId) {
+    return [...this.rooms.values()]
+      .filter((room) => room.members.has(userId))
+      .map(roomSnapshot);
+  }
+
+  async listRoomsPage({ userId, afterRoomId, limit }) {
+    const page = [...this.rooms.values()]
+      .filter((room) => room.members.has(userId))
+      .filter((room) => afterRoomId === null || room.id > afterRoomId)
+      .sort((left, right) =>
+        left.id < right.id ? -1 : left.id > right.id ? 1 : 0)
+      .slice(0, limit + 1);
+    const items = page.slice(0, limit).map(roomSnapshot);
+    return {
+      items,
+      nextRoomId: page.length > limit ? items[items.length - 1].id : null,
+    };
+  }
+
+  async createAgentProfile({
+    userId,
+    displayName,
+    avatarResourceId,
+    shortBio,
+    key,
+    requestFingerprint,
+  }) {
+    requireOwnedAvatar(avatarResourceId);
+    const replay = this._replay(userId, 'createAgentProfile', key, requestFingerprint);
+    if (replay.response) return replay.response;
+    const createdAt = this.clock().toISOString();
+    const profile = {
+      id: newId('agent'),
+      ownerUserId: userId,
+      displayName,
+      avatarResourceId,
+      shortBio,
+      profileRevision: 1,
+      createdAt,
+      updatedAt: createdAt,
+    };
+    this.agentProfiles.set(profile.id, profile);
+    const body = agentProfileSnapshot(profile);
+    this._saveReplay(replay.recordKey, requestFingerprint, 201, body);
+    return { status: 201, body };
+  }
+
+  async getAgentProfile({ agentProfileId }) {
+    return agentProfileSnapshot(this._agentProfile(agentProfileId));
+  }
+
+  async updateAgentProfile({
+    userId,
+    agentProfileId,
+    expectedProfileRevision,
+    changes,
+    key,
+    requestFingerprint,
+  }) {
+    const profile = this._agentProfile(agentProfileId);
+    if (profile.ownerUserId !== userId) {
+      throw new HttpError(403, 'forbidden', 'Agent profile owner required');
+    }
+    const replay = this._replay(userId, 'updateAgentProfile', key, requestFingerprint);
+    if (replay.response) return replay.response;
+    if (expectedProfileRevision !== profile.profileRevision) {
+      throw new HttpError(409, 'request_version_conflict', 'Profile revision does not match');
+    }
+    if (Object.hasOwn(changes, 'avatarResourceId')) {
+      requireOwnedAvatar(changes.avatarResourceId);
+    }
+    if (Object.hasOwn(changes, 'displayName')) profile.displayName = changes.displayName;
+    if (Object.hasOwn(changes, 'avatarResourceId')) {
+      profile.avatarResourceId = changes.avatarResourceId;
+    }
+    if (Object.hasOwn(changes, 'shortBio')) profile.shortBio = changes.shortBio;
+    profile.profileRevision += 1;
+    profile.updatedAt = this.clock().toISOString();
+    const body = agentProfileSnapshot(profile);
+    this._saveReplay(replay.recordKey, requestFingerprint, 200, body);
+    return { status: 200, body };
+  }
+
+  async createRoom({ userId, title, key, requestFingerprint }) {
+    const replay = this._replay(userId, 'createRoom', key, requestFingerprint);
+    if (replay.response) return replay.response;
+    const createdAt = this.clock().toISOString();
+    const room = {
+      id: newId('room'),
+      ownerUserId: userId,
+      title,
+      lastSeq: 0,
+      revision: 1,
+      createdAt,
+      updatedAt: createdAt,
+      members: new Map([[userId, { userId, role: 'owner', joinedSeq: 0, readSeq: 0 }]]),
+    };
+    this.rooms.set(room.id, room);
+    this.messagesByRoom.set(room.id, []);
+    const body = roomSnapshot(room);
+    this._saveReplay(replay.recordKey, requestFingerprint, 201, body);
+    return { status: 201, body };
+  }
+
+  async getRoom({ userId, roomId }) {
+    const room = this._room(roomId);
+    requireMembership(room, userId);
+    return roomSnapshot(room);
+  }
+
+  async getMembership({ userId, roomId }) {
+    const room = this._room(roomId);
+    const membership = requireMembership(room, userId);
+    return membershipSnapshot(this.usersById.get(userId), membership, true);
+  }
+
+  async listMembers({ userId, roomId }) {
+    const room = this._room(roomId);
+    requireMembership(room, userId);
+    return {
+      items: [...room.members.values()].map((membership) =>
+        membershipSnapshot(this.usersById.get(membership.userId), membership, false)),
+      roomRevision: room.revision,
+    };
+  }
+
+  async getRoomContext({ userId, roomId }) {
+    const room = this._room(roomId);
+    requireMembership(room, userId);
+    return {
+      room: roomSnapshot(room),
+      members: [...room.members.values()].map((membership) =>
+        membershipSnapshot(this.usersById.get(membership.userId), membership, false)),
+      agentBindings: [...this.roomAgentBindings.values()]
+        .filter((binding) => binding.roomId === roomId)
+        .sort((left, right) => left.ownerUserId.localeCompare(right.ownerUserId))
+        .map((binding) => {
+          const profile = this._agentProfile(binding.agentProfileId);
+          return {
+            binding: publicRoomAgentBindingSnapshot(binding, profile.profileRevision),
+            agentProfile: agentProfileSnapshot(profile),
+          };
+        }),
+    };
+  }
+
+  async getMyRoomAgentBinding({ userId, roomId }) {
+    const room = this._room(roomId);
+    requireMembership(room, userId);
+    const binding = this.roomAgentBindings.get(this._bindingKey(roomId, userId));
+    if (!binding) {
+      throw new HttpError(404, 'resource_not_found', 'Room agent binding not found');
+    }
+    return roomAgentBindingSnapshot(binding);
+  }
+
+  async listRoomAgentBindings({ userId, roomId }) {
+    const room = this._room(roomId);
+    requireMembership(room, userId);
+    return {
+      items: [...this.roomAgentBindings.values()]
+        .filter((binding) => binding.roomId === roomId)
+        .sort((left, right) => left.ownerUserId.localeCompare(right.ownerUserId))
+        .map((binding) => publicRoomAgentBindingSnapshot(
+          binding,
+          this._agentProfile(binding.agentProfileId).profileRevision,
+        )),
+    };
+  }
+
+  async putMyRoomAgentBinding({
+    userId,
+    roomId,
+    agentProfileId,
+    participationMode,
+    publishMode,
+    triggerScope,
+    preferredRuntimeDeviceId,
+    generationLimitPer24h,
+    expectedPolicyRevision,
+    key,
+    requestFingerprint,
+  }) {
+    const room = this._room(roomId);
+    requireMembership(room, userId);
+    const replay = this._replay(userId, 'putMyRoomAgentBinding', key, requestFingerprint);
+    if (replay.response) return replay.response;
+    const profile = this._agentProfile(agentProfileId);
+    if (profile.ownerUserId !== userId) {
+      throw new HttpError(403, 'forbidden', 'Agent profile owner required');
+    }
+    if (
+      preferredRuntimeDeviceId !== null &&
+      !this.userDevices.has(`${userId}:${preferredRuntimeDeviceId}`)
+    ) {
+      throw new HttpError(403, 'forbidden', 'Preferred runtime device owner required');
+    }
+    const bindingKey = this._bindingKey(roomId, userId);
+    let binding = this.roomAgentBindings.get(bindingKey);
+    if (binding) {
+      if (expectedPolicyRevision !== binding.policyRevision) {
+        throw new HttpError(409, 'request_version_conflict', 'Binding revision does not match');
+      }
+      binding.agentProfileId = agentProfileId;
+      binding.participationMode = participationMode;
+      binding.publishMode = publishMode;
+      binding.triggerScope = triggerScope;
+      binding.preferredRuntimeDeviceId = preferredRuntimeDeviceId;
+      binding.generationLimitPer24h = generationLimitPer24h;
+      binding.policyRevision += 1;
+      binding.updatedAt = this.clock().toISOString();
+    } else {
+      if (expectedPolicyRevision !== null) {
+        throw new HttpError(409, 'request_version_conflict', 'Binding does not exist');
+      }
+      binding = {
+        id: newId('binding'),
+        roomId,
+        ownerUserId: userId,
+        agentProfileId,
+        participationMode,
+        publishMode,
+        triggerScope,
+        preferredRuntimeDeviceId,
+        generationLimitPer24h,
+        policyRevision: 1,
+        runtimeLeaseDeviceId: null,
+        runtimeLeaseId: null,
+        runtimeLeaseEpoch: 0,
+        runtimeLeaseExpiresAt: null,
+        updatedAt: this.clock().toISOString(),
+      };
+      this.roomAgentBindings.set(bindingKey, binding);
+    }
+    const status = binding.policyRevision === 1 ? 201 : 200;
+    const body = roomAgentBindingSnapshot(binding);
+    this._saveReplay(replay.recordKey, requestFingerprint, status, body);
+    return { status, body };
+  }
+
+  async deleteMyRoomAgentBinding({
+    userId,
+    roomId,
+    expectedPolicyRevision,
+    key,
+    requestFingerprint,
+  }) {
+    const room = this._room(roomId);
+    requireMembership(room, userId);
+    const replay = this._replay(userId, 'deleteMyRoomAgentBinding', key, requestFingerprint);
+    if (replay.response) return replay.response;
+    const bindingKey = this._bindingKey(roomId, userId);
+    const binding = this.roomAgentBindings.get(bindingKey);
+    if (!binding) {
+      throw new HttpError(404, 'resource_not_found', 'Room agent binding not found');
+    }
+    if (expectedPolicyRevision !== binding.policyRevision) {
+      throw new HttpError(409, 'request_version_conflict', 'Binding revision does not match');
+    }
+    this.roomAgentBindings.delete(bindingKey);
+    this._saveReplay(replay.recordKey, requestFingerprint, 204, null);
+    return { status: 204, body: null };
+  }
+
+  async putMyAgentRuntime({
+    user,
+    roomId,
+    deviceId,
+    readiness,
+    readyForBindingPolicyRevision,
+    runtimeCapabilitiesVersion,
+    localConfigRevision,
+    key,
+    requestFingerprint,
+  }) {
+    const room = this._room(roomId);
+    requireMembership(room, user.userId);
+    if (deviceId !== user.deviceId) {
+      throw new HttpError(403, 'forbidden', 'Runtime device must match the session');
+    }
+    const binding = this.roomAgentBindings.get(this._bindingKey(roomId, user.userId));
+    if (!binding) {
+      throw new HttpError(404, 'resource_not_found', 'Room agent binding not found');
+    }
+    const replay = this._replay(user.userId, 'putMyAgentRuntime', key, requestFingerprint);
+    if (replay.response) return replay.response;
+    if (
+      (readiness === 'ready' &&
+        readyForBindingPolicyRevision !== binding.policyRevision) ||
+      (readiness === 'notReady' && readyForBindingPolicyRevision !== null)
+    ) {
+      throw new HttpError(409, 'request_version_conflict', 'Runtime policy revision does not match');
+    }
+    const runtime = {
+      bindingId: binding.id,
+      ownerUserId: user.userId,
+      deviceId,
+      readiness,
+      readyForBindingPolicyRevision,
+      runtimeCapabilitiesVersion,
+      localConfigRevision,
+      updatedAt: this.clock().toISOString(),
+    };
+    if (readiness === 'ready' && binding.preferredRuntimeDeviceId === deviceId) {
+      acquireRuntimeLease(binding, user, this.clock());
+    } else if (
+      readiness === 'notReady' &&
+      binding.runtimeLeaseDeviceId === deviceId
+    ) {
+      binding.runtimeLeaseExpiresAt = null;
+    }
+    this.agentRuntimes.set(this._runtimeKey(binding.id, deviceId), runtime);
+    const body = agentRuntimeSnapshot(runtime);
+    this._saveReplay(replay.recordKey, requestFingerprint, 200, body);
+    return { status: 200, body };
+  }
+
+  async activateMyAgent({
+    user,
+    roomId,
+    publicProfile,
+    runtimeCapabilitiesVersion,
+    localConfigRevision,
+  }) {
+    const room = this._room(roomId);
+    requireMembership(room, user.userId);
+    requireOwnedAvatar(publicProfile.avatarResourceId);
+    const now = this.clock();
+    const bindingKey = this._bindingKey(roomId, user.userId);
+    let binding = this.roomAgentBindings.get(bindingKey);
+    let profile;
+    if (binding) {
+      profile = this._agentProfile(binding.agentProfileId);
+      if (
+        profile.displayName !== publicProfile.displayName ||
+        profile.avatarResourceId !== publicProfile.avatarResourceId ||
+        profile.shortBio !== publicProfile.shortBio
+      ) {
+        profile.displayName = publicProfile.displayName;
+        profile.avatarResourceId = publicProfile.avatarResourceId;
+        profile.shortBio = publicProfile.shortBio;
+        profile.profileRevision += 1;
+        profile.updatedAt = now.toISOString();
+      }
+      if (
+        binding.participationMode !== 'automatic' ||
+        binding.publishMode !== 'automatic' ||
+        binding.triggerScope !== 'allHumanMessages'
+      ) {
+        binding.participationMode = 'automatic';
+        binding.publishMode = 'automatic';
+        binding.triggerScope = 'allHumanMessages';
+        binding.policyRevision += 1;
+        binding.updatedAt = now.toISOString();
+      }
+    } else {
+      const createdAt = now.toISOString();
+      profile = {
+        id: newId('agent'),
+        ownerUserId: user.userId,
+        displayName: publicProfile.displayName,
+        avatarResourceId: publicProfile.avatarResourceId,
+        shortBio: publicProfile.shortBio,
+        profileRevision: 1,
+        createdAt,
+        updatedAt: createdAt,
+      };
+      this.agentProfiles.set(profile.id, profile);
+      binding = {
+        id: newId('binding'),
+        roomId,
+        ownerUserId: user.userId,
+        agentProfileId: profile.id,
+        participationMode: 'automatic',
+        publishMode: 'automatic',
+        triggerScope: 'allHumanMessages',
+        preferredRuntimeDeviceId: null,
+        generationLimitPer24h: 1000,
+        policyRevision: 1,
+        runtimeLeaseDeviceId: null,
+        runtimeLeaseId: null,
+        runtimeLeaseEpoch: 0,
+        runtimeLeaseExpiresAt: null,
+        updatedAt: createdAt,
+      };
+      this.roomAgentBindings.set(bindingKey, binding);
+    }
+    acquireRuntimeLease(binding, user, now);
+    const runtime = {
+      bindingId: binding.id,
+      ownerUserId: user.userId,
+      deviceId: user.deviceId,
+      readiness: 'ready',
+      readyForBindingPolicyRevision: binding.policyRevision,
+      runtimeCapabilitiesVersion,
+      localConfigRevision,
+      updatedAt: now.toISOString(),
+    };
+    this.agentRuntimes.set(this._runtimeKey(binding.id, user.deviceId), runtime);
+    return agentActivationSnapshot(binding, profile);
+  }
+
+  async recoverMyAgentRuntime({ user, roomId }) {
+    const room = this._room(roomId);
+    requireMembership(room, user.userId);
+    const binding = this.roomAgentBindings.get(this._bindingKey(roomId, user.userId));
+    if (!binding) {
+      throw new HttpError(404, 'resource_not_found', 'Room agent binding not found');
+    }
+    if (binding.participationMode === 'off') {
+      throw new HttpError(409, 'generation_state_conflict', 'Agent binding is disabled');
+    }
+    const now = this.clock();
+    acquireRuntimeLease(binding, user, now);
+    const runtimeKey = this._runtimeKey(binding.id, user.deviceId);
+    const runtime = this.agentRuntimes.get(runtimeKey) ?? {
+      bindingId: binding.id,
+      ownerUserId: user.userId,
+      deviceId: user.deviceId,
+      runtimeCapabilitiesVersion: 1,
+      localConfigRevision: 0,
+    };
+    runtime.readiness = 'ready';
+    runtime.readyForBindingPolicyRevision = binding.policyRevision;
+    runtime.updatedAt = now.toISOString();
+    this.agentRuntimes.set(runtimeKey, runtime);
+    return agentActivationSnapshot(binding, this._agentProfile(binding.agentProfileId));
+  }
+
+  async heartbeatMyAgent({ user, roomId, leaseId, leaseEpoch }) {
+    const room = this._room(roomId);
+    requireMembership(room, user.userId);
+    const binding = this.roomAgentBindings.get(this._bindingKey(roomId, user.userId));
+    if (!binding) {
+      throw new HttpError(404, 'resource_not_found', 'Room agent binding not found');
+    }
+    const now = this.clock();
+    requireRuntimeLease(binding, user, leaseId, leaseEpoch, now);
+    binding.runtimeLeaseExpiresAt = new Date(
+      now.getTime() + AGENT_RUNTIME_LEASE_DURATION_MS,
+    ).toISOString();
+    const runtime = this.agentRuntimes.get(this._runtimeKey(binding.id, user.deviceId));
+    if (runtime) runtime.updatedAt = now.toISOString();
+    return agentActivationSnapshot(binding, this._agentProfile(binding.agentProfileId));
+  }
+
+  async deactivateMyAgent({ user, roomId, leaseId, leaseEpoch }) {
+    const room = this._room(roomId);
+    requireMembership(room, user.userId);
+    const binding = this.roomAgentBindings.get(this._bindingKey(roomId, user.userId));
+    if (!binding) {
+      throw new HttpError(404, 'resource_not_found', 'Room agent binding not found');
+    }
+    requireRuntimeLease(binding, user, leaseId, leaseEpoch, this.clock(), { active: false });
+    binding.preferredRuntimeDeviceId = null;
+    binding.runtimeLeaseExpiresAt = null;
+    const updatedAt = this.clock().toISOString();
+    const runtime = this.agentRuntimes.get(this._runtimeKey(binding.id, user.deviceId));
+    if (runtime) {
+      runtime.readiness = 'notReady';
+      runtime.readyForBindingPolicyRevision = null;
+      runtime.updatedAt = updatedAt;
+    }
+    return {
+      roomId,
+      bindingId: binding.id,
+      deviceId: user.deviceId,
+      leaseEpoch,
+      status: 'deactivated',
+    };
+  }
+
+  async createManualGenerationRequest({
+    user,
+    roomId,
+    clientGenerationRequestId,
+    triggerMessageIds,
+    expectedBindingPolicyRevision,
+    supersedesRequestId = null,
+    key,
+    requestFingerprint,
+  }) {
+    const room = this._room(roomId);
+    const membership = requireMembership(room, user.userId);
+    const binding = this.roomAgentBindings.get(this._bindingKey(roomId, user.userId));
+    if (!binding) {
+      throw new HttpError(404, 'resource_not_found', 'Room agent binding not found');
+    }
+    const replay = this._replay(
+      user.userId,
+      'createManualGenerationRequest',
+      key,
+      requestFingerprint,
+    );
+    if (replay.response) return replay.response;
+    if (binding.participationMode === 'off') {
+      throw new HttpError(409, 'generation_state_conflict', 'Agent binding is disabled');
+    }
+    if (binding.policyRevision !== expectedBindingPolicyRevision) {
+      throw new HttpError(409, 'request_version_conflict', 'Binding policy revision does not match');
+    }
+    const roomMessages = this.messagesByRoom.get(roomId);
+    const triggers = triggerMessageIds.map((messageId) => {
+      const message = roomMessages.find((candidate) => candidate.id === messageId);
+      if (!message) {
+        throw new HttpError(404, 'resource_not_found', 'Trigger message not found');
+      }
+      if (message.seq < membership.joinedSeq) {
+        throw new HttpError(403, 'history_not_visible', 'Trigger message is outside membership history');
+      }
+      return message;
+    });
+    const triggerSequences = triggers.map((message) => message.seq);
+    if (supersedesRequestId !== null) {
+      const superseded = this.generationRequests.get(supersedesRequestId);
+      if (
+        !superseded ||
+        superseded.ownerUserId !== user.userId ||
+        superseded.creatorDeviceId !== user.deviceId
+      ) {
+        throw new HttpError(404, 'resource_not_found', 'Superseded generation request not found');
+      }
+      if (
+        superseded.roomId !== roomId ||
+        superseded.bindingId !== binding.id ||
+        !REGENERATABLE_GENERATION_STATUSES.has(superseded.status) ||
+        JSON.stringify(superseded.triggerMessageIds) !== JSON.stringify(triggerMessageIds)
+      ) {
+        throw new HttpError(
+          409,
+          'generation_state_conflict',
+          'Superseded generation request is not eligible for regeneration',
+        );
+      }
+    }
+    const now = this.clock().toISOString();
+    const request = {
+      id: newId('generation'),
+      roomId,
+      bindingId: binding.id,
+      ownerUserId: user.userId,
+      creatorDeviceId: user.deviceId,
+      source: 'manual',
+      clientGenerationRequestId,
+      triggerBatchId: null,
+      triggerMessageIds: clone(triggerMessageIds),
+      triggerFromSeq: Math.min(...triggerSequences),
+      triggerThroughSeq: Math.max(...triggerSequences),
+      contextThroughSeq: room.lastSeq,
+      minVisibleSeq: membership.joinedSeq,
+      historyPolicyRevision: room.revision,
+      bindingPolicyRevision: binding.policyRevision,
+      status: 'queued',
+      requestVersion: 1,
+      claimedDeviceId: null,
+      leaseId: null,
+      leaseEpoch: 0,
+      leaseExpiresAt: null,
+      draftDeviceId: null,
+      attempt: 0,
+      supersedesRequestId,
+      startedAt: null,
+      createdAt: now,
+      updatedAt: now,
+    };
+    this.generationRequests.set(request.id, request);
+    const body = generationRequestSnapshot(request);
+    this._saveReplay(replay.recordKey, requestFingerprint, 201, body);
+    return { status: 201, body };
+  }
+
+  async createAutomaticGenerationRequest({
+    user,
+    roomId,
+    triggerBatchId,
+    triggerMessageIds,
+    key,
+    requestFingerprint,
+    humanTriggersOnly = false,
+  }) {
+    const room = this._room(roomId);
+    const membership = requireMembership(room, user.userId);
+    const binding = this.roomAgentBindings.get(this._bindingKey(roomId, user.userId));
+    if (!binding) {
+      throw new HttpError(404, 'resource_not_found', 'Room agent binding not found');
+    }
+    const replay = this._replay(
+      user.userId,
+      'createAutomaticGenerationRequest',
+      key,
+      requestFingerprint,
+    );
+    if (replay.response) return replay.response;
+    if (binding.participationMode !== 'automatic' || binding.publishMode !== 'automatic') {
+      throw new HttpError(
+        409,
+        'generation_state_conflict',
+        'Agent binding is not enabled for automatic publication',
+      );
+    }
+    if (
+      triggerMessageIds.length < 1 ||
+      triggerMessageIds.length > 128 ||
+      new Set(triggerMessageIds).size !== triggerMessageIds.length
+    ) {
+      throw new HttpError(400, 'invalid_request', 'Trigger message IDs must contain unique items');
+    }
+    const roomMessages = this.messagesByRoom.get(roomId);
+    const triggers = triggerMessageIds.map((messageId) => {
+      const message = roomMessages.find((candidate) => candidate.id === messageId);
+      if (!message) {
+        throw new HttpError(404, 'resource_not_found', 'Trigger message not found');
+      }
+      if (message.seq < membership.joinedSeq) {
+        throw new HttpError(403, 'history_not_visible', 'Trigger message is outside membership history');
+      }
+      return message;
+    });
+    requireEligibleAutomaticTriggers({
+      triggerScope: binding.triggerScope,
+      agentProfileId: binding.agentProfileId,
+      triggers,
+      humanTriggersOnly,
+    });
+    const triggerSequences = triggers.map((message) => message.seq);
+    const now = this.clock().toISOString();
+    const request = {
+      id: newId('generation'),
+      roomId,
+      bindingId: binding.id,
+      ownerUserId: user.userId,
+      creatorDeviceId: user.deviceId,
+      source: 'automatic',
+      clientGenerationRequestId: null,
+      triggerBatchId,
+      triggerMessageIds: clone(triggerMessageIds),
+      triggerFromSeq: Math.min(...triggerSequences),
+      triggerThroughSeq: Math.max(...triggerSequences),
+      contextThroughSeq: room.lastSeq,
+      minVisibleSeq: membership.joinedSeq,
+      historyPolicyRevision: room.revision,
+      bindingPolicyRevision: binding.policyRevision,
+      status: 'queued',
+      requestVersion: 1,
+      claimedDeviceId: null,
+      leaseId: null,
+      leaseEpoch: 0,
+      leaseExpiresAt: null,
+      draftDeviceId: null,
+      attempt: 0,
+      supersedesRequestId: null,
+      startedAt: null,
+      createdAt: now,
+      updatedAt: now,
+    };
+    this.generationRequests.set(request.id, request);
+    const body = generationRequestSnapshot(request);
+    this._saveReplay(replay.recordKey, requestFingerprint, 201, body);
+    return { status: 201, body };
+  }
+
+  async listGenerationRequests({ user, statuses, pageToken, limit }) {
+    const filtered = [...this.generationRequests.values()]
+      .filter(
+        (request) =>
+          request.ownerUserId === user.userId &&
+          request.creatorDeviceId === user.deviceId &&
+          statuses.includes(request.status),
+      )
+      .sort((left, right) =>
+        right.createdAt.localeCompare(left.createdAt) || right.id.localeCompare(left.id),
+      );
+    let start = 0;
+    if (pageToken !== null) {
+      const cursorIndex = filtered.findIndex((request) => request.id === pageToken);
+      if (cursorIndex < 0) {
+        throw new HttpError(400, 'invalid_request', 'pageToken is not valid');
+      }
+      start = cursorIndex + 1;
+    }
+    const page = filtered.slice(start, start + limit + 1);
+    return {
+      items: page.slice(0, limit).map(generationRequestSnapshot),
+      nextPageToken: page.length > limit ? page[limit - 1].id : null,
+    };
+  }
+
+  async getGenerationRequest({ userId, generationRequestId }) {
+    const request = this._generationRequest(generationRequestId);
+    if (request.ownerUserId !== userId) {
+      throw new HttpError(403, 'forbidden', 'Generation request owner required');
+    }
+    return generationRequestSnapshot(request);
+  }
+
+  async claimGenerationRequest({
+    user,
+    generationRequestId,
+    expectedRequestVersion,
+    key,
+    requestFingerprint,
+  }) {
+    const request = this._generationRequest(generationRequestId);
+    const replay = this._replay(
+      user.userId,
+      'claimGenerationRequest',
+      key,
+      requestFingerprint,
+    );
+    const { binding } = this._requireGenerationContext(request, user, { ready: true });
+    if (
+      (request.source === 'manual' && request.creatorDeviceId !== user.deviceId) ||
+      binding.preferredRuntimeDeviceId !== user.deviceId
+    ) {
+      throw new HttpError(403, 'forbidden', 'Current device is not eligible to claim');
+    }
+    const now = this.clock();
+    if (replay.response) {
+      requireGenerationStatus(request, 'claimed');
+      requireGenerationLease(request, user, request.leaseId, request.leaseEpoch, now);
+      return { status: 200, body: generationRequestSnapshot(request) };
+    }
+    requireGenerationVersion(request, expectedRequestVersion);
+    requireGenerationStatus(request, 'queued');
+    request.status = 'claimed';
+    request.requestVersion += 1;
+    request.claimedDeviceId = user.deviceId;
+    request.leaseId = newId('lease');
+    request.leaseEpoch += 1;
+    request.leaseExpiresAt = new Date(
+      now.getTime() + GENERATION_LEASE_DURATION_MS,
+    ).toISOString();
+    request.updatedAt = now.toISOString();
+    const body = generationRequestSnapshot(request);
+    this._saveReplay(replay.recordKey, requestFingerprint, 200, body);
+    return { status: 200, body };
+  }
+
+  async startGenerationRequest({
+    user,
+    generationRequestId,
+    expectedRequestVersion,
+    leaseId,
+    leaseEpoch,
+    key,
+    requestFingerprint,
+  }) {
+    const request = this._generationRequest(generationRequestId);
+    const replay = this._replay(
+      user.userId,
+      'startGenerationRequest',
+      key,
+      requestFingerprint,
+    );
+    const { binding } = this._requireGenerationContext(request, user, { ready: true });
+    const now = this.clock();
+    if (replay.response) {
+      requireGenerationStatus(request, 'generating');
+      requireGenerationLease(request, user, leaseId, leaseEpoch, now);
+      return { status: 200, body: generationRequestSnapshot(request) };
+    }
+    requireGenerationVersion(request, expectedRequestVersion);
+    requireGenerationStatus(request, 'claimed');
+    requireGenerationLease(request, user, leaseId, leaseEpoch, now);
+    const cutoff = now.getTime() - 24 * 60 * 60 * 1000;
+    const started = [...this.generationRequests.values()].filter(
+      (candidate) =>
+        candidate.bindingId === binding.id &&
+        candidate.startedAt !== null &&
+        Date.parse(candidate.startedAt) >= cutoff,
+    );
+    if (started.length >= binding.generationLimitPer24h) {
+      const retryAt = Math.min(...started.map((candidate) => Date.parse(candidate.startedAt))) +
+        24 * 60 * 60 * 1000;
+      throw new HttpError(
+        429,
+        'generation_limit_exceeded',
+        'Generation limit has been reached',
+        { retryAfterSeconds: Math.max(0, Math.ceil((retryAt - now.getTime()) / 1000)) },
+      );
+    }
+    request.status = 'generating';
+    request.requestVersion += 1;
+    request.attempt += 1;
+    request.startedAt = now.toISOString();
+    request.updatedAt = now.toISOString();
+    const body = generationRequestSnapshot(request);
+    this._saveReplay(replay.recordKey, requestFingerprint, 200, body);
+    return { status: 200, body };
+  }
+
+  async markGenerationReviewPending({
+    user,
+    generationRequestId,
+    expectedRequestVersion,
+    leaseId,
+    leaseEpoch,
+    key,
+    requestFingerprint,
+  }) {
+    const request = this._generationRequest(generationRequestId);
+    if (request.ownerUserId !== user.userId) {
+      throw new HttpError(403, 'forbidden', 'Generation request owner required');
+    }
+    const replay = this._replay(
+      user.userId,
+      'markGenerationReviewPending',
+      key,
+      requestFingerprint,
+    );
+    if (replay.response) return replay.response;
+    const { binding } = this._requireGenerationContext(request, user, { ready: true });
+    if (binding.publishMode !== 'reviewRequired') {
+      throw new HttpError(409, 'generation_state_conflict', 'Binding does not require review');
+    }
+    requireGenerationVersion(request, expectedRequestVersion);
+    requireGenerationStatus(request, 'generating');
+    requireGenerationLease(request, user, leaseId, leaseEpoch, this.clock());
+    request.status = 'review_pending';
+    request.requestVersion += 1;
+    request.draftDeviceId = user.deviceId;
+    request.leaseId = null;
+    request.leaseExpiresAt = null;
+    request.updatedAt = this.clock().toISOString();
+    const body = generationRequestSnapshot(request);
+    this._saveReplay(replay.recordKey, requestFingerprint, 200, body);
+    return { status: 200, body };
+  }
+
+  async failGenerationRequest({
+    user,
+    generationRequestId,
+    expectedRequestVersion,
+    leaseId,
+    leaseEpoch,
+    key,
+    requestFingerprint,
+  }) {
+    const request = this._generationRequest(generationRequestId);
+    if (request.ownerUserId !== user.userId) {
+      throw new HttpError(403, 'forbidden', 'Generation request owner required');
+    }
+    const replay = this._replay(
+      user.userId,
+      'failGenerationRequest',
+      key,
+      requestFingerprint,
+    );
+    if (replay.response) return replay.response;
+    requireGenerationVersion(request, expectedRequestVersion);
+    requireGenerationStatus(request, 'generating');
+    requireGenerationLease(request, user, leaseId, leaseEpoch, this.clock());
+    request.status = 'failed';
+    request.requestVersion += 1;
+    request.leaseId = null;
+    request.leaseExpiresAt = null;
+    request.updatedAt = this.clock().toISOString();
+    const body = generationRequestSnapshot(request);
+    this._saveReplay(replay.recordKey, requestFingerprint, 200, body);
+    return { status: 200, body };
+  }
+
+  async discardGenerationRequest({
+    user,
+    generationRequestId,
+    expectedRequestVersion,
+    key,
+    requestFingerprint,
+  }) {
+    const request = this._generationRequest(generationRequestId);
+    if (request.ownerUserId !== user.userId) {
+      throw new HttpError(403, 'forbidden', 'Generation request owner required');
+    }
+    const replay = this._replay(
+      user.userId,
+      'discardGenerationRequest',
+      key,
+      requestFingerprint,
+    );
+    if (replay.response) return replay.response;
+    requireGenerationVersion(request, expectedRequestVersion);
+    requireGenerationStatus(request, 'review_pending');
+    if (request.draftDeviceId !== user.deviceId) {
+      throw new HttpError(403, 'forbidden', 'Draft device required');
+    }
+    request.status = 'discarded';
+    request.requestVersion += 1;
+    request.updatedAt = this.clock().toISOString();
+    const body = generationRequestSnapshot(request);
+    this._saveReplay(replay.recordKey, requestFingerprint, 200, body);
+    return { status: 200, body };
+  }
+
+  async publishGenerationRequest({
+    user,
+    generationRequestId,
+    expectedRequestVersion,
+    expectedBindingPolicyRevision,
+    clientMessageId,
+    text,
+    mentions,
+    replyToMessageId,
+    leaseId,
+    leaseEpoch,
+    key,
+    requestFingerprint,
+    automatic = false,
+  }) {
+    const request = this._generationRequest(generationRequestId);
+    if (request.ownerUserId !== user.userId) {
+      throw new HttpError(403, 'forbidden', 'Generation request owner required');
+    }
+    const operation = automatic
+      ? 'publishAutomaticGenerationRequest'
+      : 'publishGenerationRequest';
+    const replay = this._replay(
+      user.userId,
+      operation,
+      key,
+      requestFingerprint,
+    );
+    if (replay.response) return replay.response;
+    const { room, membership, binding } = this._requireGenerationContext(
+      request,
+      user,
+      { ready: true },
+    );
+    requireGenerationVersion(request, expectedRequestVersion);
+    if (automatic) {
+      if (request.source !== 'automatic' || binding.publishMode !== 'automatic') {
+        throw new HttpError(
+          409,
+          'generation_state_conflict',
+          'Generation request is not eligible for automatic publication',
+        );
+      }
+      requireGenerationStatus(request, 'generating');
+      requireGenerationLease(request, user, leaseId, leaseEpoch, this.clock());
+    } else {
+      requireGenerationStatus(request, 'review_pending');
+      if (request.draftDeviceId !== user.deviceId) {
+        throw new HttpError(403, 'forbidden', 'Draft device required');
+      }
+      if (leaseId !== null || leaseEpoch !== null) {
+        throw new HttpError(
+          409,
+          'generation_state_conflict',
+          'Review publication must not use a lease',
+        );
+      }
+    }
+    if (
+      expectedBindingPolicyRevision !== request.bindingPolicyRevision ||
+      expectedBindingPolicyRevision !== binding.policyRevision
+    ) {
+      throw new HttpError(409, 'request_version_conflict', 'Binding policy revision does not match');
+    }
+    const messages = this.messagesByRoom.get(request.roomId);
+    if (messages.some((message) => message.generationRequestId === request.id)) {
+      throw new HttpError(409, 'generation_state_conflict', 'Generation request is already published');
+    }
+    if (messages.some((message) => message.clientMessageId === clientMessageId)) {
+      throw new HttpError(409, 'conflict', 'Client message ID is already in use');
+    }
+    requireAgentLoopCapacity({
+      messages,
+      bindings: this.roomAgentBindings,
+      roomId: request.roomId,
+      ownerUserId: user.userId,
+    });
+    for (const mention of mentions) {
+      if (mention.kind === 'user' && !room.members.has(mention.targetId)) {
+        throw new HttpError(400, 'invalid_request', 'Mention target is not a room member');
+      }
+      if (
+        mention.kind === 'agent' &&
+        ![...this.roomAgentBindings.values()].some(
+          (candidate) =>
+            candidate.roomId === request.roomId &&
+            candidate.agentProfileId === mention.targetId,
+        )
+      ) {
+        throw new HttpError(400, 'invalid_request', 'Mentioned agent is not visible in the room');
+      }
+    }
+    if (replyToMessageId !== null) {
+      const target = messages.find((message) => message.id === replyToMessageId);
+      if (!target) {
+        throw new HttpError(404, 'resource_not_found', 'Reply target not found');
+      }
+      if (target.seq < membership.joinedSeq) {
+        throw new HttpError(403, 'history_not_visible', 'Reply target is outside membership history');
+      }
+    }
+    const profile = this._agentProfile(binding.agentProfileId);
+    const createdAt = this.clock().toISOString();
+    const message = {
+      id: newId('msg'),
+      roomId: request.roomId,
+      seq: room.lastSeq + 1,
+      clientMessageId,
+      sender: {
+        kind: 'agent',
+        userId: user.userId,
+        agentProfileId: profile.id,
+        displayNameSnapshot: profile.displayName,
+        avatarResourceIdSnapshot: profile.avatarResourceId,
+      },
+      content: { schemaVersion: 1, type: 'text', text },
+      mentions: clone(mentions),
+      replyToMessageId,
+      generationRequestId: request.id,
+      triggerThroughSeq: request.triggerThroughSeq,
+      createdAt,
+    };
+    room.lastSeq = message.seq;
+    messages.push(message);
+    request.status = 'published';
+    request.requestVersion += 1;
+    if (automatic) {
+      request.leaseId = null;
+      request.leaseExpiresAt = null;
+    }
+    request.updatedAt = createdAt;
+    const body = {
+      generationRequest: generationRequestSnapshot(request),
+      message: clone(message),
+    };
+    this._saveReplay(replay.recordKey, requestFingerprint, 200, body);
+    this.outbox.push({
+      id: String(this.nextOutboxId++),
+      eventId: newId('evt'),
+      type: 'message.created',
+      roomId: request.roomId,
+      payload: clone(message),
+      occurredAt: createdAt,
+      dispatchedAt: null,
+    });
+    return { status: 200, body };
+  }
+
+  async publishAutomaticGenerationRequest(parameters) {
+    return this.publishGenerationRequest({ ...parameters, automatic: true });
+  }
+
+  async listInvites({ userId, roomId }) {
+    const room = this._room(roomId);
+    requireInviteManager(room, userId);
+    const now = this.clock();
+    return [...this.invites.values()]
+      .filter((invite) => invite.roomId === roomId && activeInvite(invite, now))
+      .map(inviteSummary);
+  }
+
+  async createInvite({
+    userId,
+    roomId,
+    expectedRoomRevision,
+    expiresAt,
+    maxUses,
+    key,
+    requestFingerprint,
+  }) {
+    const room = this._room(roomId);
+    requireInviteManager(room, userId);
+    const replay = this._replay(userId, 'createRoomInvite', key, requestFingerprint);
+    if (replay.response) return replay.response;
+    if (expectedRoomRevision !== room.revision) {
+      throw new HttpError(409, 'request_version_conflict', 'Room revision does not match');
+    }
+    const token = randomBytes(16).toString('base64url');
+    const invite = {
+      id: newId('invite'),
+      roomId,
+      createdByUserId: userId,
+      tokenHash: hash(token),
+      expiresAt,
+      maxUses,
+      remainingUses: maxUses,
+      createdAt: this.clock().toISOString(),
+      revokedAt: null,
+    };
+    this.invites.set(invite.id, invite);
+    const body = { ...inviteSummary(invite), inviteToken: token };
+    this._saveReplay(replay.recordKey, requestFingerprint, 201, body);
+    return { status: 201, body };
+  }
+
+  async revokeInvite({ userId, roomId, inviteId, key, requestFingerprint }) {
+    const room = this._room(roomId);
+    requireInviteManager(room, userId);
+    const invite = this.invites.get(inviteId);
+    if (!invite || invite.roomId !== roomId) {
+      throw new HttpError(404, 'resource_not_found', 'Invite not found');
+    }
+    const replay = this._replay(userId, 'revokeRoomInvite', key, requestFingerprint);
+    if (replay.response) return replay.response;
+    if (!activeInvite(invite, this.clock())) {
+      throw new HttpError(409, 'conflict', 'Invite is no longer active');
+    }
+    invite.revokedAt = this.clock().toISOString();
+    this._saveReplay(replay.recordKey, requestFingerprint, 204, null);
+    return { status: 204, body: null };
+  }
+
+  async acceptInvite({ userId, inviteToken, key, requestFingerprint }) {
+    const replay = this._replay(userId, 'acceptRoomInvite', key, requestFingerprint);
+    if (replay.response) return replay.response;
+    const tokenHash = hash(inviteToken);
+    const invite = [...this.invites.values()].find((entry) => entry.tokenHash === tokenHash);
+    if (!invite || !activeInvite(invite, this.clock())) {
+      throw new HttpError(409, 'conflict', 'Invite is not valid');
+    }
+    const room = this._room(invite.roomId);
+    let membership = room.members.get(userId);
+    if (!membership) {
+      membership = {
+        userId,
+        role: 'member',
+        joinedSeq: room.lastSeq + 1,
+        readSeq: room.lastSeq,
+      };
+      room.members.set(userId, membership);
+      invite.remainingUses -= 1;
+      room.revision += 1;
+      room.updatedAt = this.clock().toISOString();
+    }
+    const body = {
+      room: roomSnapshot(room),
+      membership: membershipSnapshot(this.usersById.get(userId), membership, true),
+    };
+    this._saveReplay(replay.recordKey, requestFingerprint, 200, body);
+    return { status: 200, body };
+  }
+
+  async listMessages({ userId, roomId, afterSeq, limit }) {
+    const room = this._room(roomId);
+    const membership = requireMembership(room, userId);
+    const visible = this.messagesByRoom.get(roomId).filter(
+      (message) => message.seq > afterSeq && message.seq >= membership.joinedSeq,
+    );
+    return {
+      items: visible.slice(0, limit).map(clone),
+      highWaterSeq: room.lastSeq,
+      hasMore: visible.length > limit,
+    };
+  }
+
+  async createHumanMessage({
+    user,
+    roomId,
+    clientMessageId,
+    text,
+    mentions,
+    replyToMessageId,
+    key,
+    requestFingerprint,
+  }) {
+    const room = this._room(roomId);
+    const membership = requireMembership(room, user.userId);
+    const replay = this._replay(
+      user.userId,
+      'createHumanMessage',
+      key,
+      requestFingerprint,
+    );
+    if (replay.response) return replay.response;
+    for (const mention of mentions) {
+      if (mention.kind === 'user' && !room.members.has(mention.targetId)) {
+        throw new HttpError(400, 'invalid_request', 'Mention target is not a room member');
+      }
+    }
+    if (replyToMessageId) {
+      const target = this.messagesByRoom.get(roomId).find(
+        (message) => message.id === replyToMessageId,
+      );
+      if (!target) throw new HttpError(404, 'resource_not_found', 'Reply target not found');
+      if (target.seq < membership.joinedSeq) {
+        throw new HttpError(403, 'history_not_visible', 'Reply target is outside membership history');
+      }
+    }
+    const createdAt = this.clock().toISOString();
+    const message = {
+      id: newId('msg'),
+      roomId,
+      seq: room.lastSeq + 1,
+      clientMessageId,
+      sender: {
+        kind: 'human',
+        userId: user.userId,
+        displayNameSnapshot: user.displayName,
+        avatarResourceIdSnapshot: user.avatarResourceId,
+      },
+      content: { schemaVersion: 1, type: 'text', text },
+      mentions: clone(mentions),
+      replyToMessageId,
+      createdAt,
+    };
+    room.lastSeq = message.seq;
+    this.messagesByRoom.get(roomId).push(message);
+    const body = clone(message);
+    this._saveReplay(replay.recordKey, requestFingerprint, 201, body);
+    this.outbox.push({
+      id: String(this.nextOutboxId++),
+      eventId: newId('evt'),
+      type: 'message.created',
+      roomId,
+      payload: body,
+      occurredAt: createdAt,
+      dispatchedAt: null,
+    });
+    return { status: 201, body };
+  }
+
+  async listPendingOutboxEvents(limit = 100) {
+    return this.outbox
+      .filter((entry) => entry.dispatchedAt === null)
+      .slice(0, limit)
+      .map((entry) => ({
+        outboxId: entry.id,
+        event: {
+          protocolVersion: 1,
+          eventId: entry.eventId,
+          type: entry.type,
+          occurredAt: entry.occurredAt,
+          ...(entry.roomId ? { roomId: entry.roomId } : {}),
+          payload: clone(entry.payload),
+        },
+      }));
+  }
+
+  async markOutboxDispatched(outboxId) {
+    const entry = this.outbox.find((candidate) => candidate.id === String(outboxId));
+    if (entry) entry.dispatchedAt = this.clock().toISOString();
+  }
+
+  async listRealtimeRecipientUserIds(roomId, messageSeq) {
+    const room = this._room(roomId);
+    return [...room.members.values()]
+      .filter((membership) => membership.joinedSeq <= messageSeq)
+      .map((membership) => membership.userId);
+  }
+}
+
+function rowToUser(row) {
+  return {
+    id: row.id,
+    userId: row.id,
+    deviceId: row.device_id,
+    handle: row.handle,
+    displayName: row.display_name,
+    avatarResourceId: row.avatar_resource_id,
+    profileRevision: row.profile_revision,
+  };
+}
+
+function rowToRoom(row) {
+  return {
+    id: row.id,
+    ownerUserId: row.owner_user_id,
+    title: row.title,
+    lastSeq: safeInteger(row.last_seq, 'rooms.last_seq'),
+    revision: safeInteger(row.revision, 'rooms.revision'),
+    historyVisibility: row.history_visibility,
+    createdAt: iso(row.created_at),
+    updatedAt: iso(row.updated_at),
+  };
+}
+
+function rowToMembership(row, includeReadSeq) {
+  return {
+    userId: row.user_id,
+    role: row.role,
+    joinedSeq: safeInteger(row.joined_seq, 'room_members.joined_seq'),
+    ...(includeReadSeq
+      ? { readSeq: safeInteger(row.read_seq, 'room_members.read_seq') }
+      : {}),
+    displayName: row.display_name,
+    avatarResourceId: row.avatar_resource_id,
+  };
+}
+
+function rowToInvite(row) {
+  return {
+    id: row.id,
+    roomId: row.room_id,
+    createdByUserId: row.created_by_user_id,
+    expiresAt: iso(row.expires_at),
+    maxUses: row.max_uses,
+    remainingUses: row.remaining_uses,
+    createdAt: iso(row.created_at),
+  };
+}
+
+function rowToAgentProfile(row) {
+  return {
+    id: row.id,
+    ownerUserId: row.owner_user_id,
+    displayName: row.display_name,
+    avatarResourceId: row.avatar_resource_id,
+    shortBio: row.short_bio,
+    profileRevision: safeInteger(row.profile_revision, 'agent_profiles.profile_revision'),
+    createdAt: iso(row.created_at),
+    updatedAt: iso(row.updated_at),
+  };
+}
+
+function rowToRoomAgentBinding(row) {
+  return {
+    bindingId: row.id,
+    roomId: row.room_id,
+    ownerUserId: row.owner_user_id,
+    agentProfileId: row.agent_profile_id,
+    participationMode: row.participation_mode,
+    publishMode: row.publish_mode,
+    triggerScope: row.trigger_scope,
+    preferredRuntimeDeviceId: row.preferred_runtime_device_id,
+    generationLimitPer24h: row.generation_limit_per_24h,
+    policyRevision: safeInteger(row.policy_revision, 'room_agent_bindings.policy_revision'),
+    updatedAt: iso(row.updated_at),
+  };
+}
+
+function rowToPublicRoomAgentBinding(row) {
+  return {
+    bindingId: row.id,
+    roomId: row.room_id,
+    ownerUserId: row.owner_user_id,
+    agentProfileId: row.agent_profile_id,
+    agentProfileRevision: safeInteger(
+      row.agent_profile_revision,
+      'agent_profiles.profile_revision',
+    ),
+    participationMode: row.participation_mode,
+    publishMode: row.publish_mode,
+    triggerScope: row.trigger_scope,
+    policyRevision: safeInteger(row.policy_revision, 'room_agent_bindings.policy_revision'),
+    updatedAt: iso(row.updated_at),
+  };
+}
+
+function rowToAgentRuntime(row) {
+  return {
+    bindingId: row.binding_id,
+    deviceId: row.device_id,
+    readiness: row.readiness,
+    readyForBindingPolicyRevision: row.ready_for_binding_policy_revision === null
+      ? null
+      : safeInteger(
+        row.ready_for_binding_policy_revision,
+        'agent_runtimes.ready_for_binding_policy_revision',
+      ),
+    runtimeCapabilitiesVersion: safeInteger(
+      row.runtime_capabilities_version,
+      'agent_runtimes.runtime_capabilities_version',
+    ),
+    localConfigRevision: safeInteger(
+      row.local_config_revision,
+      'agent_runtimes.local_config_revision',
+    ),
+    updatedAt: iso(row.updated_at),
+  };
+}
+
+function rowToAgentActivation(binding, profile) {
+  return {
+    roomId: binding.room_id,
+    bindingId: binding.id,
+    agentProfileId: profile.id,
+    profileRevision: safeInteger(profile.profile_revision, 'agent_profiles.profile_revision'),
+    policyRevision: safeInteger(binding.policy_revision, 'room_agent_bindings.policy_revision'),
+    deviceId: binding.runtime_lease_device_id,
+    leaseId: binding.runtime_lease_id,
+    leaseEpoch: safeInteger(
+      binding.runtime_lease_epoch,
+      'room_agent_bindings.runtime_lease_epoch',
+    ),
+    leaseExpiresAt: iso(binding.runtime_lease_expires_at),
+  };
+}
+
+function rowToGenerationRequest(row) {
+  return {
+    id: row.id,
+    roomId: row.room_id,
+    bindingId: row.binding_id,
+    ownerUserId: row.owner_user_id,
+    source: row.source,
+    ...(row.client_generation_request_id
+      ? { clientGenerationRequestId: row.client_generation_request_id }
+      : {}),
+    ...(row.trigger_batch_id ? { triggerBatchId: row.trigger_batch_id } : {}),
+    triggerMessageIds: row.trigger_message_ids,
+    triggerFromSeq: safeInteger(row.trigger_from_seq, 'generation_requests.trigger_from_seq'),
+    triggerThroughSeq: safeInteger(
+      row.trigger_through_seq,
+      'generation_requests.trigger_through_seq',
+    ),
+    contextThroughSeq: safeInteger(
+      row.context_through_seq,
+      'generation_requests.context_through_seq',
+    ),
+    minVisibleSeq: safeInteger(row.min_visible_seq, 'generation_requests.min_visible_seq'),
+    historyPolicyRevision: safeInteger(
+      row.history_policy_revision,
+      'generation_requests.history_policy_revision',
+    ),
+    bindingPolicyRevision: safeInteger(
+      row.binding_policy_revision,
+      'generation_requests.binding_policy_revision',
+    ),
+    status: row.status,
+    requestVersion: safeInteger(row.request_version, 'generation_requests.request_version'),
+    ...(row.claimed_device_id ? { claimedDeviceId: row.claimed_device_id } : {}),
+    ...(row.lease_id ? { leaseId: row.lease_id } : {}),
+    leaseEpoch: safeInteger(row.lease_epoch, 'generation_requests.lease_epoch'),
+    ...(row.lease_expires_at ? { leaseExpiresAt: iso(row.lease_expires_at) } : {}),
+    ...(row.draft_device_id ? { draftDeviceId: row.draft_device_id } : {}),
+    attempt: safeInteger(row.attempt, 'generation_requests.attempt'),
+    ...(row.supersedes_request_id
+      ? { supersedesRequestId: row.supersedes_request_id }
+      : {}),
+    createdAt: iso(row.created_at),
+    updatedAt: iso(row.updated_at),
+  };
+}
+
+function rowToMessage(row) {
+  return {
+    id: row.id,
+    roomId: row.room_id,
+    seq: safeInteger(row.seq, 'messages.seq'),
+    clientMessageId: row.client_message_id,
+    sender: row.sender,
+    content: row.content,
+    mentions: row.mentions,
+    replyToMessageId: row.reply_to_message_id,
+    ...(row.generation_request_id
+      ? { generationRequestId: row.generation_request_id }
+      : {}),
+    ...(row.trigger_through_seq !== null
+      ? { triggerThroughSeq: safeInteger(row.trigger_through_seq, 'messages.trigger_through_seq') }
+      : {}),
+    createdAt: iso(row.created_at),
+  };
+}
+
+function rowToContextAgentBinding(row) {
+  return {
+    binding: rowToPublicRoomAgentBinding(row),
+    agentProfile: {
+      id: row.context_profile_id,
+      ownerUserId: row.context_profile_owner_user_id,
+      displayName: row.context_profile_display_name,
+      avatarResourceId: row.context_profile_avatar_resource_id,
+      shortBio: row.context_profile_short_bio,
+      profileRevision: safeInteger(
+        row.agent_profile_revision,
+        'agent_profiles.profile_revision',
+      ),
+      createdAt: iso(row.context_profile_created_at),
+      updatedAt: iso(row.context_profile_updated_at),
+    },
+  };
+}
+
+export class PostgresGroupChatStore {
+  static async connect({
+    connectionString,
+    ssl = false,
+    migrate = false,
+    clock = () => new Date(),
+    logger = console,
+  }) {
+    if (!connectionString?.trim()) {
+      throw new Error('DATABASE_URL is required for PostgreSQL storage');
+    }
+    const pool = new pg.Pool({
+      connectionString,
+      ssl: ssl ? { rejectUnauthorized: true } : undefined,
+      max: Number(process.env.DATABASE_POOL_SIZE ?? 10),
+    });
+    try {
+      await pool.query('SELECT 1');
+      if (migrate) await runMigrations(pool, logger);
+      await pool.query('SELECT 1 FROM users LIMIT 1');
+      return new PostgresGroupChatStore({ pool, clock });
+    } catch (error) {
+      await pool.end();
+      throw error;
+    }
+  }
+
+  constructor({ pool, clock = () => new Date() }) {
+    this.pool = pool;
+    this.clock = clock;
+  }
+
+  async health() {
+    await this.pool.query('SELECT 1');
+  }
+
+  async close() {
+    await this.pool.end();
+  }
+
+  async _transaction(action) {
+    const client = await this.pool.connect();
+    try {
+      await client.query('BEGIN');
+      const result = await action(client);
+      await client.query('COMMIT');
+      return result;
+    } catch (error) {
+      await client.query('ROLLBACK');
+      throw error;
+    } finally {
+      client.release();
+    }
+  }
+
+  async _replay(client, principalId, operation, key, requestFingerprint) {
+    await client.query(
+      'SELECT pg_advisory_xact_lock(hashtextextended($1, 0))',
+      [`${principalId}:${operation}:${key}`],
+    );
+    const result = await client.query(
+      `SELECT request_fingerprint, response_status, response_body
+         FROM idempotency_records
+        WHERE principal_id = $1 AND operation = $2 AND idempotency_key = $3`,
+      [principalId, operation, key],
+    );
+    if (result.rowCount === 0) return null;
+    const row = result.rows[0];
+    if (row.request_fingerprint !== requestFingerprint) throw idempotencyConflict();
+    return { status: row.response_status, body: row.response_body };
+  }
+
+  async _saveReplay(
+    client,
+    { principalId, operation, key, requestFingerprint, status, body },
+  ) {
+    await client.query(
+      `INSERT INTO idempotency_records(
+         principal_id, operation, idempotency_key, request_fingerprint,
+         response_status, response_body, created_at
+       ) VALUES ($1, $2, $3, $4, $5, $6, $7)`,
+      [principalId, operation, key, requestFingerprint, status, body, this.clock()],
+    );
+  }
+
+  async _room(client, roomId, { lock = false } = {}) {
+    const result = await client.query(
+      `SELECT * FROM rooms WHERE id = $1${lock ? ' FOR UPDATE' : ''}`,
+      [roomId],
+    );
+    if (result.rowCount === 0) {
+      throw new HttpError(404, 'resource_not_found', 'Room not found');
+    }
+    return result.rows[0];
+  }
+
+  async _membership(client, roomId, userId, { manager = false, lock = false } = {}) {
+    const result = await client.query(
+      `SELECT * FROM room_members
+        WHERE room_id = $1 AND user_id = $2${lock ? ' FOR UPDATE' : ''}`,
+      [roomId, userId],
+    );
+    if (result.rowCount === 0) {
+      throw new HttpError(403, 'forbidden', 'Room membership required');
+    }
+    const membership = result.rows[0];
+    if (manager && membership.role !== 'owner' && membership.role !== 'admin') {
+      throw new HttpError(403, 'forbidden', 'Owner or admin role required');
+    }
+    return membership;
+  }
+
+  async _bindingById(client, bindingId, { lock = false } = {}) {
+    const result = await client.query(
+      `SELECT * FROM room_agent_bindings
+        WHERE id = $1${lock ? ' FOR UPDATE' : ''}`,
+      [bindingId],
+    );
+    if (result.rowCount === 0) {
+      throw new HttpError(409, 'request_version_conflict', 'Agent binding is no longer current');
+    }
+    return result.rows[0];
+  }
+
+  async _generationRequest(client, generationRequestId, { lock = false } = {}) {
+    const result = await client.query(
+      `SELECT * FROM generation_requests
+        WHERE id = $1${lock ? ' FOR UPDATE' : ''}`,
+      [generationRequestId],
+    );
+    if (result.rowCount === 0) {
+      throw new HttpError(404, 'resource_not_found', 'Generation request not found');
+    }
+    return result.rows[0];
+  }
+
+  async _requireReadyRuntime(client, binding, user) {
+    const result = await client.query(
+      `SELECT * FROM agent_runtimes
+        WHERE binding_id = $1 AND device_id = $2`,
+      [binding.id, user.deviceId],
+    );
+    const runtime = result.rows[0];
+    if (
+      !runtime ||
+      runtime.readiness !== 'ready' ||
+      safeInteger(
+        runtime.ready_for_binding_policy_revision,
+        'agent_runtimes.ready_for_binding_policy_revision',
+      ) !== safeInteger(binding.policy_revision, 'room_agent_bindings.policy_revision') ||
+      binding.preferred_runtime_device_id !== user.deviceId ||
+      binding.runtime_lease_device_id !== user.deviceId ||
+      !binding.runtime_lease_expires_at ||
+      new Date(binding.runtime_lease_expires_at).getTime() <= this.clock().getTime()
+    ) {
+      throw new HttpError(409, 'runtime_not_ready', 'Agent runtime is not ready');
+    }
+    return runtime;
+  }
+
+  async _generationContext(client, request, user, { ready = false } = {}) {
+    if (request.owner_user_id !== user.userId) {
+      throw new HttpError(403, 'forbidden', 'Generation request owner required');
+    }
+    const room = await this._room(client, request.room_id, { lock: true });
+    const membership = await this._membership(client, request.room_id, user.userId);
+    const binding = await this._bindingById(client, request.binding_id, { lock: true });
+    if (
+      binding.room_id !== request.room_id ||
+      binding.owner_user_id !== user.userId ||
+      binding.participation_mode === 'off'
+    ) {
+      throw new HttpError(409, 'generation_state_conflict', 'Agent binding is disabled');
+    }
+    if (
+      safeInteger(binding.policy_revision, 'room_agent_bindings.policy_revision') !==
+      safeInteger(request.binding_policy_revision, 'generation_requests.binding_policy_revision')
+    ) {
+      throw new HttpError(409, 'request_version_conflict', 'Binding policy has changed');
+    }
+    if (ready) await this._requireReadyRuntime(client, binding, user);
+    return { room, membership, binding };
+  }
+
+  async createGuestSession({ deviceId, displayName }) {
+    try {
+      return await this._transaction(async (client) => {
+        const now = this.clock();
+        const nicknameKey = displayName.normalize('NFKC').toLowerCase();
+        const existing = await client.query(
+          'SELECT * FROM users WHERE device_id = $1 FOR UPDATE',
+          [deviceId],
+        );
+        let user;
+        if (existing.rowCount > 0) {
+          const row = existing.rows[0];
+          if (row.display_name !== displayName) {
+            const updated = await client.query(
+              `UPDATE users
+                  SET display_name = $1, nickname_key = $2,
+                      profile_revision = profile_revision + 1, updated_at = $3
+                WHERE id = $4
+                RETURNING *`,
+              [displayName, nicknameKey, now, row.id],
+            );
+            user = rowToUser(updated.rows[0]);
+          } else {
+            user = rowToUser(row);
+          }
+        } else {
+          const id = newId('usr');
+          const inserted = await client.query(
+            `INSERT INTO users(
+               id, device_id, handle, display_name, nickname_key,
+               avatar_resource_id, profile_revision, created_at, updated_at
+             ) VALUES ($1, $2, $3, $4, $5, NULL, 1, $6, $6)
+             RETURNING *`,
+            [id, deviceId, `guest_${hash(deviceId).slice(0, 12)}`, displayName, nicknameKey, now],
+          );
+          user = rowToUser(inserted.rows[0]);
+        }
+        const accessToken = `dev_${randomBytes(24).toString('base64url')}`;
+        await client.query(
+          `INSERT INTO user_devices(user_id, device_id, created_at, updated_at)
+           VALUES ($1, $2, $3, $3)
+           ON CONFLICT (user_id, device_id) DO UPDATE SET updated_at = EXCLUDED.updated_at`,
+          [user.userId, deviceId, now],
+        );
+        await client.query(
+          `INSERT INTO sessions(token_hash, user_id, device_id, created_at)
+           VALUES ($1, $2, $3, $4)`,
+          [hash(accessToken), user.userId, deviceId, now],
+        );
+        return { accessToken, tokenType: 'Bearer', user: publicUser(user) };
+      });
+    } catch (error) {
+      if (error?.code === '23505' && error?.constraint === 'users_nickname_key_key') {
+        throw new HttpError(409, 'conflict', 'Nickname is already in use');
+      }
+      throw error;
+    }
+  }
+
+  async authenticate(accessToken) {
+    const result = await this.pool.query(
+      `SELECT u.*, s.device_id AS session_device_id
+         FROM sessions s
+         JOIN users u ON u.id = s.user_id
+        WHERE s.token_hash = $1`,
+      [hash(accessToken)],
+    );
+    if (result.rowCount === 0) {
+      throw new HttpError(401, 'session_revoked', 'Session is not valid');
+    }
+    return authenticatedUser(rowToUser(result.rows[0]), result.rows[0].session_device_id);
+  }
+
+  async listRooms(userId) {
+    const result = await this.pool.query(
+      `SELECT r.*
+         FROM rooms r
+         JOIN room_members m ON m.room_id = r.id
+        WHERE m.user_id = $1
+        ORDER BY r.updated_at DESC, r.id`,
+      [userId],
+    );
+    return result.rows.map(rowToRoom);
+  }
+
+  async listRoomsPage({ userId, afterRoomId, limit }) {
+    const result = await this.pool.query(
+      `SELECT r.*
+         FROM rooms r
+         JOIN room_members m ON m.room_id = r.id
+        WHERE m.user_id = $1 AND ($2::text IS NULL OR r.id > $2)
+        ORDER BY r.id
+        LIMIT $3`,
+      [userId, afterRoomId, limit + 1],
+    );
+    const items = result.rows.slice(0, limit).map(rowToRoom);
+    return {
+      items,
+      nextRoomId: result.rows.length > limit ? items[items.length - 1].id : null,
+    };
+  }
+
+  async createAgentProfile({
+    userId,
+    displayName,
+    avatarResourceId,
+    shortBio,
+    key,
+    requestFingerprint,
+  }) {
+    requireOwnedAvatar(avatarResourceId);
+    return this._transaction(async (client) => {
+      const replay = await this._replay(
+        client,
+        userId,
+        'createAgentProfile',
+        key,
+        requestFingerprint,
+      );
+      if (replay) return replay;
+      const now = this.clock();
+      const inserted = await client.query(
+        `INSERT INTO agent_profiles(
+           id, owner_user_id, display_name, avatar_resource_id, short_bio,
+           profile_revision, created_at, updated_at
+         ) VALUES ($1, $2, $3, $4, $5, 1, $6, $6)
+         RETURNING *`,
+        [newId('agent'), userId, displayName, avatarResourceId, shortBio, now],
+      );
+      const body = rowToAgentProfile(inserted.rows[0]);
+      await this._saveReplay(client, {
+        principalId: userId,
+        operation: 'createAgentProfile',
+        key,
+        requestFingerprint,
+        status: 201,
+        body,
+      });
+      return { status: 201, body };
+    });
+  }
+
+  async getAgentProfile({ agentProfileId }) {
+    const result = await this.pool.query(
+      'SELECT * FROM agent_profiles WHERE id = $1',
+      [agentProfileId],
+    );
+    if (result.rowCount === 0) {
+      throw new HttpError(404, 'resource_not_found', 'Agent profile not found');
+    }
+    return rowToAgentProfile(result.rows[0]);
+  }
+
+  async updateAgentProfile({
+    userId,
+    agentProfileId,
+    expectedProfileRevision,
+    changes,
+    key,
+    requestFingerprint,
+  }) {
+    if (Object.hasOwn(changes, 'avatarResourceId')) {
+      requireOwnedAvatar(changes.avatarResourceId);
+    }
+    return this._transaction(async (client) => {
+      const result = await client.query(
+        'SELECT * FROM agent_profiles WHERE id = $1 FOR UPDATE',
+        [agentProfileId],
+      );
+      if (result.rowCount === 0) {
+        throw new HttpError(404, 'resource_not_found', 'Agent profile not found');
+      }
+      const profile = result.rows[0];
+      if (profile.owner_user_id !== userId) {
+        throw new HttpError(403, 'forbidden', 'Agent profile owner required');
+      }
+      const replay = await this._replay(
+        client,
+        userId,
+        'updateAgentProfile',
+        key,
+        requestFingerprint,
+      );
+      if (replay) return replay;
+      if (expectedProfileRevision !==
+          safeInteger(profile.profile_revision, 'agent_profiles.profile_revision')) {
+        throw new HttpError(409, 'request_version_conflict', 'Profile revision does not match');
+      }
+      const updated = await client.query(
+        `UPDATE agent_profiles
+            SET display_name = $1, avatar_resource_id = $2, short_bio = $3,
+                profile_revision = profile_revision + 1, updated_at = $4
+          WHERE id = $5
+          RETURNING *`,
+        [
+          Object.hasOwn(changes, 'displayName') ? changes.displayName : profile.display_name,
+          Object.hasOwn(changes, 'avatarResourceId')
+            ? changes.avatarResourceId
+            : profile.avatar_resource_id,
+          Object.hasOwn(changes, 'shortBio') ? changes.shortBio : profile.short_bio,
+          this.clock(),
+          agentProfileId,
+        ],
+      );
+      const body = rowToAgentProfile(updated.rows[0]);
+      await this._saveReplay(client, {
+        principalId: userId,
+        operation: 'updateAgentProfile',
+        key,
+        requestFingerprint,
+        status: 200,
+        body,
+      });
+      return { status: 200, body };
+    });
+  }
+
+  async createRoom({ userId, title, key, requestFingerprint }) {
+    return this._transaction(async (client) => {
+      const replay = await this._replay(
+        client,
+        userId,
+        'createRoom',
+        key,
+        requestFingerprint,
+      );
+      if (replay) return replay;
+      const now = this.clock();
+      const roomId = newId('room');
+      const inserted = await client.query(
+        `INSERT INTO rooms(
+           id, owner_user_id, title, last_seq, revision,
+           history_visibility, created_at, updated_at
+         ) VALUES ($1, $2, $3, 0, 1, 'after_join', $4, $4)
+         RETURNING *`,
+        [roomId, userId, title, now],
+      );
+      await client.query(
+        `INSERT INTO room_members(room_id, user_id, role, joined_seq, read_seq)
+         VALUES ($1, $2, 'owner', 0, 0)`,
+        [roomId, userId],
+      );
+      const body = rowToRoom(inserted.rows[0]);
+      await this._saveReplay(client, {
+        principalId: userId,
+        operation: 'createRoom',
+        key,
+        requestFingerprint,
+        status: 201,
+        body,
+      });
+      return { status: 201, body };
+    });
+  }
+
+  async getRoom({ userId, roomId }) {
+    const client = this.pool;
+    const room = await this._room(client, roomId);
+    await this._membership(client, roomId, userId);
+    return rowToRoom(room);
+  }
+
+  async getMembership({ userId, roomId }) {
+    await this._room(this.pool, roomId);
+    const result = await this.pool.query(
+      `SELECT m.*, u.display_name, u.avatar_resource_id
+         FROM room_members m
+         JOIN users u ON u.id = m.user_id
+        WHERE m.room_id = $1 AND m.user_id = $2`,
+      [roomId, userId],
+    );
+    if (result.rowCount === 0) {
+      throw new HttpError(403, 'forbidden', 'Room membership required');
+    }
+    return rowToMembership(result.rows[0], true);
+  }
+
+  async listMembers({ userId, roomId }) {
+    const room = await this._room(this.pool, roomId);
+    await this._membership(this.pool, roomId, userId);
+    const result = await this.pool.query(
+      `SELECT m.*, u.display_name, u.avatar_resource_id
+         FROM room_members m
+         JOIN users u ON u.id = m.user_id
+        WHERE m.room_id = $1
+        ORDER BY m.joined_seq, m.user_id`,
+      [roomId],
+    );
+    return {
+      items: result.rows.map((row) => rowToMembership(row, false)),
+      roomRevision: safeInteger(room.revision, 'rooms.revision'),
+    };
+  }
+
+  async getRoomContext({ userId, roomId }) {
+    const room = await this._room(this.pool, roomId);
+    await this._membership(this.pool, roomId, userId);
+    const [members, agentBindings] = await Promise.all([
+      this.pool.query(
+        `SELECT m.*, u.display_name, u.avatar_resource_id
+           FROM room_members m
+           JOIN users u ON u.id = m.user_id
+          WHERE m.room_id = $1
+          ORDER BY m.joined_seq, m.user_id`,
+        [roomId],
+      ),
+      this.pool.query(
+        `SELECT b.*,
+                p.id AS context_profile_id,
+                p.owner_user_id AS context_profile_owner_user_id,
+                p.display_name AS context_profile_display_name,
+                p.avatar_resource_id AS context_profile_avatar_resource_id,
+                p.short_bio AS context_profile_short_bio,
+                p.profile_revision AS agent_profile_revision,
+                p.created_at AS context_profile_created_at,
+                p.updated_at AS context_profile_updated_at
+           FROM room_agent_bindings b
+           JOIN agent_profiles p ON p.id = b.agent_profile_id
+          WHERE b.room_id = $1
+          ORDER BY b.owner_user_id`,
+        [roomId],
+      ),
+    ]);
+    return {
+      room: rowToRoom(room),
+      members: members.rows.map((row) => rowToMembership(row, false)),
+      agentBindings: agentBindings.rows.map(rowToContextAgentBinding),
+    };
+  }
+
+  async getMyRoomAgentBinding({ userId, roomId }) {
+    await this._room(this.pool, roomId);
+    await this._membership(this.pool, roomId, userId);
+    const result = await this.pool.query(
+      `SELECT * FROM room_agent_bindings
+        WHERE room_id = $1 AND owner_user_id = $2`,
+      [roomId, userId],
+    );
+    if (result.rowCount === 0) {
+      throw new HttpError(404, 'resource_not_found', 'Room agent binding not found');
+    }
+    return rowToRoomAgentBinding(result.rows[0]);
+  }
+
+  async listRoomAgentBindings({ userId, roomId }) {
+    await this._room(this.pool, roomId);
+    await this._membership(this.pool, roomId, userId);
+    const result = await this.pool.query(
+      `SELECT b.*, p.profile_revision AS agent_profile_revision
+         FROM room_agent_bindings b
+         JOIN agent_profiles p ON p.id = b.agent_profile_id
+        WHERE b.room_id = $1
+        ORDER BY b.owner_user_id`,
+      [roomId],
+    );
+    return { items: result.rows.map(rowToPublicRoomAgentBinding) };
+  }
+
+  async putMyRoomAgentBinding({
+    userId,
+    roomId,
+    agentProfileId,
+    participationMode,
+    publishMode,
+    triggerScope,
+    preferredRuntimeDeviceId,
+    generationLimitPer24h,
+    expectedPolicyRevision,
+    key,
+    requestFingerprint,
+  }) {
+    return this._transaction(async (client) => {
+      await this._room(client, roomId);
+      await this._membership(client, roomId, userId, { lock: true });
+      const replay = await this._replay(
+        client,
+        userId,
+        'putMyRoomAgentBinding',
+        key,
+        requestFingerprint,
+      );
+      if (replay) return replay;
+      const profileResult = await client.query(
+        'SELECT * FROM agent_profiles WHERE id = $1',
+        [agentProfileId],
+      );
+      if (profileResult.rowCount === 0) {
+        throw new HttpError(404, 'resource_not_found', 'Agent profile not found');
+      }
+      if (profileResult.rows[0].owner_user_id !== userId) {
+        throw new HttpError(403, 'forbidden', 'Agent profile owner required');
+      }
+      if (preferredRuntimeDeviceId !== null) {
+        const device = await client.query(
+          'SELECT 1 FROM user_devices WHERE user_id = $1 AND device_id = $2',
+          [userId, preferredRuntimeDeviceId],
+        );
+        if (device.rowCount === 0) {
+          throw new HttpError(403, 'forbidden', 'Preferred runtime device owner required');
+        }
+      }
+      const existing = await client.query(
+        `SELECT * FROM room_agent_bindings
+          WHERE room_id = $1 AND owner_user_id = $2
+          FOR UPDATE`,
+        [roomId, userId],
+      );
+      let status;
+      let changed;
+      if (existing.rowCount > 0) {
+        const binding = existing.rows[0];
+        if (expectedPolicyRevision !==
+            safeInteger(binding.policy_revision, 'room_agent_bindings.policy_revision')) {
+          throw new HttpError(409, 'request_version_conflict', 'Binding revision does not match');
+        }
+        changed = await client.query(
+          `UPDATE room_agent_bindings
+              SET agent_profile_id = $1, participation_mode = $2, publish_mode = $3,
+                  trigger_scope = $4, preferred_runtime_device_id = $5,
+                  generation_limit_per_24h = $6,
+                  policy_revision = policy_revision + 1, updated_at = $7
+            WHERE id = $8
+            RETURNING *`,
+          [
+            agentProfileId,
+            participationMode,
+            publishMode,
+            triggerScope,
+            preferredRuntimeDeviceId,
+            generationLimitPer24h,
+            this.clock(),
+            binding.id,
+          ],
+        );
+        status = 200;
+      } else {
+        if (expectedPolicyRevision !== null) {
+          throw new HttpError(409, 'request_version_conflict', 'Binding does not exist');
+        }
+        changed = await client.query(
+          `INSERT INTO room_agent_bindings(
+             id, room_id, owner_user_id, agent_profile_id, participation_mode,
+             publish_mode, trigger_scope, preferred_runtime_device_id,
+             generation_limit_per_24h, policy_revision, updated_at
+           ) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, 1, $10)
+           RETURNING *`,
+          [
+            newId('binding'),
+            roomId,
+            userId,
+            agentProfileId,
+            participationMode,
+            publishMode,
+            triggerScope,
+            preferredRuntimeDeviceId,
+            generationLimitPer24h,
+            this.clock(),
+          ],
+        );
+        status = 201;
+      }
+      const body = rowToRoomAgentBinding(changed.rows[0]);
+      await this._saveReplay(client, {
+        principalId: userId,
+        operation: 'putMyRoomAgentBinding',
+        key,
+        requestFingerprint,
+        status,
+        body,
+      });
+      return { status, body };
+    });
+  }
+
+  async deleteMyRoomAgentBinding({
+    userId,
+    roomId,
+    expectedPolicyRevision,
+    key,
+    requestFingerprint,
+  }) {
+    return this._transaction(async (client) => {
+      await this._room(client, roomId);
+      await this._membership(client, roomId, userId, { lock: true });
+      const replay = await this._replay(
+        client,
+        userId,
+        'deleteMyRoomAgentBinding',
+        key,
+        requestFingerprint,
+      );
+      if (replay) return replay;
+      const result = await client.query(
+        `SELECT * FROM room_agent_bindings
+          WHERE room_id = $1 AND owner_user_id = $2
+          FOR UPDATE`,
+        [roomId, userId],
+      );
+      if (result.rowCount === 0) {
+        throw new HttpError(404, 'resource_not_found', 'Room agent binding not found');
+      }
+      const binding = result.rows[0];
+      if (expectedPolicyRevision !==
+          safeInteger(binding.policy_revision, 'room_agent_bindings.policy_revision')) {
+        throw new HttpError(409, 'request_version_conflict', 'Binding revision does not match');
+      }
+      await client.query('DELETE FROM room_agent_bindings WHERE id = $1', [binding.id]);
+      await this._saveReplay(client, {
+        principalId: userId,
+        operation: 'deleteMyRoomAgentBinding',
+        key,
+        requestFingerprint,
+        status: 204,
+        body: null,
+      });
+      return { status: 204, body: null };
+    });
+  }
+
+  async putMyAgentRuntime({
+    user,
+    roomId,
+    deviceId,
+    readiness,
+    readyForBindingPolicyRevision,
+    runtimeCapabilitiesVersion,
+    localConfigRevision,
+    key,
+    requestFingerprint,
+  }) {
+    return this._transaction(async (client) => {
+      await this._room(client, roomId);
+      await this._membership(client, roomId, user.userId);
+      if (deviceId !== user.deviceId) {
+        throw new HttpError(403, 'forbidden', 'Runtime device must match the session');
+      }
+      const bindingResult = await client.query(
+        `SELECT * FROM room_agent_bindings
+          WHERE room_id = $1 AND owner_user_id = $2
+          FOR UPDATE`,
+        [roomId, user.userId],
+      );
+      if (bindingResult.rowCount === 0) {
+        throw new HttpError(404, 'resource_not_found', 'Room agent binding not found');
+      }
+      const replay = await this._replay(
+        client,
+        user.userId,
+        'putMyAgentRuntime',
+        key,
+        requestFingerprint,
+      );
+      if (replay) return replay;
+      const binding = bindingResult.rows[0];
+      const policyRevision = safeInteger(
+        binding.policy_revision,
+        'room_agent_bindings.policy_revision',
+      );
+      if (
+        (readiness === 'ready' && readyForBindingPolicyRevision !== policyRevision) ||
+        (readiness === 'notReady' && readyForBindingPolicyRevision !== null)
+      ) {
+        throw new HttpError(
+          409,
+          'request_version_conflict',
+          'Runtime policy revision does not match',
+        );
+      }
+      const changed = await client.query(
+        `INSERT INTO agent_runtimes(
+           binding_id, owner_user_id, device_id, readiness,
+           ready_for_binding_policy_revision, runtime_capabilities_version,
+           local_config_revision, updated_at
+         ) VALUES ($1, $2, $3, $4, $5, $6, $7, $8)
+         ON CONFLICT (binding_id, device_id) DO UPDATE
+           SET readiness = EXCLUDED.readiness,
+               ready_for_binding_policy_revision = EXCLUDED.ready_for_binding_policy_revision,
+               runtime_capabilities_version = EXCLUDED.runtime_capabilities_version,
+               local_config_revision = EXCLUDED.local_config_revision,
+               updated_at = EXCLUDED.updated_at
+         RETURNING *`,
+        [
+          binding.id,
+          user.userId,
+          deviceId,
+          readiness,
+          readyForBindingPolicyRevision,
+          runtimeCapabilitiesVersion,
+          localConfigRevision,
+          this.clock(),
+        ],
+      );
+      const now = this.clock();
+      if (readiness === 'ready' && binding.preferred_runtime_device_id === deviceId) {
+        const leaseIsActive = Boolean(
+          binding.runtime_lease_device_id &&
+          binding.runtime_lease_id &&
+          binding.runtime_lease_expires_at &&
+          new Date(binding.runtime_lease_expires_at).getTime() > now.getTime()
+        );
+        if (leaseIsActive && binding.runtime_lease_device_id !== deviceId) {
+          throw new HttpError(
+            409,
+            'lease_conflict',
+            'Agent runtime lease is held by another device',
+          );
+        }
+        await client.query(
+          `UPDATE room_agent_bindings
+              SET runtime_lease_device_id = $1,
+                  runtime_lease_id = $2,
+                  runtime_lease_epoch = $3,
+                  runtime_lease_expires_at = $4
+            WHERE id = $5`,
+          [
+            deviceId,
+            leaseIsActive ? binding.runtime_lease_id : newId('agent-lease'),
+            leaseIsActive
+              ? safeInteger(binding.runtime_lease_epoch, 'room_agent_bindings.runtime_lease_epoch')
+              : safeInteger(
+                binding.runtime_lease_epoch,
+                'room_agent_bindings.runtime_lease_epoch',
+              ) + 1,
+            new Date(now.getTime() + AGENT_RUNTIME_LEASE_DURATION_MS),
+            binding.id,
+          ],
+        );
+      } else if (
+        readiness === 'notReady' &&
+        binding.runtime_lease_device_id === deviceId
+      ) {
+        await client.query(
+          `UPDATE room_agent_bindings
+              SET runtime_lease_expires_at = NULL
+            WHERE id = $1`,
+          [binding.id],
+        );
+      }
+      const body = rowToAgentRuntime(changed.rows[0]);
+      await this._saveReplay(client, {
+        principalId: user.userId,
+        operation: 'putMyAgentRuntime',
+        key,
+        requestFingerprint,
+        status: 200,
+        body,
+      });
+      return { status: 200, body };
+    });
+  }
+
+  async activateMyAgent({
+    user,
+    roomId,
+    publicProfile,
+    runtimeCapabilitiesVersion,
+    localConfigRevision,
+  }) {
+    requireOwnedAvatar(publicProfile.avatarResourceId);
+    return this._transaction(async (client) => {
+      await this._room(client, roomId);
+      await this._membership(client, roomId, user.userId, { lock: true });
+      const now = this.clock();
+      const existing = await client.query(
+        `SELECT * FROM room_agent_bindings
+          WHERE room_id = $1 AND owner_user_id = $2
+          FOR UPDATE`,
+        [roomId, user.userId],
+      );
+      let profile;
+      let binding;
+      if (existing.rowCount > 0) {
+        binding = existing.rows[0];
+        const profileResult = await client.query(
+          'SELECT * FROM agent_profiles WHERE id = $1 FOR UPDATE',
+          [binding.agent_profile_id],
+        );
+        profile = profileResult.rows[0];
+        if (
+          profile.display_name !== publicProfile.displayName ||
+          profile.avatar_resource_id !== publicProfile.avatarResourceId ||
+          profile.short_bio !== publicProfile.shortBio
+        ) {
+          const updatedProfile = await client.query(
+            `UPDATE agent_profiles
+                SET display_name = $1, avatar_resource_id = $2, short_bio = $3,
+                    profile_revision = profile_revision + 1, updated_at = $4
+              WHERE id = $5
+              RETURNING *`,
+            [
+              publicProfile.displayName,
+              publicProfile.avatarResourceId,
+              publicProfile.shortBio,
+              now,
+              profile.id,
+            ],
+          );
+          profile = updatedProfile.rows[0];
+        }
+      } else {
+        const insertedProfile = await client.query(
+          `INSERT INTO agent_profiles(
+             id, owner_user_id, display_name, avatar_resource_id, short_bio,
+             profile_revision, created_at, updated_at
+           ) VALUES ($1, $2, $3, $4, $5, 1, $6, $6)
+           RETURNING *`,
+          [
+            newId('agent'),
+            user.userId,
+            publicProfile.displayName,
+            publicProfile.avatarResourceId,
+            publicProfile.shortBio,
+            now,
+          ],
+        );
+        profile = insertedProfile.rows[0];
+        const insertedBinding = await client.query(
+          `INSERT INTO room_agent_bindings(
+             id, room_id, owner_user_id, agent_profile_id, participation_mode,
+             publish_mode, trigger_scope, preferred_runtime_device_id,
+             generation_limit_per_24h, policy_revision, updated_at
+           ) VALUES ($1, $2, $3, $4, 'automatic', 'automatic', 'allHumanMessages',
+                     NULL, 1000, 1, $5)
+           RETURNING *`,
+          [newId('binding'), roomId, user.userId, profile.id, now],
+        );
+        binding = insertedBinding.rows[0];
+      }
+
+      const leaseIsActive = Boolean(
+        binding.runtime_lease_device_id &&
+        binding.runtime_lease_id &&
+        binding.runtime_lease_expires_at &&
+        new Date(binding.runtime_lease_expires_at).getTime() > now.getTime()
+      );
+      if (leaseIsActive && binding.runtime_lease_device_id !== user.deviceId) {
+        throw new HttpError(409, 'lease_conflict', 'Agent runtime lease is held by another device');
+      }
+      const policyChanged =
+        binding.participation_mode !== 'automatic' ||
+        binding.publish_mode !== 'automatic' ||
+        binding.trigger_scope !== 'allHumanMessages';
+      const leaseId = leaseIsActive ? binding.runtime_lease_id : newId('agent-lease');
+      const leaseEpoch = leaseIsActive
+        ? safeInteger(binding.runtime_lease_epoch, 'room_agent_bindings.runtime_lease_epoch')
+        : safeInteger(binding.runtime_lease_epoch, 'room_agent_bindings.runtime_lease_epoch') + 1;
+      const leaseExpiresAt = new Date(now.getTime() + AGENT_RUNTIME_LEASE_DURATION_MS);
+      const updatedBinding = await client.query(
+        `UPDATE room_agent_bindings
+            SET participation_mode = 'automatic', publish_mode = 'automatic',
+                trigger_scope = 'allHumanMessages', preferred_runtime_device_id = $1,
+                policy_revision = policy_revision + $2,
+                runtime_lease_device_id = $1, runtime_lease_id = $3,
+                runtime_lease_epoch = $4, runtime_lease_expires_at = $5,
+                updated_at = CASE WHEN $2 = 1 THEN $6 ELSE updated_at END
+          WHERE id = $7
+          RETURNING *`,
+        [
+          user.deviceId,
+          policyChanged ? 1 : 0,
+          leaseId,
+          leaseEpoch,
+          leaseExpiresAt,
+          now,
+          binding.id,
+        ],
+      );
+      binding = updatedBinding.rows[0];
+      await client.query(
+        `INSERT INTO agent_runtimes(
+           binding_id, owner_user_id, device_id, readiness,
+           ready_for_binding_policy_revision, runtime_capabilities_version,
+           local_config_revision, updated_at
+         ) VALUES ($1, $2, $3, 'ready', $4, $5, $6, $7)
+         ON CONFLICT (binding_id, device_id) DO UPDATE
+           SET readiness = 'ready',
+               ready_for_binding_policy_revision = EXCLUDED.ready_for_binding_policy_revision,
+               runtime_capabilities_version = EXCLUDED.runtime_capabilities_version,
+               local_config_revision = EXCLUDED.local_config_revision,
+               updated_at = EXCLUDED.updated_at`,
+        [
+          binding.id,
+          user.userId,
+          user.deviceId,
+          binding.policy_revision,
+          runtimeCapabilitiesVersion,
+          localConfigRevision,
+          now,
+        ],
+      );
+      return rowToAgentActivation(binding, profile);
+    });
+  }
+
+  async recoverMyAgentRuntime({ user, roomId }) {
+    return this._transaction(async (client) => {
+      await this._room(client, roomId);
+      await this._membership(client, roomId, user.userId, { lock: true });
+      const result = await client.query(
+        `SELECT * FROM room_agent_bindings
+          WHERE room_id = $1 AND owner_user_id = $2
+          FOR UPDATE`,
+        [roomId, user.userId],
+      );
+      if (result.rowCount === 0) {
+        throw new HttpError(404, 'resource_not_found', 'Room agent binding not found');
+      }
+      let binding = result.rows[0];
+      if (binding.participation_mode === 'off') {
+        throw new HttpError(409, 'generation_state_conflict', 'Agent binding is disabled');
+      }
+
+      const now = this.clock();
+      const leaseIsActive = Boolean(
+        binding.runtime_lease_device_id &&
+        binding.runtime_lease_id &&
+        binding.runtime_lease_expires_at &&
+        new Date(binding.runtime_lease_expires_at).getTime() > now.getTime()
+      );
+      if (leaseIsActive && binding.runtime_lease_device_id !== user.deviceId) {
+        throw new HttpError(409, 'lease_conflict', 'Agent runtime lease is held by another device');
+      }
+      const leaseId = leaseIsActive ? binding.runtime_lease_id : newId('agent-lease');
+      const leaseEpoch = leaseIsActive
+        ? safeInteger(binding.runtime_lease_epoch, 'room_agent_bindings.runtime_lease_epoch')
+        : safeInteger(binding.runtime_lease_epoch, 'room_agent_bindings.runtime_lease_epoch') + 1;
+      const updated = await client.query(
+        `UPDATE room_agent_bindings
+            SET preferred_runtime_device_id = $1, runtime_lease_device_id = $1,
+                runtime_lease_id = $2, runtime_lease_epoch = $3,
+                runtime_lease_expires_at = $4
+          WHERE id = $5
+          RETURNING *`,
+        [
+          user.deviceId,
+          leaseId,
+          leaseEpoch,
+          new Date(now.getTime() + AGENT_RUNTIME_LEASE_DURATION_MS),
+          binding.id,
+        ],
+      );
+      binding = updated.rows[0];
+      await client.query(
+        `INSERT INTO agent_runtimes(
+           binding_id, owner_user_id, device_id, readiness,
+           ready_for_binding_policy_revision, runtime_capabilities_version,
+           local_config_revision, updated_at
+         ) VALUES ($1, $2, $3, 'ready', $4, 1, 0, $5)
+         ON CONFLICT (binding_id, device_id) DO UPDATE
+           SET readiness = 'ready',
+               ready_for_binding_policy_revision = EXCLUDED.ready_for_binding_policy_revision,
+               updated_at = EXCLUDED.updated_at`,
+        [binding.id, user.userId, user.deviceId, binding.policy_revision, now],
+      );
+      const profile = await client.query(
+        'SELECT * FROM agent_profiles WHERE id = $1',
+        [binding.agent_profile_id],
+      );
+      return rowToAgentActivation(binding, profile.rows[0]);
+    });
+  }
+
+  async heartbeatMyAgent({ user, roomId, leaseId, leaseEpoch }) {
+    return this._transaction(async (client) => {
+      await this._room(client, roomId);
+      await this._membership(client, roomId, user.userId);
+      const result = await client.query(
+        `SELECT * FROM room_agent_bindings
+          WHERE room_id = $1 AND owner_user_id = $2
+          FOR UPDATE`,
+        [roomId, user.userId],
+      );
+      if (result.rowCount === 0) {
+        throw new HttpError(404, 'resource_not_found', 'Room agent binding not found');
+      }
+      const binding = result.rows[0];
+      const now = this.clock();
+      if (
+        binding.runtime_lease_device_id !== user.deviceId ||
+        binding.runtime_lease_id !== leaseId ||
+        safeInteger(binding.runtime_lease_epoch, 'room_agent_bindings.runtime_lease_epoch') !==
+          leaseEpoch ||
+        !binding.runtime_lease_expires_at ||
+        new Date(binding.runtime_lease_expires_at).getTime() <= now.getTime()
+      ) {
+        throw new HttpError(409, 'lease_conflict', 'Agent runtime lease is not current');
+      }
+      const updated = await client.query(
+        `UPDATE room_agent_bindings
+            SET runtime_lease_expires_at = $1
+          WHERE id = $2
+          RETURNING *`,
+        [new Date(now.getTime() + AGENT_RUNTIME_LEASE_DURATION_MS), binding.id],
+      );
+      await client.query(
+        `UPDATE agent_runtimes SET updated_at = $1
+          WHERE binding_id = $2 AND device_id = $3`,
+        [now, binding.id, user.deviceId],
+      );
+      const profile = await client.query(
+        'SELECT * FROM agent_profiles WHERE id = $1',
+        [binding.agent_profile_id],
+      );
+      return rowToAgentActivation(updated.rows[0], profile.rows[0]);
+    });
+  }
+
+  async deactivateMyAgent({ user, roomId, leaseId, leaseEpoch }) {
+    return this._transaction(async (client) => {
+      await this._room(client, roomId);
+      await this._membership(client, roomId, user.userId);
+      const result = await client.query(
+        `SELECT * FROM room_agent_bindings
+          WHERE room_id = $1 AND owner_user_id = $2
+          FOR UPDATE`,
+        [roomId, user.userId],
+      );
+      if (result.rowCount === 0) {
+        throw new HttpError(404, 'resource_not_found', 'Room agent binding not found');
+      }
+      const binding = result.rows[0];
+      if (
+        binding.runtime_lease_device_id !== user.deviceId ||
+        binding.runtime_lease_id !== leaseId ||
+        safeInteger(binding.runtime_lease_epoch, 'room_agent_bindings.runtime_lease_epoch') !==
+          leaseEpoch
+      ) {
+        throw new HttpError(409, 'lease_conflict', 'Agent runtime lease is not current');
+      }
+      const now = this.clock();
+      await client.query(
+        `UPDATE room_agent_bindings
+            SET preferred_runtime_device_id = NULL,
+                runtime_lease_expires_at = NULL
+          WHERE id = $1`,
+        [binding.id],
+      );
+      await client.query(
+        `UPDATE agent_runtimes
+            SET readiness = 'notReady', ready_for_binding_policy_revision = NULL,
+                updated_at = $1
+          WHERE binding_id = $2 AND device_id = $3`,
+        [now, binding.id, user.deviceId],
+      );
+      return {
+        roomId,
+        bindingId: binding.id,
+        deviceId: user.deviceId,
+        leaseEpoch,
+        status: 'deactivated',
+      };
+    });
+  }
+
+  async createManualGenerationRequest({
+    user,
+    roomId,
+    clientGenerationRequestId,
+    triggerMessageIds,
+    expectedBindingPolicyRevision,
+    supersedesRequestId = null,
+    key,
+    requestFingerprint,
+  }) {
+    return this._transaction(async (client) => {
+      const room = await this._room(client, roomId, { lock: true });
+      const membership = await this._membership(client, roomId, user.userId);
+      const bindingResult = await client.query(
+        `SELECT * FROM room_agent_bindings
+          WHERE room_id = $1 AND owner_user_id = $2
+          FOR UPDATE`,
+        [roomId, user.userId],
+      );
+      if (bindingResult.rowCount === 0) {
+        throw new HttpError(404, 'resource_not_found', 'Room agent binding not found');
+      }
+      const replay = await this._replay(
+        client,
+        user.userId,
+        'createManualGenerationRequest',
+        key,
+        requestFingerprint,
+      );
+      if (replay) return replay;
+      const binding = bindingResult.rows[0];
+      if (binding.participation_mode === 'off') {
+        throw new HttpError(409, 'generation_state_conflict', 'Agent binding is disabled');
+      }
+      if (
+        safeInteger(binding.policy_revision, 'room_agent_bindings.policy_revision') !==
+        expectedBindingPolicyRevision
+      ) {
+        throw new HttpError(
+          409,
+          'request_version_conflict',
+          'Binding policy revision does not match',
+        );
+      }
+      const triggerResult = await client.query(
+        `SELECT id, seq FROM messages
+          WHERE room_id = $1 AND id = ANY($2::text[])`,
+        [roomId, triggerMessageIds],
+      );
+      if (triggerResult.rowCount !== triggerMessageIds.length) {
+        throw new HttpError(404, 'resource_not_found', 'Trigger message not found');
+      }
+      const minVisibleSeq = safeInteger(
+        membership.joined_seq,
+        'room_members.joined_seq',
+      );
+      const triggerSequences = triggerResult.rows.map((row) =>
+        safeInteger(row.seq, 'messages.seq'));
+      if (triggerSequences.some((sequence) => sequence < minVisibleSeq)) {
+        throw new HttpError(
+          403,
+          'history_not_visible',
+          'Trigger message is outside membership history',
+        );
+      }
+      if (supersedesRequestId !== null) {
+        const supersededResult = await client.query(
+          `SELECT * FROM generation_requests
+            WHERE id = $1 AND owner_user_id = $2 AND creator_device_id = $3
+            FOR UPDATE`,
+          [supersedesRequestId, user.userId, user.deviceId],
+        );
+        if (supersededResult.rowCount === 0) {
+          throw new HttpError(
+            404,
+            'resource_not_found',
+            'Superseded generation request not found',
+          );
+        }
+        const superseded = supersededResult.rows[0];
+        if (
+          superseded.room_id !== roomId ||
+          superseded.binding_id !== binding.id ||
+          !REGENERATABLE_GENERATION_STATUSES.has(superseded.status) ||
+          JSON.stringify(superseded.trigger_message_ids) !== JSON.stringify(triggerMessageIds)
+        ) {
+          throw new HttpError(
+            409,
+            'generation_state_conflict',
+            'Superseded generation request is not eligible for regeneration',
+          );
+        }
+      }
+      const now = this.clock();
+      const inserted = await client.query(
+        `INSERT INTO generation_requests(
+           id, room_id, binding_id, owner_user_id, creator_device_id, source,
+           client_generation_request_id, trigger_batch_id, trigger_message_ids,
+           trigger_from_seq, trigger_through_seq, context_through_seq,
+           min_visible_seq, history_policy_revision, binding_policy_revision,
+           status, request_version, claimed_device_id, lease_id, lease_epoch,
+           lease_expires_at, draft_device_id, attempt, supersedes_request_id,
+           started_at, created_at, updated_at
+         ) VALUES (
+           $1, $2, $3, $4, $5, 'manual', $6, NULL, $7, $8, $9, $10,
+           $11, $12, $13, 'queued', 1, NULL, NULL, 0, NULL, NULL, 0,
+           $14, NULL, $15, $15
+         ) RETURNING *`,
+        [
+          newId('generation'),
+          roomId,
+          binding.id,
+          user.userId,
+          user.deviceId,
+          clientGenerationRequestId,
+          JSON.stringify(triggerMessageIds),
+          Math.min(...triggerSequences),
+          Math.max(...triggerSequences),
+          safeInteger(room.last_seq, 'rooms.last_seq'),
+          minVisibleSeq,
+          safeInteger(room.revision, 'rooms.revision'),
+          expectedBindingPolicyRevision,
+          supersedesRequestId,
+          now,
+        ],
+      );
+      const body = rowToGenerationRequest(inserted.rows[0]);
+      await this._saveReplay(client, {
+        principalId: user.userId,
+        operation: 'createManualGenerationRequest',
+        key,
+        requestFingerprint,
+        status: 201,
+        body,
+      });
+      return { status: 201, body };
+    });
+  }
+
+  async createAutomaticGenerationRequest({
+    user,
+    roomId,
+    triggerBatchId,
+    triggerMessageIds,
+    key,
+    requestFingerprint,
+    humanTriggersOnly = false,
+  }) {
+    return this._transaction(async (client) => {
+      const room = await this._room(client, roomId, { lock: true });
+      const membership = await this._membership(client, roomId, user.userId);
+      const bindingResult = await client.query(
+        `SELECT * FROM room_agent_bindings
+          WHERE room_id = $1 AND owner_user_id = $2
+          FOR UPDATE`,
+        [roomId, user.userId],
+      );
+      if (bindingResult.rowCount === 0) {
+        throw new HttpError(404, 'resource_not_found', 'Room agent binding not found');
+      }
+      const replay = await this._replay(
+        client,
+        user.userId,
+        'createAutomaticGenerationRequest',
+        key,
+        requestFingerprint,
+      );
+      if (replay) return replay;
+      const binding = bindingResult.rows[0];
+      if (
+        binding.participation_mode !== 'automatic' ||
+        binding.publish_mode !== 'automatic'
+      ) {
+        throw new HttpError(
+          409,
+          'generation_state_conflict',
+          'Agent binding is not enabled for automatic publication',
+        );
+      }
+      if (
+        triggerMessageIds.length < 1 ||
+        triggerMessageIds.length > 128 ||
+        new Set(triggerMessageIds).size !== triggerMessageIds.length
+      ) {
+        throw new HttpError(400, 'invalid_request', 'Trigger message IDs must contain unique items');
+      }
+      const triggerResult = await client.query(
+        `SELECT id, seq, sender, mentions FROM messages
+          WHERE room_id = $1 AND id = ANY($2::text[])`,
+        [roomId, triggerMessageIds],
+      );
+      if (triggerResult.rowCount !== triggerMessageIds.length) {
+        throw new HttpError(404, 'resource_not_found', 'Trigger message not found');
+      }
+      const minVisibleSeq = safeInteger(
+        membership.joined_seq,
+        'room_members.joined_seq',
+      );
+      const triggerSequences = triggerResult.rows.map((row) =>
+        safeInteger(row.seq, 'messages.seq'));
+      if (triggerSequences.some((sequence) => sequence < minVisibleSeq)) {
+        throw new HttpError(
+          403,
+          'history_not_visible',
+          'Trigger message is outside membership history',
+        );
+      }
+      requireEligibleAutomaticTriggers({
+        triggerScope: binding.trigger_scope,
+        agentProfileId: binding.agent_profile_id,
+        triggers: triggerResult.rows,
+        humanTriggersOnly,
+      });
+      const bindingPolicyRevision = safeInteger(
+        binding.policy_revision,
+        'room_agent_bindings.policy_revision',
+      );
+      const now = this.clock();
+      const inserted = await client.query(
+        `INSERT INTO generation_requests(
+           id, room_id, binding_id, owner_user_id, creator_device_id, source,
+           client_generation_request_id, trigger_batch_id, trigger_message_ids,
+           trigger_from_seq, trigger_through_seq, context_through_seq,
+           min_visible_seq, history_policy_revision, binding_policy_revision,
+           status, request_version, claimed_device_id, lease_id, lease_epoch,
+           lease_expires_at, draft_device_id, attempt, supersedes_request_id,
+           started_at, created_at, updated_at
+         ) VALUES (
+           $1, $2, $3, $4, $5, 'automatic', NULL, $6, $7, $8, $9, $10,
+           $11, $12, $13, 'queued', 1, NULL, NULL, 0, NULL, NULL, 0,
+           NULL, NULL, $14, $14
+         ) RETURNING *`,
+        [
+          newId('generation'),
+          roomId,
+          binding.id,
+          user.userId,
+          user.deviceId,
+          triggerBatchId,
+          JSON.stringify(triggerMessageIds),
+          Math.min(...triggerSequences),
+          Math.max(...triggerSequences),
+          safeInteger(room.last_seq, 'rooms.last_seq'),
+          minVisibleSeq,
+          safeInteger(room.revision, 'rooms.revision'),
+          bindingPolicyRevision,
+          now,
+        ],
+      );
+      const body = rowToGenerationRequest(inserted.rows[0]);
+      await this._saveReplay(client, {
+        principalId: user.userId,
+        operation: 'createAutomaticGenerationRequest',
+        key,
+        requestFingerprint,
+        status: 201,
+        body,
+      });
+      return { status: 201, body };
+    });
+  }
+
+  async listGenerationRequests({ user, statuses, pageToken, limit }) {
+    let cursor = null;
+    if (pageToken !== null) {
+      const cursorResult = await this.pool.query(
+        `SELECT created_at, id FROM generation_requests
+          WHERE id = $1 AND owner_user_id = $2 AND creator_device_id = $3
+            AND status = ANY($4::text[])`,
+        [pageToken, user.userId, user.deviceId, statuses],
+      );
+      if (cursorResult.rowCount === 0) {
+        throw new HttpError(400, 'invalid_request', 'pageToken is not valid');
+      }
+      cursor = cursorResult.rows[0];
+    }
+    const result = await this.pool.query(
+      `SELECT * FROM generation_requests
+        WHERE owner_user_id = $1 AND creator_device_id = $2
+          AND status = ANY($3::text[])
+          AND ($4::timestamptz IS NULL OR (created_at, id) < ($4, $5))
+        ORDER BY created_at DESC, id DESC
+        LIMIT $6`,
+      [
+        user.userId,
+        user.deviceId,
+        statuses,
+        cursor?.created_at ?? null,
+        cursor?.id ?? null,
+        limit + 1,
+      ],
+    );
+    return {
+      items: result.rows.slice(0, limit).map(rowToGenerationRequest),
+      nextPageToken: result.rows.length > limit ? result.rows[limit - 1].id : null,
+    };
+  }
+
+  async getGenerationRequest({ userId, generationRequestId }) {
+    const request = await this._generationRequest(this.pool, generationRequestId);
+    if (request.owner_user_id !== userId) {
+      throw new HttpError(403, 'forbidden', 'Generation request owner required');
+    }
+    return rowToGenerationRequest(request);
+  }
+
+  async claimGenerationRequest({
+    user,
+    generationRequestId,
+    expectedRequestVersion,
+    key,
+    requestFingerprint,
+  }) {
+    return this._transaction(async (client) => {
+      const request = await this._generationRequest(client, generationRequestId, { lock: true });
+      const replay = await this._replay(
+        client,
+        user.userId,
+        'claimGenerationRequest',
+        key,
+        requestFingerprint,
+      );
+      const { binding } = await this._generationContext(
+        client,
+        request,
+        user,
+        { ready: true },
+      );
+      if (
+        (request.source === 'manual' && request.creator_device_id !== user.deviceId) ||
+        binding.preferred_runtime_device_id !== user.deviceId
+      ) {
+        throw new HttpError(403, 'forbidden', 'Current device is not eligible to claim');
+      }
+      const now = this.clock();
+      const snapshot = rowToGenerationRequest(request);
+      if (replay) {
+        requireGenerationStatus(snapshot, 'claimed');
+        requireGenerationLease(snapshot, user, snapshot.leaseId, snapshot.leaseEpoch, now);
+        return { status: 200, body: snapshot };
+      }
+      requireGenerationVersion(snapshot, expectedRequestVersion);
+      requireGenerationStatus(snapshot, 'queued');
+      const changed = await client.query(
+        `UPDATE generation_requests
+            SET status = 'claimed', request_version = request_version + 1,
+                claimed_device_id = $1, lease_id = $2, lease_epoch = lease_epoch + 1,
+                lease_expires_at = $3, updated_at = $4
+          WHERE id = $5 RETURNING *`,
+        [
+          user.deviceId,
+          newId('lease'),
+          new Date(now.getTime() + GENERATION_LEASE_DURATION_MS),
+          now,
+          generationRequestId,
+        ],
+      );
+      const body = rowToGenerationRequest(changed.rows[0]);
+      await this._saveReplay(client, {
+        principalId: user.userId,
+        operation: 'claimGenerationRequest',
+        key,
+        requestFingerprint,
+        status: 200,
+        body,
+      });
+      return { status: 200, body };
+    });
+  }
+
+  async startGenerationRequest({
+    user,
+    generationRequestId,
+    expectedRequestVersion,
+    leaseId,
+    leaseEpoch,
+    key,
+    requestFingerprint,
+  }) {
+    return this._transaction(async (client) => {
+      const request = await this._generationRequest(client, generationRequestId, { lock: true });
+      const replay = await this._replay(
+        client,
+        user.userId,
+        'startGenerationRequest',
+        key,
+        requestFingerprint,
+      );
+      const { binding } = await this._generationContext(
+        client,
+        request,
+        user,
+        { ready: true },
+      );
+      const now = this.clock();
+      const snapshot = rowToGenerationRequest(request);
+      if (replay) {
+        requireGenerationStatus(snapshot, 'generating');
+        requireGenerationLease(snapshot, user, leaseId, leaseEpoch, now);
+        return { status: 200, body: snapshot };
+      }
+      requireGenerationVersion(snapshot, expectedRequestVersion);
+      requireGenerationStatus(snapshot, 'claimed');
+      requireGenerationLease(snapshot, user, leaseId, leaseEpoch, now);
+      const usage = await client.query(
+        `SELECT count(*)::integer AS count, min(started_at) AS earliest
+           FROM generation_requests
+          WHERE binding_id = $1 AND started_at >= $2`,
+        [binding.id, new Date(now.getTime() - 24 * 60 * 60 * 1000)],
+      );
+      if (usage.rows[0].count >= binding.generation_limit_per_24h) {
+        const retryAt = new Date(usage.rows[0].earliest).getTime() + 24 * 60 * 60 * 1000;
+        throw new HttpError(
+          429,
+          'generation_limit_exceeded',
+          'Generation limit has been reached',
+          { retryAfterSeconds: Math.max(0, Math.ceil((retryAt - now.getTime()) / 1000)) },
+        );
+      }
+      const changed = await client.query(
+        `UPDATE generation_requests
+            SET status = 'generating', request_version = request_version + 1,
+                attempt = attempt + 1, started_at = $1, updated_at = $1
+          WHERE id = $2 RETURNING *`,
+        [now, generationRequestId],
+      );
+      const body = rowToGenerationRequest(changed.rows[0]);
+      await this._saveReplay(client, {
+        principalId: user.userId,
+        operation: 'startGenerationRequest',
+        key,
+        requestFingerprint,
+        status: 200,
+        body,
+      });
+      return { status: 200, body };
+    });
+  }
+
+  async markGenerationReviewPending({
+    user,
+    generationRequestId,
+    expectedRequestVersion,
+    leaseId,
+    leaseEpoch,
+    key,
+    requestFingerprint,
+  }) {
+    return this._transaction(async (client) => {
+      const request = await this._generationRequest(client, generationRequestId, { lock: true });
+      if (request.owner_user_id !== user.userId) {
+        throw new HttpError(403, 'forbidden', 'Generation request owner required');
+      }
+      const replay = await this._replay(
+        client,
+        user.userId,
+        'markGenerationReviewPending',
+        key,
+        requestFingerprint,
+      );
+      if (replay) return replay;
+      const { binding } = await this._generationContext(
+        client,
+        request,
+        user,
+        { ready: true },
+      );
+      if (binding.publish_mode !== 'reviewRequired') {
+        throw new HttpError(409, 'generation_state_conflict', 'Binding does not require review');
+      }
+      const snapshot = rowToGenerationRequest(request);
+      requireGenerationVersion(snapshot, expectedRequestVersion);
+      requireGenerationStatus(snapshot, 'generating');
+      requireGenerationLease(snapshot, user, leaseId, leaseEpoch, this.clock());
+      const changed = await client.query(
+        `UPDATE generation_requests
+            SET status = 'review_pending', request_version = request_version + 1,
+                draft_device_id = $1, lease_id = NULL, lease_expires_at = NULL,
+                updated_at = $2
+          WHERE id = $3 RETURNING *`,
+        [user.deviceId, this.clock(), generationRequestId],
+      );
+      const body = rowToGenerationRequest(changed.rows[0]);
+      await this._saveReplay(client, {
+        principalId: user.userId,
+        operation: 'markGenerationReviewPending',
+        key,
+        requestFingerprint,
+        status: 200,
+        body,
+      });
+      return { status: 200, body };
+    });
+  }
+
+  async failGenerationRequest({
+    user,
+    generationRequestId,
+    expectedRequestVersion,
+    leaseId,
+    leaseEpoch,
+    key,
+    requestFingerprint,
+  }) {
+    return this._transaction(async (client) => {
+      const request = await this._generationRequest(client, generationRequestId, { lock: true });
+      if (request.owner_user_id !== user.userId) {
+        throw new HttpError(403, 'forbidden', 'Generation request owner required');
+      }
+      const replay = await this._replay(
+        client,
+        user.userId,
+        'failGenerationRequest',
+        key,
+        requestFingerprint,
+      );
+      if (replay) return replay;
+      const snapshot = rowToGenerationRequest(request);
+      requireGenerationVersion(snapshot, expectedRequestVersion);
+      requireGenerationStatus(snapshot, 'generating');
+      requireGenerationLease(snapshot, user, leaseId, leaseEpoch, this.clock());
+      const changed = await client.query(
+        `UPDATE generation_requests
+            SET status = 'failed', request_version = request_version + 1,
+                lease_id = NULL, lease_expires_at = NULL, updated_at = $1
+          WHERE id = $2 RETURNING *`,
+        [this.clock(), generationRequestId],
+      );
+      const body = rowToGenerationRequest(changed.rows[0]);
+      await this._saveReplay(client, {
+        principalId: user.userId,
+        operation: 'failGenerationRequest',
+        key,
+        requestFingerprint,
+        status: 200,
+        body,
+      });
+      return { status: 200, body };
+    });
+  }
+
+  async discardGenerationRequest({
+    user,
+    generationRequestId,
+    expectedRequestVersion,
+    key,
+    requestFingerprint,
+  }) {
+    return this._transaction(async (client) => {
+      const request = await this._generationRequest(client, generationRequestId, { lock: true });
+      if (request.owner_user_id !== user.userId) {
+        throw new HttpError(403, 'forbidden', 'Generation request owner required');
+      }
+      const replay = await this._replay(
+        client,
+        user.userId,
+        'discardGenerationRequest',
+        key,
+        requestFingerprint,
+      );
+      if (replay) return replay;
+      const snapshot = rowToGenerationRequest(request);
+      requireGenerationVersion(snapshot, expectedRequestVersion);
+      requireGenerationStatus(snapshot, 'review_pending');
+      if (request.draft_device_id !== user.deviceId) {
+        throw new HttpError(403, 'forbidden', 'Draft device required');
+      }
+      const changed = await client.query(
+        `UPDATE generation_requests
+            SET status = 'discarded', request_version = request_version + 1,
+                updated_at = $1
+          WHERE id = $2 RETURNING *`,
+        [this.clock(), generationRequestId],
+      );
+      const body = rowToGenerationRequest(changed.rows[0]);
+      await this._saveReplay(client, {
+        principalId: user.userId,
+        operation: 'discardGenerationRequest',
+        key,
+        requestFingerprint,
+        status: 200,
+        body,
+      });
+      return { status: 200, body };
+    });
+  }
+
+  async publishGenerationRequest({
+    user,
+    generationRequestId,
+    expectedRequestVersion,
+    expectedBindingPolicyRevision,
+    clientMessageId,
+    text,
+    mentions,
+    replyToMessageId,
+    leaseId,
+    leaseEpoch,
+    key,
+    requestFingerprint,
+    automatic = false,
+  }) {
+    return this._transaction(async (client) => {
+      const request = await this._generationRequest(client, generationRequestId, { lock: true });
+      if (request.owner_user_id !== user.userId) {
+        throw new HttpError(403, 'forbidden', 'Generation request owner required');
+      }
+      const operation = automatic
+        ? 'publishAutomaticGenerationRequest'
+        : 'publishGenerationRequest';
+      const replay = await this._replay(
+        client,
+        user.userId,
+        operation,
+        key,
+        requestFingerprint,
+      );
+      if (replay) return replay;
+      const { room, membership, binding } = await this._generationContext(
+        client,
+        request,
+        user,
+        { ready: true },
+      );
+      const snapshot = rowToGenerationRequest(request);
+      requireGenerationVersion(snapshot, expectedRequestVersion);
+      if (automatic) {
+        if (request.source !== 'automatic' || binding.publish_mode !== 'automatic') {
+          throw new HttpError(
+            409,
+            'generation_state_conflict',
+            'Generation request is not eligible for automatic publication',
+          );
+        }
+        requireGenerationStatus(snapshot, 'generating');
+        requireGenerationLease(snapshot, user, leaseId, leaseEpoch, this.clock());
+      } else {
+        requireGenerationStatus(snapshot, 'review_pending');
+        if (request.draft_device_id !== user.deviceId) {
+          throw new HttpError(403, 'forbidden', 'Draft device required');
+        }
+        if (leaseId !== null || leaseEpoch !== null) {
+          throw new HttpError(
+            409,
+            'generation_state_conflict',
+            'Review publication must not use a lease',
+          );
+        }
+      }
+      const currentPolicyRevision = safeInteger(
+        binding.policy_revision,
+        'room_agent_bindings.policy_revision',
+      );
+      if (
+        expectedBindingPolicyRevision !== snapshot.bindingPolicyRevision ||
+        expectedBindingPolicyRevision !== currentPolicyRevision
+      ) {
+        throw new HttpError(
+          409,
+          'request_version_conflict',
+          'Binding policy revision does not match',
+        );
+      }
+      const existing = await client.query(
+        `SELECT 1 FROM messages
+          WHERE generation_request_id = $1 OR (room_id = $2 AND client_message_id = $3)`,
+        [generationRequestId, request.room_id, clientMessageId],
+      );
+      if (existing.rowCount > 0) {
+        throw new HttpError(409, 'conflict', 'Generation or client message is already published');
+      }
+      const loopState = await client.query(
+        `WITH cycle AS (
+           SELECT COALESCE((
+             SELECT seq FROM messages
+              WHERE room_id = $1 AND sender->>'kind' = 'human'
+              ORDER BY seq DESC
+              LIMIT 1
+           ), 0) AS start_seq
+         )
+         SELECT
+           COUNT(*) FILTER (WHERE m.sender->>'kind' = 'agent') AS ai_count,
+           COUNT(*) FILTER (
+             WHERE m.sender->>'kind' = 'agent' AND m.sender->>'userId' = $2
+           ) AS owner_ai_count,
+           (
+             SELECT COUNT(*) FROM room_agent_bindings
+              WHERE room_id = $1 AND participation_mode = 'automatic'
+           ) AS enabled_agent_count
+           FROM messages m CROSS JOIN cycle c
+          WHERE m.room_id = $1 AND m.seq > c.start_seq`,
+        [request.room_id, user.userId],
+      );
+      const aiCount = safeInteger(loopState.rows[0].ai_count, 'AI message count');
+      const ownerAiCount = safeInteger(
+        loopState.rows[0].owner_ai_count,
+        'Agent message count',
+      );
+      const enabledAgentCount = safeInteger(
+        loopState.rows[0].enabled_agent_count,
+        'Enabled agent count',
+      );
+      if (ownerAiCount >= AGENT_MESSAGES_PER_CYCLE_LIMIT) {
+        throw new HttpError(
+          409,
+          'agent_loop_limit_reached',
+          'Agent reply already published for the current human cycle; stop the current assistant turn',
+        );
+      }
+      const roomLimit = Math.min(
+        Math.max(enabledAgentCount, 1) * AGENT_MESSAGES_PER_CYCLE_LIMIT,
+        ABSOLUTE_CONSECUTIVE_AI_LIMIT,
+      );
+      if (aiCount >= roomLimit) {
+        throw new HttpError(
+          409,
+          'agent_loop_limit_reached',
+          'Room AI message limit reached for the current human cycle',
+        );
+      }
+      const mentionedUserIds = mentions
+        .filter((mention) => mention.kind === 'user')
+        .map((mention) => mention.targetId);
+      if (mentionedUserIds.length > 0) {
+        const targets = await client.query(
+          `SELECT user_id FROM room_members
+            WHERE room_id = $1 AND user_id = ANY($2::text[])`,
+          [request.room_id, mentionedUserIds],
+        );
+        if (targets.rowCount !== mentionedUserIds.length) {
+          throw new HttpError(400, 'invalid_request', 'Mention target is not a room member');
+        }
+      }
+      const mentionedAgentIds = mentions
+        .filter((mention) => mention.kind === 'agent')
+        .map((mention) => mention.targetId);
+      if (mentionedAgentIds.length > 0) {
+        const targets = await client.query(
+          `SELECT agent_profile_id FROM room_agent_bindings
+            WHERE room_id = $1 AND agent_profile_id = ANY($2::text[])`,
+          [request.room_id, mentionedAgentIds],
+        );
+        if (targets.rowCount !== mentionedAgentIds.length) {
+          throw new HttpError(400, 'invalid_request', 'Mentioned agent is not visible in the room');
+        }
+      }
+      if (replyToMessageId !== null) {
+        const target = await client.query(
+          'SELECT seq FROM messages WHERE id = $1 AND room_id = $2',
+          [replyToMessageId, request.room_id],
+        );
+        if (target.rowCount === 0) {
+          throw new HttpError(404, 'resource_not_found', 'Reply target not found');
+        }
+        if (
+          safeInteger(target.rows[0].seq, 'messages.seq') <
+          safeInteger(membership.joined_seq, 'room_members.joined_seq')
+        ) {
+          throw new HttpError(
+            403,
+            'history_not_visible',
+            'Reply target is outside membership history',
+          );
+        }
+      }
+      const profileResult = await client.query(
+        'SELECT * FROM agent_profiles WHERE id = $1',
+        [binding.agent_profile_id],
+      );
+      if (profileResult.rowCount === 0) {
+        throw new HttpError(404, 'resource_not_found', 'Agent profile not found');
+      }
+      const profile = profileResult.rows[0];
+      const now = this.clock();
+      const seq = safeInteger(room.last_seq, 'rooms.last_seq') + 1;
+      const message = {
+        id: newId('msg'),
+        roomId: request.room_id,
+        seq,
+        clientMessageId,
+        sender: {
+          kind: 'agent',
+          userId: user.userId,
+          agentProfileId: profile.id,
+          displayNameSnapshot: profile.display_name,
+          avatarResourceIdSnapshot: profile.avatar_resource_id,
+        },
+        content: { schemaVersion: 1, type: 'text', text },
+        mentions,
+        replyToMessageId,
+        generationRequestId,
+        triggerThroughSeq: snapshot.triggerThroughSeq,
+        createdAt: now.toISOString(),
+      };
+      await client.query(
+        `INSERT INTO messages(
+           id, room_id, seq, client_message_id, sender, content, mentions,
+           reply_to_message_id, generation_request_id, trigger_through_seq,
+           created_at
+         ) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11)`,
+        [
+          message.id,
+          message.roomId,
+          seq,
+          clientMessageId,
+          message.sender,
+          message.content,
+          JSON.stringify(mentions),
+          replyToMessageId,
+          generationRequestId,
+          snapshot.triggerThroughSeq,
+          now,
+        ],
+      );
+      await client.query('UPDATE rooms SET last_seq = $1 WHERE id = $2', [seq, request.room_id]);
+      const changed = await client.query(
+        `UPDATE generation_requests
+            SET status = 'published', request_version = request_version + 1,
+                lease_id = CASE WHEN $3 THEN NULL ELSE lease_id END,
+                lease_expires_at = CASE WHEN $3 THEN NULL ELSE lease_expires_at END,
+                updated_at = $1
+          WHERE id = $2 RETURNING *`,
+        [now, generationRequestId, automatic],
+      );
+      const body = {
+        generationRequest: rowToGenerationRequest(changed.rows[0]),
+        message,
+      };
+      await this._saveReplay(client, {
+        principalId: user.userId,
+        operation,
+        key,
+        requestFingerprint,
+        status: 200,
+        body,
+      });
+      await client.query(
+        `INSERT INTO outbox_events(
+           event_id, event_type, room_id, payload, occurred_at, dispatched_at
+         ) VALUES ($1, 'message.created', $2, $3, $4, NULL)`,
+        [newId('evt'), request.room_id, message, now],
+      );
+      return { status: 200, body };
+    });
+  }
+
+  async publishAutomaticGenerationRequest(parameters) {
+    return this.publishGenerationRequest({ ...parameters, automatic: true });
+  }
+
+  async listInvites({ userId, roomId }) {
+    await this._room(this.pool, roomId);
+    await this._membership(this.pool, roomId, userId, { manager: true });
+    const result = await this.pool.query(
+      `SELECT * FROM room_invites
+        WHERE room_id = $1
+          AND revoked_at IS NULL
+          AND remaining_uses > 0
+          AND expires_at > $2
+        ORDER BY created_at DESC`,
+      [roomId, this.clock()],
+    );
+    return result.rows.map(rowToInvite);
+  }
+
+  async createInvite({
+    userId,
+    roomId,
+    expectedRoomRevision,
+    expiresAt,
+    maxUses,
+    key,
+    requestFingerprint,
+  }) {
+    return this._transaction(async (client) => {
+      const room = await this._room(client, roomId, { lock: true });
+      await this._membership(client, roomId, userId, { manager: true });
+      const replay = await this._replay(
+        client,
+        userId,
+        'createRoomInvite',
+        key,
+        requestFingerprint,
+      );
+      if (replay) return replay;
+      if (expectedRoomRevision !== safeInteger(room.revision, 'rooms.revision')) {
+        throw new HttpError(409, 'request_version_conflict', 'Room revision does not match');
+      }
+      const now = this.clock();
+      const token = randomBytes(16).toString('base64url');
+      const inserted = await client.query(
+        `INSERT INTO room_invites(
+           id, room_id, created_by_user_id, token_hash, expires_at,
+           max_uses, remaining_uses, created_at, revoked_at
+         ) VALUES ($1, $2, $3, $4, $5, $6, $6, $7, NULL)
+         RETURNING *`,
+        [newId('invite'), roomId, userId, hash(token), new Date(expiresAt), maxUses, now],
+      );
+      const body = { ...rowToInvite(inserted.rows[0]), inviteToken: token };
+      await this._saveReplay(client, {
+        principalId: userId,
+        operation: 'createRoomInvite',
+        key,
+        requestFingerprint,
+        status: 201,
+        body,
+      });
+      return { status: 201, body };
+    });
+  }
+
+  async revokeInvite({ userId, roomId, inviteId, key, requestFingerprint }) {
+    return this._transaction(async (client) => {
+      await this._room(client, roomId);
+      await this._membership(client, roomId, userId, { manager: true });
+      const replay = await this._replay(
+        client,
+        userId,
+        'revokeRoomInvite',
+        key,
+        requestFingerprint,
+      );
+      if (replay) return replay;
+      const result = await client.query(
+        `SELECT * FROM room_invites
+          WHERE id = $1 AND room_id = $2
+          FOR UPDATE`,
+        [inviteId, roomId],
+      );
+      if (result.rowCount === 0) {
+        throw new HttpError(404, 'resource_not_found', 'Invite not found');
+      }
+      const invite = result.rows[0];
+      if (invite.revoked_at || invite.remaining_uses <= 0 || invite.expires_at <= this.clock()) {
+        throw new HttpError(409, 'conflict', 'Invite is no longer active');
+      }
+      await client.query(
+        'UPDATE room_invites SET revoked_at = $1 WHERE id = $2',
+        [this.clock(), inviteId],
+      );
+      await this._saveReplay(client, {
+        principalId: userId,
+        operation: 'revokeRoomInvite',
+        key,
+        requestFingerprint,
+        status: 204,
+        body: null,
+      });
+      return { status: 204, body: null };
+    });
+  }
+
+  async acceptInvite({ userId, inviteToken, key, requestFingerprint }) {
+    return this._transaction(async (client) => {
+      const replay = await this._replay(
+        client,
+        userId,
+        'acceptRoomInvite',
+        key,
+        requestFingerprint,
+      );
+      if (replay) return replay;
+      const inviteResult = await client.query(
+        'SELECT * FROM room_invites WHERE token_hash = $1 FOR UPDATE',
+        [hash(inviteToken)],
+      );
+      if (inviteResult.rowCount === 0) {
+        throw new HttpError(409, 'conflict', 'Invite is not valid');
+      }
+      const invite = inviteResult.rows[0];
+      if (invite.revoked_at || invite.remaining_uses <= 0 || invite.expires_at <= this.clock()) {
+        throw new HttpError(409, 'conflict', 'Invite is not valid');
+      }
+      let room = await this._room(client, invite.room_id, { lock: true });
+      let membership = await client.query(
+        'SELECT * FROM room_members WHERE room_id = $1 AND user_id = $2',
+        [room.id, userId],
+      );
+      if (membership.rowCount === 0) {
+        const joinedSeq = safeInteger(room.last_seq, 'rooms.last_seq') + 1;
+        membership = await client.query(
+          `INSERT INTO room_members(room_id, user_id, role, joined_seq, read_seq)
+           VALUES ($1, $2, 'member', $3, $4)
+           RETURNING *`,
+          [room.id, userId, joinedSeq, safeInteger(room.last_seq, 'rooms.last_seq')],
+        );
+        await client.query(
+          'UPDATE room_invites SET remaining_uses = remaining_uses - 1 WHERE id = $1',
+          [invite.id],
+        );
+        const updatedRoom = await client.query(
+          `UPDATE rooms
+              SET revision = revision + 1, updated_at = $1
+            WHERE id = $2
+            RETURNING *`,
+          [this.clock(), room.id],
+        );
+        room = updatedRoom.rows[0];
+      }
+      const user = await client.query(
+        'SELECT display_name, avatar_resource_id FROM users WHERE id = $1',
+        [userId],
+      );
+      const memberRow = {
+        ...membership.rows[0],
+        display_name: user.rows[0].display_name,
+        avatar_resource_id: user.rows[0].avatar_resource_id,
+      };
+      const body = {
+        room: rowToRoom(room),
+        membership: rowToMembership(memberRow, true),
+      };
+      await this._saveReplay(client, {
+        principalId: userId,
+        operation: 'acceptRoomInvite',
+        key,
+        requestFingerprint,
+        status: 200,
+        body,
+      });
+      return { status: 200, body };
+    });
+  }
+
+  async listMessages({ userId, roomId, afterSeq, limit }) {
+    const room = await this._room(this.pool, roomId);
+    const membership = await this._membership(this.pool, roomId, userId);
+    const result = await this.pool.query(
+      `SELECT * FROM messages
+        WHERE room_id = $1 AND seq > $2 AND seq >= $3
+        ORDER BY seq
+        LIMIT $4`,
+      [roomId, afterSeq, safeInteger(membership.joined_seq, 'room_members.joined_seq'), limit + 1],
+    );
+    return {
+      items: result.rows.slice(0, limit).map(rowToMessage),
+      highWaterSeq: safeInteger(room.last_seq, 'rooms.last_seq'),
+      hasMore: result.rows.length > limit,
+    };
+  }
+
+  async createHumanMessage({
+    user,
+    roomId,
+    clientMessageId,
+    text,
+    mentions,
+    replyToMessageId,
+    key,
+    requestFingerprint,
+  }) {
+    return this._transaction(async (client) => {
+      const room = await this._room(client, roomId, { lock: true });
+      const membership = await this._membership(client, roomId, user.userId);
+      const replay = await this._replay(
+        client,
+        user.userId,
+        'createHumanMessage',
+        key,
+        requestFingerprint,
+      );
+      if (replay) return replay;
+      const mentionedUserIds = mentions
+        .filter((mention) => mention.kind === 'user')
+        .map((mention) => mention.targetId);
+      if (mentionedUserIds.length > 0) {
+        const targets = await client.query(
+          `SELECT user_id FROM room_members
+            WHERE room_id = $1 AND user_id = ANY($2::text[])`,
+          [roomId, mentionedUserIds],
+        );
+        if (targets.rowCount !== mentionedUserIds.length) {
+          throw new HttpError(400, 'invalid_request', 'Mention target is not a room member');
+        }
+      }
+      if (replyToMessageId) {
+        const target = await client.query(
+          'SELECT seq FROM messages WHERE id = $1 AND room_id = $2',
+          [replyToMessageId, roomId],
+        );
+        if (target.rowCount === 0) {
+          throw new HttpError(404, 'resource_not_found', 'Reply target not found');
+        }
+        if (safeInteger(target.rows[0].seq, 'messages.seq') <
+            safeInteger(membership.joined_seq, 'room_members.joined_seq')) {
+          throw new HttpError(403, 'history_not_visible', 'Reply target is outside membership history');
+        }
+      }
+      const now = this.clock();
+      const seq = safeInteger(room.last_seq, 'rooms.last_seq') + 1;
+      const message = {
+        id: newId('msg'),
+        roomId,
+        seq,
+        clientMessageId,
+        sender: {
+          kind: 'human',
+          userId: user.userId,
+          displayNameSnapshot: user.displayName,
+          avatarResourceIdSnapshot: user.avatarResourceId,
+        },
+        content: { schemaVersion: 1, type: 'text', text },
+        mentions,
+        replyToMessageId,
+        createdAt: now.toISOString(),
+      };
+      await client.query(
+        `INSERT INTO messages(
+           id, room_id, seq, client_message_id, sender, content, mentions,
+           reply_to_message_id, generation_request_id, trigger_through_seq, created_at
+         ) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, NULL, NULL, $9)`,
+        [
+          message.id,
+          roomId,
+          seq,
+          clientMessageId,
+          message.sender,
+          message.content,
+          JSON.stringify(mentions),
+          replyToMessageId,
+          now,
+        ],
+      );
+      await client.query('UPDATE rooms SET last_seq = $1 WHERE id = $2', [seq, roomId]);
+      await this._saveReplay(client, {
+        principalId: user.userId,
+        operation: 'createHumanMessage',
+        key,
+        requestFingerprint,
+        status: 201,
+        body: message,
+      });
+      await client.query(
+        `INSERT INTO outbox_events(
+           event_id, event_type, room_id, payload, occurred_at, dispatched_at
+         ) VALUES ($1, 'message.created', $2, $3, $4, NULL)`,
+        [newId('evt'), roomId, message, now],
+      );
+      return { status: 201, body: message };
+    });
+  }
+
+  async listPendingOutboxEvents(limit = 100) {
+    const result = await this.pool.query(
+      `SELECT id, event_id, event_type, room_id, payload, occurred_at
+         FROM outbox_events
+        WHERE dispatched_at IS NULL
+        ORDER BY id
+        LIMIT $1`,
+      [limit],
+    );
+    return result.rows.map((row) => ({
+      outboxId: String(row.id),
+      event: {
+        protocolVersion: 1,
+        eventId: row.event_id,
+        type: row.event_type,
+        occurredAt: iso(row.occurred_at),
+        ...(row.room_id ? { roomId: row.room_id } : {}),
+        payload: row.payload,
+      },
+    }));
+  }
+
+  async markOutboxDispatched(outboxId) {
+    await this.pool.query(
+      'UPDATE outbox_events SET dispatched_at = $1 WHERE id = $2 AND dispatched_at IS NULL',
+      [this.clock(), outboxId],
+    );
+  }
+
+  async listRealtimeRecipientUserIds(roomId, messageSeq) {
+    const result = await this.pool.query(
+      `SELECT user_id FROM room_members
+        WHERE room_id = $1 AND joined_seq <= $2`,
+      [roomId, messageSeq],
+    );
+    return result.rows.map((row) => row.user_id);
+  }
+}

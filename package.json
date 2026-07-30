@@ -1,0 +1,20 @@
+{
+  "name": "chuanhuatong-mcp",
+  "version": "0.1.0",
+  "private": true,
+  "type": "module",
+  "scripts": {
+    "start": "node src/server.mjs",
+    "start:dev": "node src/server.mjs --dev-auth",
+    "start:memory": "node src/server.mjs --dev-auth --memory",
+    "db:migrate": "node src/migrate.mjs",
+    "test": "node --test",
+    "check": "node --check src/server.mjs"
+  },
+  "dependencies": {
+    "@modelcontextprotocol/sdk": "^1.30.0",
+    "pg": "^8.22.0",
+    "ws": "^8.21.1",
+    "zod": "^4.4.3"
+  }
+}

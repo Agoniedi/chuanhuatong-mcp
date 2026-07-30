@@ -1,0 +1,33 @@
+services:
+  postgres:
+    image: postgres:17-alpine
+    environment:
+      POSTGRES_DB: chuanhuatong
+      POSTGRES_USER: chuanhuatong
+      POSTGRES_PASSWORD: chuanhuatong_local_only
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U chuanhuatong -d chuanhuatong"]
+      interval: 5s
+      timeout: 3s
+      retries: 20
+    volumes:
+      - chuanhuatong_postgres:/var/lib/postgresql/data
+
+  server:
+    build: .
+    depends_on:
+      postgres:
+        condition: service_healthy
+    environment:
+      NODE_ENV: development
+      DATABASE_URL: postgresql://chuanhuatong:chuanhuatong_local_only@postgres:5432/chuanhuatong
+      RUN_MIGRATIONS: "1"
+      LOCAL_DEV_AUTH: "1"
+      SERVER_HOST: 0.0.0.0
+      PORT: "18787"
+    ports:
+      - "127.0.0.1:18787:18787"
+    restart: unless-stopped
+
+volumes:
+  chuanhuatong_postgres:
