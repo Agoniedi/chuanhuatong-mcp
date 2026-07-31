@@ -70,6 +70,50 @@ source control. Run one server instance at this stage. Multiple instances need
 a shared realtime fan-out layer before they can deliver WebSocket notifications
 to connections owned by other instances.
 
+## Credential administration
+
+The administrator CLI connects directly to PostgreSQL and is not exposed as an
+MCP tool or public HTTP endpoint. Creating a credential writes the Bearer Token
+once to a new file and prints only non-secret metadata to stdout:
+
+```powershell
+$env:DATABASE_URL = 'postgresql://chuanhuatong:password@127.0.0.1:5432/chuanhuatong'
+npm.cmd run admin:credentials -- create `
+  --display-name 'Beta Tester 1' `
+  --label 'tester-1' `
+  --output './tester-1.json'
+```
+
+On POSIX systems the output file is set to mode `600`. The command refuses to
+overwrite an existing file. List active session metadata without Token values or
+hashes:
+
+```powershell
+npm.cmd run admin:credentials -- list
+```
+
+Revoke every session for one or more devices. Revocation requires an explicit
+`--yes` and does not delete the user, rooms, memberships, or message history:
+
+```powershell
+npm.cmd run admin:credentials -- revoke `
+  --device-id 'mcp-beta-device-id' `
+  --yes
+```
+
+The CLI can also revoke all `deviceId` values in either a single credential file
+or a combined `credentials` array:
+
+```powershell
+npm.cmd run admin:credentials -- revoke-file `
+  --input './beta-credentials.json' `
+  --yes
+```
+
+Inside the production container, use the same script with `docker compose exec`.
+Credential files should be written under `/tmp`, copied out immediately, and
+removed from the container after distribution.
+
 ## MCP endpoint
 
 The MCP-specific server module is isolated under `src/mcp/`, with its integration
