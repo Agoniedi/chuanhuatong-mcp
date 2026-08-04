@@ -130,11 +130,11 @@ tests under `test/mcp/`. The durable REST/store implementation remains shared.
 - `group_handoff_to_room(clientRequestId, title, contextSummary, decisions?, openQuestions?, inviteOptions?)`
 - `group_read_messages(roomId, afterSeq, limit)`
 - `group_wait_for_messages(roomId, afterSeq, timeoutMs)`
-- `group_activate_agent(roomId, publicProfile, runtimeCapabilitiesVersion, localConfigRevision)`
+- `group_activate_agent(roomId, publicProfile, triggerScope?, runtimeCapabilitiesVersion, localConfigRevision)`
 - `group_heartbeat_agent(roomId, leaseId, leaseEpoch)`
 - `group_deactivate_agent(roomId, leaseId, leaseEpoch)`
 - `group_send_message(roomId, clientMessageId, text, mentions?, replyToMessageId?)`
-- `group_publish_agent_reply(roomId, triggerBatchId, triggerMessageIds, clientMessageId, text, publicProfile?, mentions?, replyToMessageId?)`
+- `group_publish_agent_reply(roomId, triggerBatchId, triggerMessageIds, clientMessageId, text, publicProfile?, triggerScope?, mentions?, replyToMessageId?)`
 
 Every request requires `Authorization: Bearer <access-token>`. MCP POST clients
 must send `Accept: application/json, text/event-stream`; calls after initialization
@@ -157,24 +157,29 @@ The lifecycle tools derive both user and device identity from the Bearer session
 They maintain a 60-second per-binding runtime lease with an epoch fencing token;
 another registered device can take over only after expiry, and stale devices
 cannot heartbeat, deactivate, claim, or publish through the transferred binding.
-Agent publication also enforces a server-side human-message cycle: each agent
-may publish at most one message, while the room total is capped at the enabled-
-agent count and never above 20. A new human message resets the cycle.
-Limit failures use `agent_loop_limit_reached`; idempotent publication replays are
-returned before the limit check. A successful MCP publication returns
+Agent publication uses the binding's trigger scope. New MCP activations default
+to `allMessages`, allowing an agent to respond to either human or agent room
+messages. Existing bindings preserve their configured scope unless
+`group_publish_agent_reply.triggerScope` explicitly changes it;
+`allHumanMessages` and `mentionsOnly` remain available for stricter automatic
+participation. In `allMessages` mode, one agent cannot answer the same trigger
+message set twice, and the room stops after 20 consecutive AI messages until a human
+message resets the run. Stricter scopes retain the one-agent-message-per-human-
+cycle limit. Limit failures use `agent_loop_limit_reached`; idempotent publication
+replays are returned before the limit check. A successful MCP publication returns
 `nextAction=stop_current_turn`; a loop-limit error returns `retryable=false` and
 the same `nextAction`, so a Host must not retry with new IDs in that turn.
-MCP agent activation defaults to `allHumanMessages`, and automatic generation
-rejects ineligible trigger messages with `trigger_not_eligible`; this prevents
-an agent reply from recursively triggering itself. The generic REST API still
-supports an explicit `allMessages` policy.
+Automatic generation rejects trigger messages outside the selected scope with
+`trigger_not_eligible`.
 `group_publish_agent_reply` accepts an optional `publicProfile` when the room has
 no agent binding yet, folding first-time configuration and publication into one
-MCP call. `group_activate_agent` remains available for an explicit profile change
-or advanced standalone lifecycle use. Publication automatically recovers an
-existing binding's expired, stale, or missing runtime lease before retrying the
-same idempotent generation request. An active lease on another device still
-returns `lease_conflict`; normal MCP reply flows do not need heartbeat calls.
+MCP call. Its optional `triggerScope` can explicitly change an active binding's
+policy before publication. `group_activate_agent` remains available for an
+explicit profile or policy change and advanced standalone lifecycle use.
+Publication automatically recovers an existing binding's expired, stale, or
+missing runtime lease before retrying the same idempotent generation request. An
+active lease on another device still returns `lease_conflict`; normal MCP reply
+flows do not need heartbeat calls.
 `group_send_message` always derives the human sender from the Bearer identity
 and is not an agent-send operation.
 `group_handoff_to_room` atomically creates a room owned by the caller, seeds one

@@ -377,7 +377,6 @@ async function publishAutomaticAgentReply({ store, user, args }) {
     triggerMessageIds: args.triggerMessageIds,
     key: args.triggerBatchId,
     requestFingerprint,
-    humanTriggersOnly: true,
   });
   let generationRequest = await store.getGenerationRequest({
     userId: user.userId,
@@ -438,19 +437,47 @@ async function publishAutomaticAgentReply({ store, user, args }) {
 }
 
 async function publishAgentReplyWithRuntimeRecovery({ store, user, args }) {
-  if (args.publicProfile !== undefined) {
-    try {
-      await store.getMyRoomAgentBinding({ userId: user.userId, roomId: args.roomId });
-    } catch (error) {
-      if (!(error instanceof HttpError) || error.code !== 'resource_not_found') throw error;
-      await store.activateMyAgent({
-        user,
-        roomId: args.roomId,
-        publicProfile: args.publicProfile,
-        runtimeCapabilitiesVersion: MCP_RUNTIME_CAPABILITIES_VERSION,
-        localConfigRevision: 0,
-      });
-    }
+  let binding = null;
+  try {
+    binding = await store.getMyRoomAgentBinding({
+      userId: user.userId,
+      roomId: args.roomId,
+    });
+  } catch (error) {
+    if (!(error instanceof HttpError) || error.code !== 'resource_not_found') throw error;
+  }
+  const requestedTriggerScope = args.triggerScope ?? binding?.triggerScope ?? 'allMessages';
+  if (binding === null && args.publicProfile !== undefined) {
+    await store.activateMyAgent({
+      user,
+      roomId: args.roomId,
+      publicProfile: args.publicProfile,
+      triggerScope: requestedTriggerScope,
+      runtimeCapabilitiesVersion: MCP_RUNTIME_CAPABILITIES_VERSION,
+      localConfigRevision: 0,
+    });
+  } else if (
+    binding !== null &&
+    binding.participationMode === 'automatic' &&
+    args.triggerScope !== undefined &&
+    binding.triggerScope !== requestedTriggerScope
+  ) {
+    const context = await store.getRoomContext({ userId: user.userId, roomId: args.roomId });
+    const ownAgent = context.agentBindings.find(
+      ({ binding: candidate }) => candidate.bindingId === binding.bindingId,
+    );
+    await store.activateMyAgent({
+      user,
+      roomId: args.roomId,
+      publicProfile: {
+        displayName: ownAgent.agentProfile.displayName,
+        avatarResourceId: ownAgent.agentProfile.avatarResourceId,
+        shortBio: ownAgent.agentProfile.shortBio,
+      },
+      triggerScope: requestedTriggerScope,
+      runtimeCapabilitiesVersion: MCP_RUNTIME_CAPABILITIES_VERSION,
+      localConfigRevision: 0,
+    });
   }
   try {
     return await publishAutomaticAgentReply({ store, user, args });
@@ -630,10 +657,12 @@ export function createGroupChatMcpServer({
   }), logger));
 
   server.registerTool('group_activate_agent', {
-    description: 'Configure the authenticated user\'s public room-agent profile and perform initial activation. Use only for first-time setup or an explicit profile change. Do not call before each reply or to renew an expired lease; group_publish_agent_reply recovers this device\'s runtime automatically.',
+    description: 'Configure the authenticated user\'s public room-agent profile, message trigger scope, and initial activation. triggerScope defaults to allMessages so the agent can respond to human or agent room messages; use allHumanMessages or mentionsOnly for stricter automatic participation. Use only for first-time setup or an explicit profile or policy change. Do not call before each reply or to renew an expired lease; group_publish_agent_reply recovers this device\'s runtime automatically.',
     inputSchema: z.object({
       roomId: idSchema,
       publicProfile: publicProfileInputSchema,
+      triggerScope: z.enum(['mentionsOnly', 'allHumanMessages', 'allMessages'])
+        .default('allMessages'),
       runtimeCapabilitiesVersion: z.number().int().min(1).max(Number.MAX_SAFE_INTEGER),
       localConfigRevision: z.number().int().min(0).max(Number.MAX_SAFE_INTEGER),
     }).strict(),
@@ -643,6 +672,7 @@ export function createGroupChatMcpServer({
     user,
     roomId: args.roomId,
     publicProfile: args.publicProfile,
+    triggerScope: args.triggerScope,
     runtimeCapabilitiesVersion: args.runtimeCapabilitiesVersion,
     localConfigRevision: args.localConfigRevision,
   }), logger));
@@ -742,7 +772,7 @@ export function createGroupChatMcpServer({
   }, logger));
 
   server.registerTool('group_publish_agent_reply', {
-    description: 'Publish exactly one AI agent reply to eligible unseen human messages. The server allows at most one agent reply per human-message cycle: never retry with new IDs after success or agent_loop_limit_reached. For the first reply in a room, include publicProfile to configure and activate the agent in this same call; omit it after the binding exists, and reuse the exact value only for an idempotent retry after a lost response. This tool automatically recovers an existing room-agent runtime, so do not call group_activate_agent or group_heartbeat_agent before it. Use this, not group_send_message, when speaking as the AI agent. Never use an agent message as a trigger. After success, obey nextAction=stop_current_turn: stop the current assistant turn without reading or publishing again.',
+    description: 'Publish exactly one AI agent message in response to selected visible room messages. For a new binding, triggerScope defaults to allMessages. For an existing binding, omit triggerScope to preserve its policy, or explicitly set allMessages when replying to a human or agent room message; choose allHumanMessages or mentionsOnly for stricter automatic participation. Each agent may answer the same trigger message set only once, and the server stops a run of 20 consecutive AI messages. For the first reply in a room, include publicProfile to configure and activate the agent in this same call; omit it after the binding exists, and reuse the exact value only for an idempotent retry after a lost response. This tool updates an explicitly requested trigger scope and automatically recovers the existing room-agent runtime, so do not call group_activate_agent or group_heartbeat_agent before it. Use this, not group_send_message, when speaking as the AI agent. After success, obey nextAction=stop_current_turn: stop the current assistant turn without reading or publishing again.',
     inputSchema: z.object({
       roomId: idSchema,
       triggerBatchId: idSchema,
@@ -750,6 +780,7 @@ export function createGroupChatMcpServer({
       clientMessageId: idSchema,
       text: z.string().min(1).max(32768),
       publicProfile: publicProfileInputSchema.optional(),
+      triggerScope: z.enum(['mentionsOnly', 'allHumanMessages', 'allMessages']).optional(),
       mentions: mentionsSchema.default([]),
       replyToMessageId: idSchema.nullable().default(null),
     }).strict(),

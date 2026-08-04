@@ -314,6 +314,7 @@ describe('stateless Group Chat MCP read loop', () => {
     );
     assert.match(activateTool.description, /first-time setup/i);
     assert.match(activateTool.description, /do not call before each reply/i);
+    assert.equal(activateTool.inputSchema.properties.triggerScope.default, 'allMessages');
     const agentReplyTool = result.body.result.tools.find(
       (tool) => tool.name === 'group_publish_agent_reply',
     );
@@ -321,6 +322,11 @@ describe('stateless Group Chat MCP read loop', () => {
     assert.match(agentReplyTool.description, /first reply.*publicProfile/i);
     assert.match(agentReplyTool.description, /not group_send_message/i);
     assert.match(agentReplyTool.description, /stop the current assistant turn/i);
+    assert.deepEqual(agentReplyTool.inputSchema.properties.triggerScope.enum, [
+      'mentionsOnly',
+      'allHumanMessages',
+      'allMessages',
+    ]);
     assert.deepEqual(
       agentReplyTool.outputSchema.properties.nextAction.const,
       'stop_current_turn',
@@ -1269,6 +1275,7 @@ describe('stateless Group Chat MCP read loop', () => {
         avatarResourceId: null,
         shortBio: 'Public lifecycle profile',
       },
+      triggerScope: 'allHumanMessages',
       runtimeCapabilitiesVersion: 1,
       localConfigRevision: 7,
     };
@@ -1461,22 +1468,21 @@ describe('stateless Group Chat MCP read loop', () => {
     }
   });
 
-  it('rejects self-triggered agent replies under the MCP default trigger scope', async () => {
-    const room = (await createRoom('MCP Human Trigger Room', 'mcp-human-trigger-room')).body;
+  it('allows agent-triggered replies by default and preserves strict human-only mode', async () => {
+    const room = (await createRoom('MCP Agent Trigger Room', 'mcp-agent-trigger-room')).body;
     const activated = await callTool('group_activate_agent', {
       roomId: room.id,
       publicProfile: {
-        displayName: 'Human Trigger Agent',
+        displayName: 'Agent Trigger Agent',
         avatarResourceId: null,
-        shortBio: 'Responds only to human messages.',
+        shortBio: 'Can participate in multi-agent discussion.',
       },
       runtimeCapabilitiesVersion: 1,
       localConfigRevision: 1,
     });
     assert.equal(activated.body.result.isError, undefined);
     const binding = store.roomAgentBindings.get(`${room.id}:${users.alice.user.userId}`);
-    assert.equal(binding.triggerScope, 'allHumanMessages');
-    binding.triggerScope = 'allMessages';
+    assert.equal(binding.triggerScope, 'allMessages');
 
     const human = await callTool('group_send_message', {
       roomId: room.id,
@@ -1492,18 +1498,52 @@ describe('stateless Group Chat MCP read loop', () => {
     });
     assert.equal(firstReply.body.result.isError, undefined);
 
-    const selfTriggered = await callTool('group_publish_agent_reply', {
+    const agentTriggered = await callTool('group_publish_agent_reply', {
       roomId: room.id,
       triggerBatchId: 'mcp-self-trigger-batch',
       triggerMessageIds: [firstReply.body.result.structuredContent.message.id],
       clientMessageId: 'mcp-self-trigger-reply',
-      text: 'This recursive reply must be rejected.',
+      text: 'Continue the discussion from the previous agent message.',
     });
-    assert.equal(selfTriggered.body.result.isError, true);
+    assert.equal(agentTriggered.body.result.isError, undefined);
+
+    const duplicateTrigger = await callTool('group_publish_agent_reply', {
+      roomId: room.id,
+      triggerBatchId: 'mcp-duplicate-agent-trigger-batch',
+      triggerMessageIds: [firstReply.body.result.structuredContent.message.id],
+      clientMessageId: 'mcp-duplicate-agent-trigger-reply',
+      text: 'Do not answer the same trigger twice.',
+    });
+    assert.equal(duplicateTrigger.body.result.isError, true);
     assert.equal(
-      JSON.parse(selfTriggered.body.result.content[0].text).error.code,
+      JSON.parse(duplicateTrigger.body.result.content[0].text).error.code,
+      'agent_loop_limit_reached',
+    );
+
+    const strictHumanOnly = await callTool('group_publish_agent_reply', {
+      roomId: room.id,
+      triggerBatchId: 'mcp-strict-human-trigger-batch',
+      triggerMessageIds: [agentTriggered.body.result.structuredContent.message.id],
+      clientMessageId: 'mcp-strict-human-trigger-reply',
+      text: 'Strict mode must still reject this agent trigger.',
+      triggerScope: 'allHumanMessages',
+    });
+    assert.equal(strictHumanOnly.body.result.isError, true);
+    assert.equal(
+      JSON.parse(strictHumanOnly.body.result.content[0].text).error.code,
       'trigger_not_eligible',
     );
+
+    const switchedBackToAgentTriggers = await callTool('group_publish_agent_reply', {
+      roomId: room.id,
+      triggerBatchId: 'mcp-explicit-agent-trigger-batch',
+      triggerMessageIds: [agentTriggered.body.result.structuredContent.message.id],
+      clientMessageId: 'mcp-explicit-agent-trigger-reply',
+      text: 'An explicit allMessages policy change allows this agent trigger.',
+      triggerScope: 'allMessages',
+    });
+    assert.equal(switchedBackToAgentTriggers.body.result.isError, undefined);
+    assert.equal(binding.triggerScope, 'allMessages');
   });
 
   it('enforces per-agent, dynamic room, absolute AI loop limits, and human resets', async () => {
@@ -1515,6 +1555,7 @@ describe('stateless Group Chat MCP read loop', () => {
         avatarResourceId: null,
         shortBio: 'Loop limit test profile',
       },
+      triggerScope: 'allHumanMessages',
       runtimeCapabilitiesVersion: 1,
       localConfigRevision: 1,
     });

@@ -734,6 +734,11 @@ describe('PostgreSQL group chat storage', () => {
           user: firstDevice,
           ...activate,
         });
+        const activatedBinding = await store.getMyRoomAgentBinding({
+          userId: firstDevice.userId,
+          roomId: room.body.id,
+        });
+        assert.equal(activatedBinding.triggerScope, 'allMessages');
 
         const secondDeviceId = 'postgres-lifecycle-device-two';
         const secondAccessToken = 'postgres-lifecycle-device-two-token';
@@ -854,11 +859,12 @@ describe('PostgreSQL group chat storage', () => {
           return finishAutomatic(request, claimed, suffix);
         };
 
-        await finishAutomatic(
+        const firstPublished = await finishAutomatic(
           automatic,
           claimedByLeaseHolder,
           'one',
         );
+        await createAndPublish('agent-trigger', firstPublished.body.message.id);
         await assert.rejects(
           createAndPublish('two', trigger.body.id),
           (error) => error.code === 'agent_loop_limit_reached',

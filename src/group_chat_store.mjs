@@ -241,7 +241,13 @@ function requireEligibleAutomaticTriggers({
   }
 }
 
-function requireAgentLoopCapacity({ messages, bindings, roomId, ownerUserId }) {
+function requireAgentLoopCapacity({
+  messages,
+  bindings,
+  roomId,
+  ownerUserId,
+  triggerScope,
+}) {
   let cycleStartIndex = -1;
   for (let index = messages.length - 1; index >= 0; index -= 1) {
     if (messages[index].sender.kind === 'human') {
@@ -252,6 +258,16 @@ function requireAgentLoopCapacity({ messages, bindings, roomId, ownerUserId }) {
   const cycleAgentMessages = messages.slice(cycleStartIndex + 1).filter(
     (message) => message.sender.kind === 'agent',
   );
+  if (triggerScope === 'allMessages') {
+    if (cycleAgentMessages.length >= ABSOLUTE_CONSECUTIVE_AI_LIMIT) {
+      throw new HttpError(
+        409,
+        'agent_loop_limit_reached',
+        'Room consecutive AI message limit reached; wait for a human message',
+      );
+    }
+    return;
+  }
   const ownerMessageCount = cycleAgentMessages.filter(
     (message) => message.sender.userId === ownerUserId,
   ).length;
@@ -900,6 +916,7 @@ export class MemoryGroupChatStore {
     user,
     roomId,
     publicProfile,
+    triggerScope = 'allMessages',
     runtimeCapabilitiesVersion,
     localConfigRevision,
   }) {
@@ -926,11 +943,11 @@ export class MemoryGroupChatStore {
       if (
         binding.participationMode !== 'automatic' ||
         binding.publishMode !== 'automatic' ||
-        binding.triggerScope !== 'allHumanMessages'
+        binding.triggerScope !== triggerScope
       ) {
         binding.participationMode = 'automatic';
         binding.publishMode = 'automatic';
-        binding.triggerScope = 'allHumanMessages';
+        binding.triggerScope = triggerScope;
         binding.policyRevision += 1;
         binding.updatedAt = now.toISOString();
       }
@@ -954,7 +971,7 @@ export class MemoryGroupChatStore {
         agentProfileId: profile.id,
         participationMode: 'automatic',
         publishMode: 'automatic',
-        triggerScope: 'allHumanMessages',
+        triggerScope,
         preferredRuntimeDeviceId: null,
         generationLimitPer24h: 1000,
         policyRevision: 1,
@@ -1203,6 +1220,22 @@ export class MemoryGroupChatStore {
       triggers,
       humanTriggersOnly,
     });
+    if (
+      binding.triggerScope === 'allMessages' &&
+      [...this.generationRequests.values()].some(
+        (request) =>
+          request.bindingId === binding.id &&
+          request.source === 'automatic' &&
+          request.status === 'published' &&
+          JSON.stringify(request.triggerMessageIds) === JSON.stringify(triggerMessageIds),
+      )
+    ) {
+      throw new HttpError(
+        409,
+        'agent_loop_limit_reached',
+        'Agent reply already published for this trigger batch',
+      );
+    }
     const triggerSequences = triggers.map((message) => message.seq);
     const now = this.clock().toISOString();
     const request = {
@@ -1554,11 +1587,30 @@ export class MemoryGroupChatStore {
     if (messages.some((message) => message.clientMessageId === clientMessageId)) {
       throw new HttpError(409, 'conflict', 'Client message ID is already in use');
     }
+    if (
+      binding.triggerScope === 'allMessages' &&
+      [...this.generationRequests.values()].some(
+        (candidate) =>
+          candidate.id !== request.id &&
+          candidate.bindingId === binding.id &&
+          candidate.source === 'automatic' &&
+          candidate.status === 'published' &&
+          JSON.stringify(candidate.triggerMessageIds) ===
+            JSON.stringify(request.triggerMessageIds),
+      )
+    ) {
+      throw new HttpError(
+        409,
+        'agent_loop_limit_reached',
+        'Agent reply already published for this trigger batch',
+      );
+    }
     requireAgentLoopCapacity({
       messages,
       bindings: this.roomAgentBindings,
       roomId: request.roomId,
       ownerUserId: user.userId,
+      triggerScope: binding.triggerScope,
     });
     for (const mention of mentions) {
       if (mention.kind === 'user' && !room.members.has(mention.targetId)) {
@@ -3049,6 +3101,7 @@ export class PostgresGroupChatStore {
     user,
     roomId,
     publicProfile,
+    triggerScope = 'allMessages',
     runtimeCapabilitiesVersion,
     localConfigRevision,
   }) {
@@ -3115,10 +3168,10 @@ export class PostgresGroupChatStore {
              id, room_id, owner_user_id, agent_profile_id, participation_mode,
              publish_mode, trigger_scope, preferred_runtime_device_id,
              generation_limit_per_24h, policy_revision, updated_at
-           ) VALUES ($1, $2, $3, $4, 'automatic', 'automatic', 'allHumanMessages',
-                     NULL, 1000, 1, $5)
+           ) VALUES ($1, $2, $3, $4, 'automatic', 'automatic', $5,
+                     NULL, 1000, 1, $6)
            RETURNING *`,
-          [newId('binding'), roomId, user.userId, profile.id, now],
+          [newId('binding'), roomId, user.userId, profile.id, triggerScope, now],
         );
         binding = insertedBinding.rows[0];
       }
@@ -3135,7 +3188,7 @@ export class PostgresGroupChatStore {
       const policyChanged =
         binding.participation_mode !== 'automatic' ||
         binding.publish_mode !== 'automatic' ||
-        binding.trigger_scope !== 'allHumanMessages';
+        binding.trigger_scope !== triggerScope;
       const leaseId = leaseIsActive ? binding.runtime_lease_id : newId('agent-lease');
       const leaseEpoch = leaseIsActive
         ? safeInteger(binding.runtime_lease_epoch, 'room_agent_bindings.runtime_lease_epoch')
@@ -3144,14 +3197,15 @@ export class PostgresGroupChatStore {
       const updatedBinding = await client.query(
         `UPDATE room_agent_bindings
             SET participation_mode = 'automatic', publish_mode = 'automatic',
-                trigger_scope = 'allHumanMessages', preferred_runtime_device_id = $1,
-                policy_revision = policy_revision + $2,
-                runtime_lease_device_id = $1, runtime_lease_id = $3,
-                runtime_lease_epoch = $4, runtime_lease_expires_at = $5,
-                updated_at = CASE WHEN $2 = 1 THEN $6 ELSE updated_at END
-          WHERE id = $7
+                trigger_scope = $1, preferred_runtime_device_id = $2,
+                policy_revision = policy_revision + $3,
+                runtime_lease_device_id = $2, runtime_lease_id = $4,
+                runtime_lease_epoch = $5, runtime_lease_expires_at = $6,
+                updated_at = CASE WHEN $3 = 1 THEN $7 ELSE updated_at END
+          WHERE id = $8
           RETURNING *`,
         [
+          triggerScope,
           user.deviceId,
           policyChanged ? 1 : 0,
           leaseId,
@@ -3561,6 +3615,22 @@ export class PostgresGroupChatStore {
         triggers: triggerResult.rows,
         humanTriggersOnly,
       });
+      if (binding.trigger_scope === 'allMessages') {
+        const duplicate = await client.query(
+          `SELECT 1 FROM generation_requests
+            WHERE binding_id = $1 AND source = 'automatic' AND status = 'published'
+              AND trigger_message_ids = $2::jsonb
+            LIMIT 1`,
+          [binding.id, JSON.stringify(triggerMessageIds)],
+        );
+        if (duplicate.rowCount > 0) {
+          throw new HttpError(
+            409,
+            'agent_loop_limit_reached',
+            'Agent reply already published for this trigger batch',
+          );
+        }
+      }
       const bindingPolicyRevision = safeInteger(
         binding.policy_revision,
         'room_agent_bindings.policy_revision',
@@ -4018,6 +4088,22 @@ export class PostgresGroupChatStore {
       if (existing.rowCount > 0) {
         throw new HttpError(409, 'conflict', 'Generation or client message is already published');
       }
+      if (binding.trigger_scope === 'allMessages') {
+        const duplicateTrigger = await client.query(
+          `SELECT 1 FROM generation_requests
+            WHERE id <> $1 AND binding_id = $2 AND source = 'automatic'
+              AND status = 'published' AND trigger_message_ids = $3::jsonb
+            LIMIT 1`,
+          [request.id, binding.id, JSON.stringify(snapshot.triggerMessageIds)],
+        );
+        if (duplicateTrigger.rowCount > 0) {
+          throw new HttpError(
+            409,
+            'agent_loop_limit_reached',
+            'Agent reply already published for this trigger batch',
+          );
+        }
+      }
       const loopState = await client.query(
         `WITH cycle AS (
            SELECT COALESCE((
@@ -4049,7 +4135,20 @@ export class PostgresGroupChatStore {
         loopState.rows[0].enabled_agent_count,
         'Enabled agent count',
       );
-      if (ownerAiCount >= AGENT_MESSAGES_PER_CYCLE_LIMIT) {
+      if (
+        binding.trigger_scope === 'allMessages' &&
+        aiCount >= ABSOLUTE_CONSECUTIVE_AI_LIMIT
+      ) {
+        throw new HttpError(
+          409,
+          'agent_loop_limit_reached',
+          'Room consecutive AI message limit reached; wait for a human message',
+        );
+      }
+      if (
+        binding.trigger_scope !== 'allMessages' &&
+        ownerAiCount >= AGENT_MESSAGES_PER_CYCLE_LIMIT
+      ) {
         throw new HttpError(
           409,
           'agent_loop_limit_reached',
@@ -4060,7 +4159,7 @@ export class PostgresGroupChatStore {
         Math.max(enabledAgentCount, 1) * AGENT_MESSAGES_PER_CYCLE_LIMIT,
         ABSOLUTE_CONSECUTIVE_AI_LIMIT,
       );
-      if (aiCount >= roomLimit) {
+      if (binding.trigger_scope !== 'allMessages' && aiCount >= roomLimit) {
         throw new HttpError(
           409,
           'agent_loop_limit_reached',
