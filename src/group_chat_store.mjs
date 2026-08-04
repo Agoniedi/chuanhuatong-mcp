@@ -543,6 +543,40 @@ export class MemoryGroupChatStore {
     return authenticatedUser(user, session.deviceId);
   }
 
+  async isSessionActive({ userId, deviceId }) {
+    return [...this.sessions.values()].some(
+      (session) => session.userId === userId && session.deviceId === deviceId,
+    );
+  }
+
+  async updateMyProfile({
+    userId,
+    expectedProfileRevision,
+    displayName,
+    key,
+    requestFingerprint,
+  }) {
+    const user = this.usersById.get(userId);
+    const replay = this._replay(userId, 'updateMyProfile', key, requestFingerprint);
+    if (replay.response) return replay.response;
+    if (expectedProfileRevision !== user.profileRevision) {
+      throw new HttpError(409, 'request_version_conflict', 'Profile revision does not match');
+    }
+    const nicknameKey = displayName.normalize('NFKC').toLowerCase();
+    const nicknameOwnerId = this.userIdByNicknameKey.get(nicknameKey);
+    if (nicknameOwnerId && nicknameOwnerId !== userId) {
+      throw new HttpError(409, 'conflict', 'Nickname is already in use');
+    }
+    this.userIdByNicknameKey.delete(user.nicknameKey);
+    user.displayName = displayName;
+    user.nicknameKey = nicknameKey;
+    user.profileRevision += 1;
+    this.userIdByNicknameKey.set(nicknameKey, userId);
+    const body = publicUser(user);
+    this._saveReplay(replay.recordKey, requestFingerprint, 200, body);
+    return { status: 200, body };
+  }
+
   async listRooms(userId) {
     return [...this.rooms.values()]
       .filter((room) => room.members.has(userId))
@@ -1207,25 +1241,36 @@ export class MemoryGroupChatStore {
   }
 
   async listGenerationRequests({ user, statuses, pageToken, limit }) {
+    let cursor = null;
+    if (pageToken !== null) {
+      cursor = this.generationRequests.get(pageToken);
+      if (
+        !cursor ||
+        cursor.ownerUserId !== user.userId ||
+        cursor.creatorDeviceId !== user.deviceId
+      ) {
+        throw new HttpError(400, 'invalid_request', 'pageToken is not valid');
+      }
+    }
     const filtered = [...this.generationRequests.values()]
       .filter(
         (request) =>
           request.ownerUserId === user.userId &&
           request.creatorDeviceId === user.deviceId &&
-          statuses.includes(request.status),
+          statuses.includes(request.status) &&
+          (
+            cursor === null ||
+            request.createdAt.localeCompare(cursor.createdAt) < 0 ||
+            (
+              request.createdAt === cursor.createdAt &&
+              request.id.localeCompare(cursor.id) < 0
+            )
+          ),
       )
       .sort((left, right) =>
         right.createdAt.localeCompare(left.createdAt) || right.id.localeCompare(left.id),
       );
-    let start = 0;
-    if (pageToken !== null) {
-      const cursorIndex = filtered.findIndex((request) => request.id === pageToken);
-      if (cursorIndex < 0) {
-        throw new HttpError(400, 'invalid_request', 'pageToken is not valid');
-      }
-      start = cursorIndex + 1;
-    }
-    const page = filtered.slice(start, start + limit + 1);
+    const page = filtered.slice(0, limit + 1);
     return {
       items: page.slice(0, limit).map(generationRequestSnapshot),
       nextPageToken: page.length > limit ? page[limit - 1].id : null,
@@ -1716,6 +1761,15 @@ export class MemoryGroupChatStore {
     for (const mention of mentions) {
       if (mention.kind === 'user' && !room.members.has(mention.targetId)) {
         throw new HttpError(400, 'invalid_request', 'Mention target is not a room member');
+      }
+      if (
+        mention.kind === 'agent' &&
+        ![...this.roomAgentBindings.values()].some(
+          (binding) =>
+            binding.roomId === roomId && binding.agentProfileId === mention.targetId,
+        )
+      ) {
+        throw new HttpError(400, 'invalid_request', 'Mentioned agent is not visible in the room');
       }
     }
     if (replyToMessageId) {
@@ -2345,6 +2399,72 @@ export class PostgresGroupChatStore {
       throw new HttpError(401, 'session_revoked', 'Session is not valid');
     }
     return authenticatedUser(rowToUser(result.rows[0]), result.rows[0].session_device_id);
+  }
+
+  async isSessionActive({ userId, deviceId }) {
+    const result = await this.pool.query(
+      'SELECT 1 FROM sessions WHERE user_id = $1 AND device_id = $2 LIMIT 1',
+      [userId, deviceId],
+    );
+    return result.rowCount > 0;
+  }
+
+  async updateMyProfile({
+    userId,
+    expectedProfileRevision,
+    displayName,
+    key,
+    requestFingerprint,
+  }) {
+    try {
+      return await this._transaction(async (client) => {
+        const result = await client.query(
+          'SELECT * FROM users WHERE id = $1 FOR UPDATE',
+          [userId],
+        );
+        const user = result.rows[0];
+        const replay = await this._replay(
+          client,
+          userId,
+          'updateMyProfile',
+          key,
+          requestFingerprint,
+        );
+        if (replay) return replay;
+        if (expectedProfileRevision !==
+            safeInteger(user.profile_revision, 'users.profile_revision')) {
+          throw new HttpError(409, 'request_version_conflict', 'Profile revision does not match');
+        }
+        const updated = await client.query(
+          `UPDATE users
+              SET display_name = $1, nickname_key = $2,
+                  profile_revision = profile_revision + 1, updated_at = $3
+            WHERE id = $4
+            RETURNING *`,
+          [
+            displayName,
+            displayName.normalize('NFKC').toLowerCase(),
+            this.clock(),
+            userId,
+          ],
+        );
+        const body = publicUser(rowToUser(updated.rows[0]));
+        await this._saveReplay(client, {
+          principalId: userId,
+          operation: 'updateMyProfile',
+          key,
+          requestFingerprint,
+          status: 200,
+          body,
+        });
+        return { status: 200, body };
+      });
+    } catch (error) {
+      if (error?.code === '23505' && error?.constraint === 'users_nickname_key_key') {
+        throw new HttpError(409, 'conflict', 'Nickname is already in use');
+      }
+      throw error;
+    }
   }
 
   async listRooms(userId) {
@@ -3495,9 +3615,8 @@ export class PostgresGroupChatStore {
     if (pageToken !== null) {
       const cursorResult = await this.pool.query(
         `SELECT created_at, id FROM generation_requests
-          WHERE id = $1 AND owner_user_id = $2 AND creator_device_id = $3
-            AND status = ANY($4::text[])`,
-        [pageToken, user.userId, user.deviceId, statuses],
+          WHERE id = $1 AND owner_user_id = $2 AND creator_device_id = $3`,
+        [pageToken, user.userId, user.deviceId],
       );
       if (cursorResult.rowCount === 0) {
         throw new HttpError(400, 'invalid_request', 'pageToken is not valid');
@@ -4257,16 +4376,23 @@ export class PostgresGroupChatStore {
   async listMessages({ userId, roomId, afterSeq, limit }) {
     const room = await this._room(this.pool, roomId);
     const membership = await this._membership(this.pool, roomId, userId);
+    const highWaterSeq = safeInteger(room.last_seq, 'rooms.last_seq');
     const result = await this.pool.query(
       `SELECT * FROM messages
-        WHERE room_id = $1 AND seq > $2 AND seq >= $3
+        WHERE room_id = $1 AND seq > $2 AND seq >= $3 AND seq <= $4
         ORDER BY seq
-        LIMIT $4`,
-      [roomId, afterSeq, safeInteger(membership.joined_seq, 'room_members.joined_seq'), limit + 1],
+        LIMIT $5`,
+      [
+        roomId,
+        afterSeq,
+        safeInteger(membership.joined_seq, 'room_members.joined_seq'),
+        highWaterSeq,
+        limit + 1,
+      ],
     );
     return {
       items: result.rows.slice(0, limit).map(rowToMessage),
-      highWaterSeq: safeInteger(room.last_seq, 'rooms.last_seq'),
+      highWaterSeq,
       hasMore: result.rows.length > limit,
     };
   }
@@ -4303,6 +4429,19 @@ export class PostgresGroupChatStore {
         );
         if (targets.rowCount !== mentionedUserIds.length) {
           throw new HttpError(400, 'invalid_request', 'Mention target is not a room member');
+        }
+      }
+      const mentionedAgentIds = mentions
+        .filter((mention) => mention.kind === 'agent')
+        .map((mention) => mention.targetId);
+      if (mentionedAgentIds.length > 0) {
+        const targets = await client.query(
+          `SELECT agent_profile_id FROM room_agent_bindings
+            WHERE room_id = $1 AND agent_profile_id = ANY($2::text[])`,
+          [roomId, mentionedAgentIds],
+        );
+        if (targets.rowCount !== mentionedAgentIds.length) {
+          throw new HttpError(400, 'invalid_request', 'Mentioned agent is not visible in the room');
         }
       }
       if (replyToMessageId) {

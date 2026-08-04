@@ -59,6 +59,14 @@ const ownMembershipSchema = memberSchema.extend({
   readSeq: z.number().int().nonnegative(),
 }).strict();
 
+const userProfileSchema = z.object({
+  userId: idSchema,
+  handle: idSchema,
+  displayName: z.string().min(1).max(80),
+  avatarResourceId: nullableResourceIdSchema,
+  profileRevision: z.number().int().positive(),
+}).strict();
+
 const agentProfileSchema = z.object({
   id: idSchema,
   ownerUserId: idSchema,
@@ -463,6 +471,28 @@ export function createGroupChatMcpServer({
     name: 'chuanhuatong-mcp',
     version: '0.1.0',
   });
+
+  server.registerTool('group_set_display_name', {
+    description: 'Change the authenticated human user\'s group-chat display name when the user explicitly requests it. Future human messages use the new name; existing message snapshots do not change.',
+    inputSchema: z.object({
+      clientRequestId: idSchema,
+      displayName: z.string().min(1).max(80).refine(
+        (value) => value.trim().length > 0,
+        'displayName must not be blank',
+      ),
+    }).strict(),
+    outputSchema: userProfileSchema,
+    annotations: WRITE_ANNOTATIONS,
+  }, toolHandler(async (args) => {
+    const result = await store.updateMyProfile({
+      userId: user.userId,
+      expectedProfileRevision: user.profileRevision,
+      displayName: args.displayName.trim(),
+      key: args.clientRequestId,
+      requestFingerprint: toolFingerprint('group_set_display_name', args),
+    });
+    return result.body;
+  }, logger));
 
   server.registerTool('group_create_room', {
     description: 'Create a group-chat room owned by the authenticated identity.',

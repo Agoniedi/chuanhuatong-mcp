@@ -2,6 +2,7 @@ import assert from 'node:assert/strict';
 import { once } from 'node:events';
 import { after, before, describe, it } from 'node:test';
 import WebSocket from 'ws';
+import { MemoryGroupChatStore } from '../src/group_chat_store.mjs';
 import { createLocalServer } from '../src/server.mjs';
 
 let server;
@@ -450,6 +451,111 @@ describe('local group chat REST loop', () => {
     } finally {
       await Promise.all([closeRealtime(aliceSocket), closeRealtime(bobSocket)]);
     }
+  });
+
+  it('stops realtime delivery when the connected device session is revoked', async () => {
+    const realtimeStore = new MemoryGroupChatStore();
+    const realtimeServer = createLocalServer({
+      devAuthEnabled: true,
+      store: realtimeStore,
+      logger: { warn() {}, error() {} },
+      outboxPollIntervalMs: 5,
+    });
+    realtimeServer.listen(0, '127.0.0.1');
+    await once(realtimeServer, 'listening');
+    const realtimeBaseUrl = `http://127.0.0.1:${realtimeServer.address().port}`;
+    const session = await realtimeStore.createGuestSession({
+      deviceId: 'revoked-realtime-device',
+      displayName: 'Revoked Realtime User',
+    });
+    const room = await realtimeStore.createRoom({
+      userId: session.user.userId,
+      title: 'Revoked realtime room',
+      key: 'revoked-realtime-room',
+      requestFingerprint: 'revoked-realtime-room-fingerprint',
+    });
+    const socket = new WebSocket(
+      `${realtimeBaseUrl.replace('http://', 'ws://')}/v1/realtime`,
+      { headers: { Authorization: `Bearer ${session.accessToken}` } },
+    );
+    const ready = waitForRealtimeEvent(socket, 'connection.ready');
+    await Promise.all([once(socket, 'open'), ready]);
+
+    try {
+      const outcome = new Promise((resolve) => {
+        socket.once('message', () => resolve('message'));
+        socket.once('close', (code) => resolve({ code }));
+      });
+      realtimeStore.sessions.clear();
+      await realtimeStore.createHumanMessage({
+        user: session.user,
+        roomId: room.body.id,
+        clientMessageId: 'revoked-realtime-message',
+        text: 'This event must not be delivered',
+        mentions: [],
+        replyToMessageId: null,
+        key: 'revoked-realtime-message',
+        requestFingerprint: 'revoked-realtime-message-fingerprint',
+      });
+
+      assert.deepEqual(await outcome, { code: 1008 });
+    } finally {
+      await closeRealtime(socket);
+      await realtimeServer.shutdown();
+    }
+  });
+
+  it('keeps generation pagination valid when the cursor item changes status', async () => {
+    const paginationStore = new MemoryGroupChatStore();
+    const baseRequest = {
+      roomId: 'pagination-room',
+      bindingId: 'pagination-binding',
+      ownerUserId: 'pagination-user',
+      creatorDeviceId: 'pagination-device',
+      source: 'manual',
+      triggerMessageIds: [],
+      triggerFromSeq: 1,
+      triggerThroughSeq: 1,
+      contextThroughSeq: 1,
+      minVisibleSeq: 1,
+      historyPolicyRevision: 1,
+      bindingPolicyRevision: 1,
+      status: 'queued',
+      requestVersion: 1,
+      leaseEpoch: 0,
+      attempt: 1,
+    };
+    paginationStore.generationRequests.set('generation-newer', {
+      ...baseRequest,
+      id: 'generation-newer',
+      createdAt: '2026-08-04T02:00:00.000Z',
+      updatedAt: '2026-08-04T02:00:00.000Z',
+    });
+    paginationStore.generationRequests.set('generation-older', {
+      ...baseRequest,
+      id: 'generation-older',
+      createdAt: '2026-08-04T01:00:00.000Z',
+      updatedAt: '2026-08-04T01:00:00.000Z',
+    });
+    const user = { userId: 'pagination-user', deviceId: 'pagination-device' };
+    const firstPage = await paginationStore.listGenerationRequests({
+      user,
+      statuses: ['queued'],
+      pageToken: null,
+      limit: 1,
+    });
+    assert.deepEqual(firstPage.items.map((item) => item.id), ['generation-newer']);
+    assert.equal(firstPage.nextPageToken, 'generation-newer');
+
+    paginationStore.generationRequests.get('generation-newer').status = 'claimed';
+    const secondPage = await paginationStore.listGenerationRequests({
+      user,
+      statuses: ['queued'],
+      pageToken: firstPage.nextPageToken,
+      limit: 1,
+    });
+    assert.deepEqual(secondPage.items.map((item) => item.id), ['generation-older']);
+    assert.equal(secondPage.nextPageToken, null);
   });
 
   it('rejects stale room revisions and preserves private membership fields', async () => {

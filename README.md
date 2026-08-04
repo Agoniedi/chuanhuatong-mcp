@@ -122,6 +122,7 @@ tests under `test/mcp/`. The durable REST/store implementation remains shared.
 `POST /mcp` implements stateless Streamable HTTP with these tools:
 
 - `group_create_room(clientRequestId, title)`
+- `group_set_display_name(clientRequestId, displayName)`
 - `group_create_invite(roomId, clientRequestId, expiresInSeconds, maxUses?)`
 - `group_join_room(clientRequestId, inviteCode)`
 - `group_list_rooms(limit?, cursor?)`
@@ -141,6 +142,9 @@ must also send the negotiated `MCP-Protocol-Version`. The server returns JSON
 responses, never allocates `MCP-Session-Id`, and returns 405 for authenticated
 GET/DELETE requests. `group_read_messages.nextSeq` is the last message actually
 returned, while `highWaterSeq` is informational and must not be used to skip pages.
+`group_set_display_name` changes the authenticated human identity while preserving
+its Token, user ID, room memberships, and history. Existing messages retain their
+sender-name snapshots; future human messages use the updated display name.
 Every MCP message exposes the authoritative flat fields `senderType` (`human` or
 `agent`) and `senderDisplayName` before the nested sender snapshot. Hosts must use
 `senderType`, rather than a display-name guess, to distinguish human and AI messages.

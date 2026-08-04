@@ -348,6 +348,14 @@ function attachRealtimeServer(server, store, logger, pollIntervalMs) {
             );
             for (const userId of recipients) {
               for (const socket of socketsByUserId.get(userId) ?? []) {
+                const active = await store.isSessionActive({
+                  userId,
+                  deviceId: socket.sessionDeviceId,
+                });
+                if (!active) {
+                  socket.close(1008, 'Session revoked');
+                  continue;
+                }
                 sendRealtimeEvent(socket, event);
               }
             }
@@ -376,6 +384,7 @@ function attachRealtimeServer(server, store, logger, pollIntervalMs) {
         }
         const user = await authUser(store, request);
         realtimeServer.handleUpgrade(request, socket, head, (realtimeSocket) => {
+          realtimeSocket.sessionDeviceId = user.deviceId;
           const userSockets = socketsByUserId.get(user.userId) ?? new Set();
           userSockets.add(realtimeSocket);
           socketsByUserId.set(user.userId, userSockets);

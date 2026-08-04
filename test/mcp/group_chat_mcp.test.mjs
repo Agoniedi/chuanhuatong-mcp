@@ -248,6 +248,7 @@ describe('stateless Group Chat MCP read loop', () => {
         'group_publish_agent_reply',
         'group_read_messages',
         'group_send_message',
+        'group_set_display_name',
         'group_wait_for_messages',
       ],
     );
@@ -261,6 +262,7 @@ describe('stateless Group Chat MCP read loop', () => {
       'group_join_room',
       'group_publish_agent_reply',
       'group_send_message',
+      'group_set_display_name',
     ];
     for (const tool of result.body.result.tools.filter(
       (candidate) => !writeTools.includes(candidate.name))) {
@@ -294,6 +296,11 @@ describe('stateless Group Chat MCP read loop', () => {
     );
     assert.match(humanSendTool.description, /human identity/i);
     assert.match(humanSendTool.description, /not.*agent/i);
+    const displayNameTool = result.body.result.tools.find(
+      (tool) => tool.name === 'group_set_display_name',
+    );
+    assert.match(displayNameTool.description, /explicitly requests/i);
+    assert.match(displayNameTool.description, /existing message snapshots do not change/i);
     const readTool = result.body.result.tools.find(
       (tool) => tool.name === 'group_read_messages',
     );
@@ -345,6 +352,7 @@ describe('stateless Group Chat MCP read loop', () => {
           'group_publish_agent_reply',
           'group_read_messages',
           'group_send_message',
+          'group_set_display_name',
           'group_wait_for_messages',
         ],
       );
@@ -663,6 +671,73 @@ describe('stateless Group Chat MCP read loop', () => {
     assert.equal(empty.body.result.structuredContent.nextSeq, 3);
   });
 
+  it('changes the authenticated human display name through MCP', async () => {
+    const session = await json('/__dev/guest-session', 'POST', {
+      deviceId: 'mcp-device-profile-update',
+      displayName: 'MCP Profile Before',
+    });
+    const accessToken = session.body.accessToken;
+    const room = await callTool('group_create_room', {
+      clientRequestId: 'mcp-profile-update-room',
+      title: 'MCP Profile Update Room',
+    }, { accessToken });
+    const roomId = room.body.result.structuredContent.id;
+    const oldMessage = await callTool('group_send_message', {
+      roomId,
+      clientMessageId: 'mcp-profile-message-before',
+      text: 'Before rename',
+    }, { accessToken });
+    const args = {
+      clientRequestId: 'mcp-profile-update-name',
+      displayName: 'MCP Profile After',
+    };
+    const updated = await callTool('group_set_display_name', args, { accessToken });
+    const replay = await callTool('group_set_display_name', args, { accessToken });
+    const changedReplay = await callTool('group_set_display_name', {
+      ...args,
+      displayName: 'Different Replay Name',
+    }, { accessToken });
+    const duplicate = await callTool('group_set_display_name', {
+      clientRequestId: 'mcp-profile-update-duplicate',
+      displayName: 'ＭＣＰ Ｂｏｂ',
+    }, { accessToken });
+    const blank = await callTool('group_set_display_name', {
+      clientRequestId: 'mcp-profile-update-blank',
+      displayName: '   ',
+    }, { accessToken });
+    const newMessage = await callTool('group_send_message', {
+      roomId,
+      clientMessageId: 'mcp-profile-message-after',
+      text: 'After rename',
+    }, { accessToken });
+    const profile = updated.body.result.structuredContent;
+
+    assert.equal(updated.body.result.isError, undefined);
+    assert.equal(profile.userId, session.body.user.userId);
+    assert.equal(profile.displayName, 'MCP Profile After');
+    assert.equal(profile.profileRevision, session.body.user.profileRevision + 1);
+    assert.deepEqual(replay.body.result.structuredContent, profile);
+    assert.equal(changedReplay.body.result.isError, true);
+    assert.equal(
+      JSON.parse(changedReplay.body.result.content[0].text).error.code,
+      'idempotency_conflict',
+    );
+    assert.equal(duplicate.body.result.isError, true);
+    assert.equal(
+      JSON.parse(duplicate.body.result.content[0].text).error.code,
+      'conflict',
+    );
+    assert.equal(blank.body.result.isError, true);
+    assert.equal(
+      oldMessage.body.result.structuredContent.senderDisplayName,
+      'MCP Profile Before',
+    );
+    assert.equal(
+      newMessage.body.result.structuredContent.senderDisplayName,
+      'MCP Profile After',
+    );
+  });
+
   it('sends one human message idempotently and rejects forged or invalid sends', async () => {
     const args = {
       roomId: contextRoom.id,
@@ -721,6 +796,18 @@ describe('stateless Group Chat MCP read loop', () => {
       text: '',
     });
     assert.equal(blank.body.result.isError, true);
+
+    const invalidAgentMention = await callTool('group_send_message', {
+      roomId: contextRoom.id,
+      clientMessageId: 'mcp-invalid-agent-mention',
+      text: 'Do not accept an unknown agent mention',
+      mentions: [{ kind: 'agent', targetId: 'missing-agent-profile' }],
+    });
+    assert.equal(invalidAgentMention.body.result.isError, true);
+    assert.equal(
+      JSON.parse(invalidAgentMention.body.result.content[0].text).error.code,
+      'invalid_request',
+    );
 
     const forbidden = await callTool('group_send_message', {
       roomId: contextRoom.id,

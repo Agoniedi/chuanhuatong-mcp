@@ -188,6 +188,35 @@ describe('PostgreSQL group chat storage', () => {
           deviceId: 'postgres-device-alice',
           displayName: 'Postgres Alice',
         });
+        const profileSession = await store.createGuestSession({
+          deviceId: 'postgres-device-profile-update',
+          displayName: 'Postgres Profile Before',
+        });
+        const profileUpdateRequest = {
+          userId: profileSession.user.userId,
+          expectedProfileRevision: 1,
+          displayName: 'Postgres Profile After',
+          key: 'postgres-profile-update',
+          requestFingerprint: 'postgres-profile-update-fingerprint',
+        };
+        const [profileUpdate, profileUpdateReplay] = await Promise.all([
+          store.updateMyProfile(profileUpdateRequest),
+          store.updateMyProfile(profileUpdateRequest),
+        ]);
+        assert.deepEqual(profileUpdateReplay, profileUpdate);
+        assert.equal(profileUpdate.body.userId, profileSession.user.userId);
+        assert.equal(profileUpdate.body.displayName, 'Postgres Profile After');
+        assert.equal(profileUpdate.body.profileRevision, 2);
+        await assert.rejects(
+          store.updateMyProfile({
+            ...profileUpdateRequest,
+            expectedProfileRevision: 2,
+            displayName: 'Ｐｏｓｔｇｒｅｓ Ａｌｉｃｅ',
+            key: 'postgres-profile-update-duplicate',
+            requestFingerprint: 'postgres-profile-update-duplicate-fingerprint',
+          }),
+          (error) => error.status === 409 && error.code === 'conflict',
+        );
         const roomRequest = {
           userId: session.user.userId,
           title: 'Persistent room',
@@ -225,6 +254,19 @@ describe('PostgreSQL group chat storage', () => {
           key: 'create-room-agent-binding-once',
           requestFingerprint: 'room-agent-binding-fingerprint',
         });
+        await assert.rejects(
+          store.createHumanMessage({
+            user: session.user,
+            roomId: roomResult.body.id,
+            clientMessageId: 'postgres-invalid-agent-mention',
+            text: 'Unknown agent mention',
+            mentions: [{ kind: 'agent', targetId: 'missing-agent-profile' }],
+            replyToMessageId: null,
+            key: 'postgres-invalid-agent-mention',
+            requestFingerprint: 'postgres-invalid-agent-mention-fingerprint',
+          }),
+          (error) => error.status === 400 && error.code === 'invalid_request',
+        );
         const updatedProfile = await store.updateAgentProfile({
           userId: session.user.userId,
           agentProfileId: profileResult.body.id,
@@ -363,13 +405,41 @@ describe('PostgreSQL group chat storage', () => {
           requestFingerprint: 'postgres-generation-replacement-fingerprint',
         });
         assert.equal(replacement.body.supersedesRequestId, disposable.body.id);
+        const generationFirstPage = await store.listGenerationRequests({
+          user: authenticated,
+          statuses: ['queued', 'published'],
+          pageToken: null,
+          limit: 1,
+        });
+        assert.equal(generationFirstPage.items[0].id, replacement.body.id);
+        assert.equal(generationFirstPage.nextPageToken, replacement.body.id);
+        await store.claimGenerationRequest({
+          user: authenticated,
+          generationRequestId: replacement.body.id,
+          expectedRequestVersion: replacement.body.requestVersion,
+          key: 'postgres-generation-replacement-claim',
+          requestFingerprint: 'postgres-generation-replacement-claim-fingerprint',
+        });
+        const generationSecondPage = await store.listGenerationRequests({
+          user: authenticated,
+          statuses: ['queued', 'published'],
+          pageToken: generationFirstPage.nextPageToken,
+          limit: 1,
+        });
+        assert.deepEqual(
+          generationSecondPage.items.map((item) => item.id),
+          [published.body.generationRequest.id],
+        );
         await store.close();
 
         store = await PostgresGroupChatStore.connect({
           connectionString: isolatedUrl.toString(),
         });
         const restoredUser = await store.authenticate(session.accessToken);
+        const restoredProfileUser = await store.authenticate(profileSession.accessToken);
         assert.equal(restoredUser.userId, session.user.userId);
+        assert.equal(restoredProfileUser.displayName, 'Postgres Profile After');
+        assert.equal(restoredProfileUser.profileRevision, 2);
         assert.deepEqual(
           (await store.listRooms(restoredUser.userId)).map((room) => room.id),
           [roomResult.body.id],
@@ -408,6 +478,23 @@ describe('PostgreSQL group chat storage', () => {
         assert.equal(roomContext.agentBindings.length, 1);
         assert.deepEqual(roomContext.agentBindings[0].binding, publicBindings.items[0]);
         assert.deepEqual(roomContext.agentBindings[0].agentProfile, updatedProfile.body);
+        const originalRoomLookup = store._room.bind(store);
+        let concurrentMessage;
+        store._room = async (...args) => {
+          const room = await originalRoomLookup(...args);
+          store._room = originalRoomLookup;
+          concurrentMessage = await store.createHumanMessage({
+            user: restoredUser,
+            roomId: roomResult.body.id,
+            clientMessageId: 'postgres-concurrent-watermark-message',
+            text: 'Committed after the room watermark was read',
+            mentions: [],
+            replyToMessageId: null,
+            key: 'postgres-concurrent-watermark-message',
+            requestFingerprint: 'postgres-concurrent-watermark-message-fingerprint',
+          });
+          return room;
+        };
         const messages = await store.listMessages({
           userId: restoredUser.userId,
           roomId: roomResult.body.id,
@@ -415,6 +502,8 @@ describe('PostgreSQL group chat storage', () => {
           limit: 100,
         });
         assert.deepEqual(messages.items, [messageResult.body, published.body.message]);
+        assert.ok(messages.items.every((message) => message.seq <= messages.highWaterSeq));
+        assert.ok(concurrentMessage.body.seq > messages.highWaterSeq);
         assert.deepEqual(
           await store.getGenerationRequest({
             userId: restoredUser.userId,
