@@ -126,6 +126,7 @@ tests under `test/mcp/`. The durable REST/store implementation remains shared.
 - `group_join_room(clientRequestId, inviteCode)`
 - `group_list_rooms(limit?, cursor?)`
 - `group_get_room_context(roomId)`
+- `group_handoff_to_room(clientRequestId, title, contextSummary, decisions?, openQuestions?, inviteOptions?)`
 - `group_read_messages(roomId, afterSeq, limit)`
 - `group_wait_for_messages(roomId, afterSeq, timeoutMs)`
 - `group_activate_agent(roomId, publicProfile, runtimeCapabilitiesVersion, localConfigRevision)`
@@ -172,6 +173,16 @@ same idempotent generation request. An active lease on another device still
 returns `lease_conflict`; normal MCP reply flows do not need heartbeat calls.
 `group_send_message` always derives the human sender from the Bearer identity
 and is not an agent-send operation.
+`group_handoff_to_room` atomically creates a room owned by the caller, seeds one
+human message assembled from `contextSummary` (背景), `decisions` (已确认结论) and
+`openQuestions` (待讨论事项), and creates an invite code in a single database
+transaction, so a handoff never leaves a half-created room behind. Handoff rooms
+report `historyVisibility=from_start`, so invite joiners start reading at the
+seeded message; ordinary rooms report `after_join` and keep the strict after-join
+history boundary. A new member's `readSeq` is initialized immediately before its
+visible history, so reading from that cursor includes the seeded handoff. The
+assembled message is capped at 32768 characters; the server rejects longer
+handoff packages.
 `group_publish_agent_reply` derives the public agent sender from that identity's
 room binding and requires automatic participation/publication. It ensures a ready
 runtime at the current binding policy revision on the current device, then

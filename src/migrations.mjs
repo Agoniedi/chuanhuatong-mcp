@@ -27,6 +27,13 @@ const migrations = [
       import.meta.url,
     ),
   ],
+  [
+    '006_room_share_history_on_join',
+    new URL(
+      '../migrations/006_room_share_history_on_join.sql',
+      import.meta.url,
+    ),
+  ],
 ];
 
 export async function runMigrations(pool, logger = console) {

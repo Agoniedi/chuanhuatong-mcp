@@ -31,7 +31,7 @@ const roomSchema = z.object({
   title: z.string().min(1).max(120),
   lastSeq: z.number().int().nonnegative(),
   revision: z.number().int().positive(),
-  historyVisibility: z.literal('after_join'),
+  historyVisibility: z.enum(['after_join', 'from_start']),
   createdAt: timestampSchema,
   updatedAt: timestampSchema,
 }).strict();
@@ -175,6 +175,33 @@ const publishAgentReplyOutputSchema = z.object({
   status: z.literal('published'),
   nextAction: z.literal('stop_current_turn'),
   message: messageSchema,
+}).strict();
+
+const DEFAULT_HANDOFF_INVITE_EXPIRES_IN_SECONDS = 7 * 24 * 60 * 60;
+const DEFAULT_HANDOFF_INVITE_MAX_USES = 10;
+const handoffItemSchema = z.string().min(1).max(2000);
+const inviteOptionsSchema = z.object({
+  expiresInSeconds: z.number().int().min(60).max(30 * 24 * 60 * 60)
+    .default(DEFAULT_HANDOFF_INVITE_EXPIRES_IN_SECONDS),
+  maxUses: z.number().int().min(1).max(100).default(DEFAULT_HANDOFF_INVITE_MAX_USES),
+});
+
+const handoffInputSchema = z.object({
+  clientRequestId: idSchema,
+  title: z.string().min(1).max(120).refine(
+    (value) => value.trim().length > 0,
+    'title must not be blank',
+  ),
+  contextSummary: z.string().min(1).max(32768),
+  decisions: z.array(handoffItemSchema).max(50).default([]),
+  openQuestions: z.array(handoffItemSchema).max(50).default([]),
+  inviteOptions: inviteOptionsSchema.optional(),
+}).strict();
+
+const handoffOutputSchema = z.object({
+  room: roomSchema,
+  message: messageSchema,
+  invite: inviteSchema,
 }).strict();
 
 const publicProfileInputSchema = z.object({
@@ -646,6 +673,42 @@ export function createGroupChatMcpServer({
     });
     onMessageCreated();
     return toMcpMessage(result.body);
+  }, logger));
+
+  server.registerTool('group_handoff_to_room', {
+    description: 'Atomically create a room owned by the caller, post a structured context handoff message as the caller, and create an invite code for other users to join and read the handoff context in one step. Compose the message from the current conversation: contextSummary as background, decisions as confirmed conclusions, and openQuestions as open items. Keep the assembled text within 32768 characters; the server rejects longer input. Returns the room, the seeded message, and the invite code.',
+    inputSchema: handoffInputSchema,
+    outputSchema: handoffOutputSchema,
+    annotations: WRITE_ANNOTATIONS,
+  }, toolHandler(async (args) => {
+    const inviteOptions = {
+      expiresInSeconds: args.inviteOptions?.expiresInSeconds
+        ?? DEFAULT_HANDOFF_INVITE_EXPIRES_IN_SECONDS,
+      maxUses: args.inviteOptions?.maxUses ?? DEFAULT_HANDOFF_INVITE_MAX_USES,
+    };
+    const fingerprintArgs = { ...args, inviteOptions };
+    const result = await store.handoffToRoom({
+      user,
+      title: args.title,
+      contextSummary: args.contextSummary,
+      decisions: args.decisions,
+      openQuestions: args.openQuestions,
+      invite: {
+        expiresAt: new Date(
+          Date.now() + inviteOptions.expiresInSeconds * 1000,
+        ).toISOString(),
+        maxUses: inviteOptions.maxUses,
+      },
+      key: args.clientRequestId,
+      requestFingerprint: toolFingerprint('group_handoff_to_room', fingerprintArgs),
+    });
+    onMessageCreated();
+    const { inviteToken, ...inviteRow } = result.body.invite;
+    return {
+      room: result.body.room,
+      message: toMcpMessage(result.body.message),
+      invite: { ...inviteRow, inviteCode: inviteToken },
+    };
   }, logger));
 
   server.registerTool('group_publish_agent_reply', {

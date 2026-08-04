@@ -2,7 +2,7 @@
 
 > 更新日期：2026-07-30
 > 当前目标：只实现一个独立、标准的远程 MCP Server，不要求二次开发 Host
-> 当前状态：12 个 MCP 工具已实现并部署；官方 SDK 线上双身份建房、邀请、加入和消息闭环已通过
+> 当前状态：13 个 MCP 工具已实现并部署；官方 SDK 线上双身份建房、邀请、加入和消息闭环已通过；`group_handoff_to_room` 原子交接已实现
 
 ## 1. 不可变边界
 
@@ -37,6 +37,26 @@ group_join_room(clientRequestId, inviteCode)
 group_list_rooms(limit?, cursor?)
 group_get_room_context(roomId)
 ```
+
+### 交接
+
+```text
+group_handoff_to_room(
+  clientRequestId,
+  title,
+  contextSummary,
+  decisions?,
+  openQuestions?,
+  inviteOptions?
+)
+```
+
+- 一次 MCP 调用在单数据库事务内完成「建房 + 写入交接消息 + 创建邀请码」，杜绝建房成功但内容发送失败的半完成态。
+- 交接消息由 Host AI 生成的结构化交接包组装：`contextSummary` 为背景、`decisions` 为已确认结论、`openQuestions` 为待讨论事项，服务端组装为一条带章节的消息。
+- 组装后消息上限 32768 字符，超出返回 `invalid_request`；调用方应先摘要再拆分。
+- sender 始终由 Bearer 身份派生，显示为当前用户；Server 不保存 Host 私有会话历史。
+- 交接房间置 `historyVisibility=from_start`，邀请加入者从种子消息起可见，初始 `readSeq=joinedSeq-1`；普通房间保持 `after_join` 历史边界。
+- 幂等：邀请码默认值在计算请求指纹前规范化；同一 `clientRequestId` 的等价参数重放结果一致，改参重放返回 `idempotency_conflict`。
 
 - 建房人自动成为 owner。
 - 只有 owner/admin 可以创建邀请。
@@ -122,7 +142,7 @@ group_publish_agent_reply(
 
 ### 阶段 3：标准 MCP 可用性闭环
 
-- [已完成] 用官方 MCP SDK 验证 `serverInfo=chuanhuatong-mcp` 和精确 12 个工具。
+- [已完成] 用官方 MCP SDK 验证 `serverInfo=chuanhuatong-mcp` 和精确 13 个工具。
 - [已完成] 两个独立 Bearer 身份仅通过 MCP 完成建房、邀请、加入、幂等重放、发送和读取。
 - 在不修改 Host 的前提下，用标准 MCP 工具调用完成建房、邀请、加入、发送和读取。
 - 根据实际 Host 行为决定是否补充标准 MCP prompt/resource；不引入 Host 私有协议。
@@ -144,7 +164,7 @@ group_publish_agent_reply(
 
 ## 7. 当前验收标准
 
-- `tools/list` 精确公开 12 个工具。
+- `tools/list` 精确公开 13 个工具。
 - 两个身份可以完全通过 MCP 创建/加入同一房间并交换消息。
 - 邀请一次性消费、ACL、分页、幂等和乱序补偿均由服务器保证。
 - 不需要任何 Host 源码修改或独立 Runner。

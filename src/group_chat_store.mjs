@@ -23,6 +23,10 @@ function hash(value) {
   return createHash('sha256').update(value).digest('hex');
 }
 
+function handoffMessageId(key) {
+  return `handoff_${hash(key)}`;
+}
+
 function clone(value) {
   return JSON.parse(JSON.stringify(value));
 }
@@ -60,7 +64,7 @@ function roomSnapshot(room) {
     title: room.title,
     lastSeq: room.lastSeq,
     revision: room.revision,
-    historyVisibility: 'after_join',
+    historyVisibility: room.historyVisibility,
     createdAt: room.createdAt,
     updatedAt: room.updatedAt,
   };
@@ -87,6 +91,25 @@ function inviteSummary(invite) {
     remainingUses: invite.remainingUses,
     createdAt: invite.createdAt,
   };
+}
+
+function assembleHandoffMessage({ contextSummary, decisions = [], openQuestions = [] }) {
+  const sections = [`# 背景\n${contextSummary}`];
+  if (decisions.length > 0) {
+    sections.push(`# 已确认结论\n${decisions.map((item) => `- ${item}`).join('\n')}`);
+  }
+  if (openQuestions.length > 0) {
+    sections.push(`# 待讨论事项\n${openQuestions.map((item) => `- ${item}`).join('\n')}`);
+  }
+  const text = sections.join('\n\n');
+  if (text.length > 32768) {
+    throw new HttpError(
+      400,
+      'invalid_request',
+      'Assembled handoff context must be at most 32768 characters',
+    );
+  }
+  return text;
 }
 
 function agentProfileSnapshot(profile) {
@@ -614,6 +637,7 @@ export class MemoryGroupChatStore {
       title,
       lastSeq: 0,
       revision: 1,
+      historyVisibility: 'after_join',
       createdAt,
       updatedAt: createdAt,
       members: new Map([[userId, { userId, role: 'owner', joinedSeq: 0, readSeq: 0 }]]),
@@ -1637,11 +1661,12 @@ export class MemoryGroupChatStore {
     const room = this._room(invite.roomId);
     let membership = room.members.get(userId);
     if (!membership) {
+      const joinedSeq = room.historyVisibility === 'from_start' ? 1 : room.lastSeq + 1;
       membership = {
         userId,
         role: 'member',
-        joinedSeq: room.lastSeq + 1,
-        readSeq: room.lastSeq,
+        joinedSeq,
+        readSeq: joinedSeq - 1,
       };
       room.members.set(userId, membership);
       invite.remainingUses -= 1;
@@ -1729,6 +1754,84 @@ export class MemoryGroupChatStore {
       type: 'message.created',
       roomId,
       payload: body,
+      occurredAt: createdAt,
+      dispatchedAt: null,
+    });
+    return { status: 201, body };
+  }
+
+  async handoffToRoom({
+    user,
+    title,
+    contextSummary,
+    decisions,
+    openQuestions,
+    invite,
+    key,
+    requestFingerprint,
+  }) {
+    const replay = this._replay(user.userId, 'handoffToRoom', key, requestFingerprint);
+    if (replay.response) return replay.response;
+    const text = assembleHandoffMessage({ contextSummary, decisions, openQuestions });
+    const createdAt = this.clock().toISOString();
+    const roomId = newId('room');
+    const room = {
+      id: roomId,
+      ownerUserId: user.userId,
+      title,
+      lastSeq: 1,
+      revision: 1,
+      historyVisibility: 'from_start',
+      createdAt,
+      updatedAt: createdAt,
+      members: new Map([
+        [user.userId, { userId: user.userId, role: 'owner', joinedSeq: 0, readSeq: 0 }],
+      ]),
+    };
+    this.rooms.set(roomId, room);
+    this.messagesByRoom.set(roomId, []);
+    const message = {
+      id: newId('msg'),
+      roomId,
+      seq: 1,
+      clientMessageId: handoffMessageId(key),
+      sender: {
+        kind: 'human',
+        userId: user.userId,
+        displayNameSnapshot: user.displayName,
+        avatarResourceIdSnapshot: user.avatarResourceId,
+      },
+      content: { schemaVersion: 1, type: 'text', text },
+      mentions: [],
+      replyToMessageId: null,
+      createdAt,
+    };
+    this.messagesByRoom.get(roomId).push(message);
+    const token = randomBytes(16).toString('base64url');
+    const inviteRecord = {
+      id: newId('invite'),
+      roomId,
+      createdByUserId: user.userId,
+      tokenHash: hash(token),
+      expiresAt: invite.expiresAt,
+      maxUses: invite.maxUses,
+      remainingUses: invite.maxUses,
+      createdAt,
+      revokedAt: null,
+    };
+    this.invites.set(inviteRecord.id, inviteRecord);
+    const body = {
+      room: roomSnapshot(room),
+      message: clone(message),
+      invite: { ...inviteSummary(inviteRecord), inviteToken: token },
+    };
+    this._saveReplay(replay.recordKey, requestFingerprint, 201, body);
+    this.outbox.push({
+      id: String(this.nextOutboxId++),
+      eventId: newId('evt'),
+      type: 'message.created',
+      roomId,
+      payload: clone(message),
       occurredAt: createdAt,
       dispatchedAt: null,
     });
@@ -4104,12 +4207,14 @@ export class PostgresGroupChatStore {
         [room.id, userId],
       );
       if (membership.rowCount === 0) {
-        const joinedSeq = safeInteger(room.last_seq, 'rooms.last_seq') + 1;
+        const joinedSeq = room.history_visibility === 'from_start'
+          ? 1
+          : safeInteger(room.last_seq, 'rooms.last_seq') + 1;
         membership = await client.query(
           `INSERT INTO room_members(room_id, user_id, role, joined_seq, read_seq)
            VALUES ($1, $2, 'member', $3, $4)
            RETURNING *`,
-          [room.id, userId, joinedSeq, safeInteger(room.last_seq, 'rooms.last_seq')],
+          [room.id, userId, joinedSeq, joinedSeq - 1],
         );
         await client.query(
           'UPDATE room_invites SET remaining_uses = remaining_uses - 1 WHERE id = $1',
@@ -4264,6 +4369,114 @@ export class PostgresGroupChatStore {
         [newId('evt'), roomId, message, now],
       );
       return { status: 201, body: message };
+    });
+  }
+
+  async handoffToRoom({
+    user,
+    title,
+    contextSummary,
+    decisions,
+    openQuestions,
+    invite,
+    key,
+    requestFingerprint,
+  }) {
+    return this._transaction(async (client) => {
+      const replay = await this._replay(
+        client,
+        user.userId,
+        'handoffToRoom',
+        key,
+        requestFingerprint,
+      );
+      if (replay) return replay;
+      const text = assembleHandoffMessage({ contextSummary, decisions, openQuestions });
+      const now = this.clock();
+      const roomId = newId('room');
+      const roomInserted = await client.query(
+        `INSERT INTO rooms(
+           id, owner_user_id, title, last_seq, revision,
+           history_visibility, created_at, updated_at
+         ) VALUES ($1, $2, $3, 1, 1, 'from_start', $4, $4)
+         RETURNING *`,
+        [roomId, user.userId, title, now],
+      );
+      await client.query(
+        `INSERT INTO room_members(room_id, user_id, role, joined_seq, read_seq)
+         VALUES ($1, $2, 'owner', 0, 0)`,
+        [roomId, user.userId],
+      );
+      const message = {
+        id: newId('msg'),
+        roomId,
+        seq: 1,
+        clientMessageId: handoffMessageId(key),
+        sender: {
+          kind: 'human',
+          userId: user.userId,
+          displayNameSnapshot: user.displayName,
+          avatarResourceIdSnapshot: user.avatarResourceId,
+        },
+        content: { schemaVersion: 1, type: 'text', text },
+        mentions: [],
+        replyToMessageId: null,
+        createdAt: now.toISOString(),
+      };
+      await client.query(
+        `INSERT INTO messages(
+           id, room_id, seq, client_message_id, sender, content, mentions,
+           reply_to_message_id, generation_request_id, trigger_through_seq, created_at
+         ) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, NULL, NULL, $9)`,
+        [
+          message.id,
+          roomId,
+          1,
+          message.clientMessageId,
+          message.sender,
+          message.content,
+          JSON.stringify([]),
+          null,
+          now,
+        ],
+      );
+      const token = randomBytes(16).toString('base64url');
+      const inviteInserted = await client.query(
+        `INSERT INTO room_invites(
+           id, room_id, created_by_user_id, token_hash, expires_at,
+           max_uses, remaining_uses, created_at, revoked_at
+         ) VALUES ($1, $2, $3, $4, $5, $6, $6, $7, NULL)
+         RETURNING *`,
+        [
+          newId('invite'),
+          roomId,
+          user.userId,
+          hash(token),
+          new Date(invite.expiresAt),
+          invite.maxUses,
+          now,
+        ],
+      );
+      const body = {
+        room: rowToRoom(roomInserted.rows[0]),
+        message,
+        invite: { ...rowToInvite(inviteInserted.rows[0]), inviteToken: token },
+      };
+      await this._saveReplay(client, {
+        principalId: user.userId,
+        operation: 'handoffToRoom',
+        key,
+        requestFingerprint,
+        status: 201,
+        body,
+      });
+      await client.query(
+        `INSERT INTO outbox_events(
+           event_id, event_type, room_id, payload, occurred_at, dispatched_at
+         ) VALUES ($1, 'message.created', $2, $3, $4, NULL)`,
+        [newId('evt'), roomId, message, now],
+      );
+      return { status: 201, body };
     });
   }
 

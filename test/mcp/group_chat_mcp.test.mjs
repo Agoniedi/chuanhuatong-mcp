@@ -241,6 +241,7 @@ describe('stateless Group Chat MCP read loop', () => {
         'group_create_room',
         'group_deactivate_agent',
         'group_get_room_context',
+        'group_handoff_to_room',
         'group_heartbeat_agent',
         'group_join_room',
         'group_list_rooms',
@@ -255,6 +256,7 @@ describe('stateless Group Chat MCP read loop', () => {
       'group_create_invite',
       'group_create_room',
       'group_deactivate_agent',
+      'group_handoff_to_room',
       'group_heartbeat_agent',
       'group_join_room',
       'group_publish_agent_reply',
@@ -336,6 +338,7 @@ describe('stateless Group Chat MCP read loop', () => {
           'group_create_room',
           'group_deactivate_agent',
           'group_get_room_context',
+          'group_handoff_to_room',
           'group_heartbeat_agent',
           'group_join_room',
           'group_list_rooms',
@@ -463,6 +466,128 @@ describe('stateless Group Chat MCP read loop', () => {
       JSON.parse(consumed.body.result.content[0].text).error.code,
       'conflict',
     );
+  });
+
+  it('atomically creates a room, seeds handoff context, and returns a joinable invite', async () => {
+    const args = {
+      clientRequestId: 'mcp-handoff-alice',
+      title: '方案讨论',
+      contextSummary: '我们在规划传话筒的拉群协作交接功能。',
+      decisions: ['新增 group_handoff_to_room 原子工具'],
+      openQuestions: ['邀请码默认过期时间是否合适'],
+    };
+    const created = await callTool('group_handoff_to_room', args, {
+      accessToken: users.alice.accessToken,
+    });
+    const replayed = await callTool('group_handoff_to_room', args, {
+      accessToken: users.alice.accessToken,
+    });
+    const replayedWithExplicitDefaults = await callTool('group_handoff_to_room', {
+      ...args,
+      inviteOptions: {
+        expiresInSeconds: 7 * 24 * 60 * 60,
+        maxUses: 10,
+      },
+    }, { accessToken: users.alice.accessToken });
+    const result = created.body.result.structuredContent;
+
+    assert.equal(created.body.result.isError, undefined);
+    assert.deepEqual(replayed.body.result.structuredContent, result);
+    assert.deepEqual(replayedWithExplicitDefaults.body.result.structuredContent, result);
+
+    const room = result.room;
+    assert.equal(room.ownerUserId, users.alice.user.userId);
+    assert.equal(room.title, '方案讨论');
+    assert.equal(room.lastSeq, 1);
+    assert.equal(room.historyVisibility, 'from_start');
+
+    const message = result.message;
+    assert.equal(message.roomId, room.id);
+    assert.equal(message.seq, 1);
+    assert.equal(message.senderType, 'human');
+    assert.equal(message.senderDisplayName, users.alice.user.displayName);
+    assert.ok(message.content.text.includes('# 背景'));
+    assert.ok(message.content.text.includes(args.contextSummary));
+    assert.ok(message.content.text.includes('# 已确认结论'));
+    assert.ok(message.content.text.includes('- 新增 group_handoff_to_room 原子工具'));
+    assert.ok(message.content.text.includes('# 待讨论事项'));
+
+    const invite = result.invite;
+    assert.equal(invite.roomId, room.id);
+    assert.equal(invite.maxUses, 10);
+    assert.equal(invite.remainingUses, 10);
+    assert.ok(typeof invite.inviteCode === 'string' && invite.inviteCode.length >= 22);
+
+    const conflict = await callTool('group_handoff_to_room', {
+      ...args,
+      contextSummary: '不同的背景',
+    }, { accessToken: users.alice.accessToken });
+    assert.equal(conflict.body.result.isError, true);
+    assert.equal(
+      JSON.parse(conflict.body.result.content[0].text).error.code,
+      'idempotency_conflict',
+    );
+
+    const joined = await callTool('group_join_room', {
+      clientRequestId: 'mcp-handoff-join-bob',
+      inviteCode: invite.inviteCode,
+    }, { accessToken: users.bob.accessToken });
+    assert.equal(joined.body.result.isError, undefined);
+    assert.equal(
+      joined.body.result.structuredContent.room.historyVisibility,
+      'from_start',
+    );
+    const membership = joined.body.result.structuredContent.membership;
+    assert.equal(membership.readSeq, 0);
+    const roomContext = await callTool('group_get_room_context', { roomId: room.id }, {
+      accessToken: users.bob.accessToken,
+    });
+    assert.equal(roomContext.body.result.isError, undefined);
+    assert.equal(roomContext.body.result.structuredContent.members.length, 2);
+    const messages = await callTool('group_read_messages', {
+      roomId: room.id,
+      afterSeq: membership.readSeq,
+      limit: 5,
+    }, { accessToken: users.bob.accessToken });
+    const items = messages.body.result.structuredContent.messages;
+    assert.equal(items.length, 1);
+    assert.equal(items[0].content.text, message.content.text);
+  });
+
+  it('keeps the derived handoff message ID valid for a maximum-length request ID', async () => {
+    const created = await callTool('group_handoff_to_room', {
+      clientRequestId: 'x'.repeat(128),
+      title: 'Boundary handoff',
+      contextSummary: 'Boundary context',
+    }, { accessToken: users.alice.accessToken });
+
+    assert.equal(created.body.result.isError, undefined);
+    assert.ok(
+      created.body.result.structuredContent.message.clientMessageId.length <= 128,
+    );
+  });
+
+  it('rejects invalid handoff inputs and unknown fields', async () => {
+    const base = {
+      title: 'Handoff',
+      contextSummary: 'Background',
+    };
+    for (const args of [
+      { ...base, clientRequestId: 'handoff-blank-title', title: '   ' },
+      { ...base, clientRequestId: 'handoff-long-summary', contextSummary: 'x'.repeat(32769) },
+      {
+        ...base,
+        clientRequestId: 'handoff-overlong-assembly',
+        contextSummary: 'y'.repeat(32000),
+        decisions: ['z'.repeat(2000)],
+      },
+      { ...base, clientRequestId: 'handoff-unknown-field', extra: true },
+    ]) {
+      const result = await callTool('group_handoff_to_room', args, {
+        accessToken: users.alice.accessToken,
+      });
+      assert.equal(result.body.result.isError, true);
+    }
   });
 
   it('rejects invalid self-service room inputs and unknown fields', async () => {

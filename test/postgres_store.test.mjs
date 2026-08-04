@@ -825,4 +825,82 @@ describe('PostgreSQL group chat storage', () => {
       }
     },
   );
+
+  it(
+    'handoff atomically creates a shared room with a readable seeded context',
+    { skip: !process.env.TEST_DATABASE_URL },
+    async () => {
+      const baseUrl = process.env.TEST_DATABASE_URL;
+      const schema = `chuanhuatong_test_${randomBytes(8).toString('hex')}`;
+      const admin = new pg.Pool({ connectionString: baseUrl });
+      await admin.query(`CREATE SCHEMA "${schema}"`);
+
+      const isolatedUrl = new URL(baseUrl);
+      isolatedUrl.searchParams.set('options', `-csearch_path=${schema}`);
+      let store;
+      try {
+        store = await PostgresGroupChatStore.connect({
+          connectionString: isolatedUrl.toString(),
+          migrate: true,
+          logger: { info() {} },
+        });
+        const owner = await store.createGuestSession({
+          deviceId: 'postgres-handoff-owner-device',
+          displayName: 'Postgres Handoff Owner',
+        });
+        const joiner = await store.createGuestSession({
+          deviceId: 'postgres-handoff-joiner-device',
+          displayName: 'Postgres Handoff Joiner',
+        });
+        const request = {
+          user: owner.user,
+          title: 'Handoff room',
+          contextSummary: '背景：方案讨论',
+          decisions: ['结论：采用原子工具'],
+          openQuestions: ['问题：默认过期时间'],
+          invite: {
+            expiresAt: new Date(Date.now() + 60 * 60 * 1000).toISOString(),
+            maxUses: 5,
+          },
+          key: 'postgres-handoff-once',
+          requestFingerprint: 'postgres-handoff-fingerprint',
+        };
+        const [created, replay] = await Promise.all([
+          store.handoffToRoom(request),
+          store.handoffToRoom(request),
+        ]);
+        assert.deepEqual(replay, created);
+
+        const body = created.body;
+        assert.equal(body.room.ownerUserId, owner.user.userId);
+        assert.equal(body.room.lastSeq, 1);
+        assert.equal(body.room.historyVisibility, 'from_start');
+        assert.equal(body.message.seq, 1);
+        assert.ok(body.message.content.text.includes('# 背景'));
+        assert.equal(typeof body.invite.inviteToken, 'string');
+
+        const accepted = await store.acceptInvite({
+          userId: joiner.user.userId,
+          inviteToken: body.invite.inviteToken,
+          key: 'postgres-handoff-join',
+          requestFingerprint: 'postgres-handoff-join-fingerprint',
+        });
+        assert.equal(accepted.body.membership.joinedSeq, 1);
+        assert.equal(accepted.body.membership.readSeq, 0);
+        assert.equal(accepted.body.room.historyVisibility, 'from_start');
+        const messages = await store.listMessages({
+          userId: joiner.user.userId,
+          roomId: body.room.id,
+          afterSeq: accepted.body.membership.readSeq,
+          limit: 10,
+        });
+        assert.equal(messages.items.length, 1);
+        assert.equal(messages.items[0].id, body.message.id);
+      } finally {
+        await store?.close().catch(() => {});
+        await admin.query(`DROP SCHEMA "${schema}" CASCADE`);
+        await admin.end();
+      }
+    },
+  );
 });
