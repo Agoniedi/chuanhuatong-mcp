@@ -184,6 +184,29 @@ describe('PostgreSQL group chat storage', () => {
           migrate: true,
           logger: { info() {} },
         });
+        const registrationRequest = {
+          displayName: 'Postgres Registration User',
+          key: 'postgres-registration-once',
+          requestFingerprint: 'postgres-registration-fingerprint',
+        };
+        const [registration, registrationReplay] = await Promise.all([
+          store.createUserRegistration(registrationRequest),
+          store.createUserRegistration(registrationRequest),
+        ]);
+        assert.equal(registrationReplay.userId, registration.userId);
+        assert.notEqual(registrationReplay.token, registration.token);
+        assert.equal(
+          (await store.authenticate(registrationReplay.token)).userId,
+          registration.userId,
+        );
+        await assert.rejects(
+          store.createUserRegistration({
+            ...registrationRequest,
+            displayName: 'Different Postgres Registration User',
+            requestFingerprint: 'different-postgres-registration-fingerprint',
+          }),
+          (error) => error.status === 409 && error.code === 'idempotency_conflict',
+        );
         const session = await store.createGuestSession({
           deviceId: 'postgres-device-alice',
           displayName: 'Postgres Alice',

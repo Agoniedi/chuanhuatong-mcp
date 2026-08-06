@@ -8,6 +8,7 @@ const GENERATION_LEASE_DURATION_MS = 2 * 60 * 1000;
 const AGENT_RUNTIME_LEASE_DURATION_MS = 60 * 1000;
 const AGENT_MESSAGES_PER_CYCLE_LIMIT = 1;
 const ABSOLUTE_CONSECUTIVE_AI_LIMIT = 20;
+const PUBLIC_REGISTRATION_PRINCIPAL_ID = 'public-registration';
 const REGENERATABLE_GENERATION_STATUSES = new Set([
   'discarded',
   'failed',
@@ -141,13 +142,15 @@ function roomAgentBindingSnapshot(binding) {
   };
 }
 
-function publicRoomAgentBindingSnapshot(binding, profileRevision) {
+function publicRoomAgentBindingSnapshot(binding, profile) {
   return {
     bindingId: binding.id,
     roomId: binding.roomId,
     ownerUserId: binding.ownerUserId,
     agentProfileId: binding.agentProfileId,
-    agentProfileRevision: profileRevision,
+    agentProfileRevision: profile.profileRevision,
+    displayName: profile.displayName,
+    avatarResourceId: profile.avatarResourceId,
     participationMode: binding.participationMode,
     publishMode: binding.publishMode,
     triggerScope: binding.triggerScope,
@@ -552,6 +555,55 @@ export class MemoryGroupChatStore {
     return { accessToken, tokenType: 'Bearer', user: publicUser(user) };
   }
 
+  async createUserRegistration({ displayName, key, requestFingerprint }) {
+    const replay = this._replay(
+      PUBLIC_REGISTRATION_PRINCIPAL_ID,
+      'createUserRegistration',
+      key,
+      requestFingerprint,
+    );
+    if (replay.response) {
+      const user = this.usersById.get(replay.response.body.userId);
+      const accessToken = `ct_${randomBytes(24).toString('base64url')}`;
+      this.sessions.set(hash(accessToken), { userId: user.id, deviceId: user.deviceId });
+      return { token: accessToken, ...clone(replay.response.body) };
+    }
+    const deviceId = `web_${randomBytes(12).toString('base64url')}`;
+    const nicknameKey = displayName.normalize('NFKC').toLowerCase();
+    const nicknameOwnerId = this.userIdByNicknameKey.get(nicknameKey);
+    if (nicknameOwnerId) {
+      throw new HttpError(409, 'conflict', 'Nickname is already in use');
+    }
+    const user = {
+      id: newId('usr'),
+      deviceId,
+      handle: `guest_${hash(deviceId).slice(0, 12)}`,
+      displayName,
+      nicknameKey,
+      avatarResourceId: null,
+      profileRevision: 1,
+    };
+    this.usersByDeviceId.set(deviceId, user);
+    this.usersById.set(user.id, user);
+    this.userDevices.add(`${user.id}:${deviceId}`);
+    this.userIdByNicknameKey.set(nicknameKey, user.id);
+    const accessToken = `ct_${randomBytes(24).toString('base64url')}`;
+    this.sessions.set(hash(accessToken), { userId: user.id, deviceId });
+    const body = {
+      userId: user.id,
+      displayName: user.displayName,
+      handle: user.handle,
+    };
+    this._saveReplay(replay.recordKey, requestFingerprint, 201, body);
+    return { token: accessToken, ...body };
+  }
+
+  async getMe({ userId }) {
+    const user = this.usersById.get(userId);
+    if (!user) throw new HttpError(404, 'resource_not_found', 'User not found');
+    return publicUser(user);
+  }
+
   async authenticate(accessToken) {
     const session = this.sessions.get(hash(accessToken));
     const user = session ? this.usersById.get(session.userId) : null;
@@ -734,7 +786,7 @@ export class MemoryGroupChatStore {
         .map((binding) => {
           const profile = this._agentProfile(binding.agentProfileId);
           return {
-            binding: publicRoomAgentBindingSnapshot(binding, profile.profileRevision),
+            binding: publicRoomAgentBindingSnapshot(binding, profile),
             agentProfile: agentProfileSnapshot(profile),
           };
         }),
@@ -760,7 +812,7 @@ export class MemoryGroupChatStore {
         .sort((left, right) => left.ownerUserId.localeCompare(right.ownerUserId))
         .map((binding) => publicRoomAgentBindingSnapshot(
           binding,
-          this._agentProfile(binding.agentProfileId).profileRevision,
+          this._agentProfile(binding.agentProfileId),
         )),
     };
   }
@@ -1747,6 +1799,22 @@ export class MemoryGroupChatStore {
     return { status: 204, body: null };
   }
 
+  async invitePreview({ inviteToken }) {
+    const tokenHash = hash(inviteToken);
+    const invite = [...this.invites.values()].find((entry) => entry.tokenHash === tokenHash);
+    if (!invite || !activeInvite(invite, this.clock())) {
+      throw new HttpError(404, 'resource_not_found', 'Invite is not valid or has expired');
+    }
+    const room = this._room(invite.roomId);
+    const inviter = this.usersById.get(invite.createdByUserId);
+    return {
+      roomTitle: room.title,
+      inviterDisplayName: inviter?.displayName ?? 'Unknown',
+      expiresAt: invite.expiresAt,
+      remainingUses: invite.remainingUses,
+    };
+  }
+
   async acceptInvite({ userId, inviteToken, key, requestFingerprint }) {
     const replay = this._replay(userId, 'acceptRoomInvite', key, requestFingerprint);
     if (replay.response) return replay.response;
@@ -2063,6 +2131,8 @@ function rowToPublicRoomAgentBinding(row) {
       row.agent_profile_revision,
       'agent_profiles.profile_revision',
     ),
+    displayName: row.agent_display_name,
+    avatarResourceId: row.agent_avatar_resource_id,
     participationMode: row.participation_mode,
     publishMode: row.publish_mode,
     triggerScope: row.trigger_scope,
@@ -2439,6 +2509,92 @@ export class PostgresGroupChatStore {
     }
   }
 
+  async createUserRegistration({ displayName, key, requestFingerprint }) {
+    try {
+      return await this._transaction(async (client) => {
+        const replay = await this._replay(
+          client,
+          PUBLIC_REGISTRATION_PRINCIPAL_ID,
+          'createUserRegistration',
+          key,
+          requestFingerprint,
+        );
+        if (replay) {
+          const existing = await client.query(
+            'SELECT device_id FROM users WHERE id = $1',
+            [replay.body.userId],
+          );
+          const accessToken = `ct_${randomBytes(24).toString('base64url')}`;
+          await client.query(
+            `INSERT INTO sessions(token_hash, user_id, device_id, created_at)
+             VALUES ($1, $2, $3, $4)`,
+            [
+              hash(accessToken),
+              replay.body.userId,
+              existing.rows[0].device_id,
+              this.clock(),
+            ],
+          );
+          return { token: accessToken, ...replay.body };
+        }
+        const now = this.clock();
+        const deviceId = `web_${randomBytes(12).toString('base64url')}`;
+        const nicknameKey = displayName.normalize('NFKC').toLowerCase();
+        const id = newId('usr');
+        const inserted = await client.query(
+          `INSERT INTO users(
+             id, device_id, handle, display_name, nickname_key,
+             avatar_resource_id, profile_revision, created_at, updated_at
+           ) VALUES ($1, $2, $3, $4, $5, NULL, 1, $6, $6)
+           RETURNING *`,
+          [id, deviceId, `guest_${hash(deviceId).slice(0, 12)}`, displayName, nicknameKey, now],
+        );
+        const user = rowToUser(inserted.rows[0]);
+        await client.query(
+          `INSERT INTO user_devices(user_id, device_id, created_at, updated_at)
+           VALUES ($1, $2, $3, $3)`,
+          [user.userId, deviceId, now],
+        );
+        const accessToken = `ct_${randomBytes(24).toString('base64url')}`;
+        await client.query(
+          `INSERT INTO sessions(token_hash, user_id, device_id, created_at)
+           VALUES ($1, $2, $3, $4)`,
+          [hash(accessToken), user.userId, deviceId, now],
+        );
+        const body = {
+          userId: user.userId,
+          displayName: user.displayName,
+          handle: user.handle,
+        };
+        await this._saveReplay(client, {
+          principalId: PUBLIC_REGISTRATION_PRINCIPAL_ID,
+          operation: 'createUserRegistration',
+          key,
+          requestFingerprint,
+          status: 201,
+          body,
+        });
+        return { token: accessToken, ...body };
+      });
+    } catch (error) {
+      if (error?.code === '23505' && error?.constraint === 'users_nickname_key_key') {
+        throw new HttpError(409, 'conflict', 'Nickname is already in use');
+      }
+      throw error;
+    }
+  }
+
+  async getMe({ userId }) {
+    const result = await this.pool.query(
+      'SELECT * FROM users WHERE id = $1',
+      [userId],
+    );
+    if (result.rowCount === 0) {
+      throw new HttpError(404, 'resource_not_found', 'User not found');
+    }
+    return publicUser(rowToUser(result.rows[0]));
+  }
+
   async authenticate(accessToken) {
     const result = await this.pool.query(
       `SELECT u.*, s.device_id AS session_device_id
@@ -2760,6 +2916,8 @@ export class PostgresGroupChatStore {
                 p.avatar_resource_id AS context_profile_avatar_resource_id,
                 p.short_bio AS context_profile_short_bio,
                 p.profile_revision AS agent_profile_revision,
+                p.display_name AS agent_display_name,
+                p.avatar_resource_id AS agent_avatar_resource_id,
                 p.created_at AS context_profile_created_at,
                 p.updated_at AS context_profile_updated_at
            FROM room_agent_bindings b
@@ -2794,7 +2952,10 @@ export class PostgresGroupChatStore {
     await this._room(this.pool, roomId);
     await this._membership(this.pool, roomId, userId);
     const result = await this.pool.query(
-      `SELECT b.*, p.profile_revision AS agent_profile_revision
+      `SELECT b.*,
+              p.profile_revision AS agent_profile_revision,
+              p.display_name AS agent_display_name,
+              p.avatar_resource_id AS agent_avatar_resource_id
          FROM room_agent_bindings b
          JOIN agent_profiles p ON p.id = b.agent_profile_id
         WHERE b.room_id = $1
@@ -4395,6 +4556,33 @@ export class PostgresGroupChatStore {
         body: null,
       });
       return { status: 204, body: null };
+    });
+  }
+
+  async invitePreview({ inviteToken }) {
+    return this._transaction(async (client) => {
+      const result = await client.query(
+        `SELECT i.*, r.title AS room_title, r.owner_user_id,
+                u.display_name AS inviter_display_name
+           FROM room_invites i
+           JOIN rooms r ON r.id = i.room_id
+           JOIN users u ON u.id = i.created_by_user_id
+          WHERE i.token_hash = $1`,
+        [hash(inviteToken)],
+      );
+      if (result.rowCount === 0) {
+        throw new HttpError(404, 'resource_not_found', 'Invite is not valid or has expired');
+      }
+      const row = result.rows[0];
+      if (row.revoked_at || row.remaining_uses <= 0 || row.expires_at <= this.clock()) {
+        throw new HttpError(404, 'resource_not_found', 'Invite is not valid or has expired');
+      }
+      return {
+        roomTitle: row.room_title,
+        inviterDisplayName: row.inviter_display_name,
+        expiresAt: row.expires_at.toISOString(),
+        remainingUses: row.remaining_uses,
+      };
     });
   }
 

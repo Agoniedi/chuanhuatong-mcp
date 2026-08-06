@@ -18,17 +18,8 @@ internet.
 
 ## Local PostgreSQL stack
 
-Docker Compose is the recommended local setup once Docker Desktop is installed:
-
-```powershell
-docker compose up --build
-```
-
-This starts PostgreSQL and the server on `127.0.0.1:18787`, applies migrations,
-and explicitly enables development authentication. Data is stored in the named
-`chuanhuatong_postgres` volume and survives container restarts.
-
-Without Docker, point the server at an existing PostgreSQL 15+ database:
+The repository does not currently include a Docker Compose manifest. Point the
+server at an existing PostgreSQL 15+ database:
 
 ```powershell
 $env:DATABASE_URL = 'postgresql://chuanhuatong:password@127.0.0.1:5432/chuanhuatong'
@@ -40,6 +31,7 @@ The legacy memory mode is explicit and intended only for fast tests or temporary
 manual checks. It never activates as a database fallback:
 
 ```powershell
+$env:PUBLIC_REGISTRATION = '1'
 npm.cmd run start:memory
 ```
 
@@ -64,6 +56,8 @@ chat UI or invoke tools while the Host is idle; those remain Host capabilities.
 | `MCP_ALLOWED_ORIGINS` | browser MCP only | Comma-separated exact browser origins; when empty, requests carrying `Origin` are rejected |
 | `MCP_RATE_LIMIT_PER_MINUTE` | no | Per-authenticated-user MCP POST limit for the current single server instance, default `300` |
 | `LOCAL_DEV_AUTH=1` | development only | Enable `POST /__dev/guest-session` |
+| `PUBLIC_REGISTRATION=1` | no | Enable `POST /v1/auth/register`; disabled by default |
+| `TRUST_PROXY=1` | trusted reverse proxy only | Trust the leftmost `X-Forwarded-For` value for registration rate limiting; disabled by default |
 
 `DATABASE_URL` and database passwords belong in deployment secrets, never in
 source control. Run one server instance at this stage. Multiple instances need
@@ -110,9 +104,9 @@ npm.cmd run admin:credentials -- revoke-file `
   --yes
 ```
 
-Inside the production container, use the same script with `docker compose exec`.
-Credential files should be written under `/tmp`, copied out immediately, and
-removed from the container after distribution.
+In a container deployment, run the same script in the server container with its
+database environment. Credential files should be written to a temporary path,
+copied out immediately, and removed from the container after distribution.
 
 ## MCP endpoint
 

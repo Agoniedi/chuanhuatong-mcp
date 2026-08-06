@@ -9,8 +9,8 @@ let server;
 let baseUrl;
 let users;
 
-async function request(path, options = {}) {
-  const response = await fetch(`${baseUrl}${path}`, {
+async function requestAt(origin, path, options = {}) {
+  const response = await fetch(`${origin}${path}`, {
     ...options,
     headers: {
       ...(options.body ? { 'content-type': 'application/json' } : {}),
@@ -21,8 +21,26 @@ async function request(path, options = {}) {
   return { response, body };
 }
 
+async function request(path, options = {}) {
+  return requestAt(baseUrl, path, options);
+}
+
 async function json(path, method, body, headers = {}) {
   return request(path, { method, body: JSON.stringify(body), headers });
+}
+
+async function jsonAt(origin, path, method, body, headers = {}) {
+  return requestAt(origin, path, { method, body: JSON.stringify(body), headers });
+}
+
+async function startIsolatedServer(options) {
+  const isolatedServer = createLocalServer(options);
+  isolatedServer.listen(0, '127.0.0.1');
+  await once(isolatedServer, 'listening');
+  return {
+    server: isolatedServer,
+    baseUrl: `http://127.0.0.1:${isolatedServer.address().port}`,
+  };
 }
 
 function realtimeUrl() {
@@ -195,6 +213,107 @@ describe('local group chat REST loop', () => {
     }
   });
 
+  it('registers one user idempotently and returns a valid replacement token on replay', async () => {
+    const isolated = await startIsolatedServer({
+      publicRegistration: true,
+      logger: { warn() {}, error() {} },
+    });
+    try {
+      const missingKey = await jsonAt(
+        isolated.baseUrl,
+        '/v1/auth/register',
+        'POST',
+        { displayName: 'Missing Registration Key' },
+      );
+      const headers = { 'Idempotency-Key': 'registration-idempotency-1' };
+      const first = await jsonAt(
+        isolated.baseUrl,
+        '/v1/auth/register',
+        'POST',
+        { displayName: 'Registration User' },
+        headers,
+      );
+      const replay = await jsonAt(
+        isolated.baseUrl,
+        '/v1/auth/register',
+        'POST',
+        { displayName: 'Registration User' },
+        headers,
+      );
+      const conflict = await jsonAt(
+        isolated.baseUrl,
+        '/v1/auth/register',
+        'POST',
+        { displayName: 'Different Registration User' },
+        headers,
+      );
+      const me = await requestAt(isolated.baseUrl, '/v1/me', {
+        headers: { Authorization: `Bearer ${replay.body.token}` },
+      });
+
+      assert.equal(missingKey.response.status, 400);
+      assert.equal(missingKey.body.error.code, 'invalid_request');
+      assert.equal(first.response.status, 201);
+      assert.equal(replay.response.status, 201);
+      assert.equal(replay.body.userId, first.body.userId);
+      assert.notEqual(replay.body.token, first.body.token);
+      assert.equal(conflict.response.status, 409);
+      assert.equal(conflict.body.error.code, 'idempotency_conflict');
+      assert.equal(me.response.status, 200);
+      assert.equal(me.body.userId, first.body.userId);
+      assert.equal(me.body.displayName, 'Registration User');
+    } finally {
+      await isolated.server.shutdown();
+    }
+  });
+
+  it('ignores forwarded client addresses unless proxy trust is enabled', async () => {
+    const untrusted = await startIsolatedServer({
+      publicRegistration: true,
+      logger: { warn() {}, error() {} },
+    });
+    try {
+      for (let index = 0; index < 11; index += 1) {
+        const result = await jsonAt(
+          untrusted.baseUrl,
+          '/v1/auth/register',
+          'POST',
+          { displayName: `Untrusted Proxy User ${index}` },
+          {
+            'Idempotency-Key': `untrusted-proxy-registration-${index}`,
+            'X-Forwarded-For': `203.0.113.${index + 1}`,
+          },
+        );
+        assert.equal(result.response.status, index < 10 ? 201 : 429);
+      }
+    } finally {
+      await untrusted.server.shutdown();
+    }
+
+    const trusted = await startIsolatedServer({
+      publicRegistration: true,
+      trustProxy: true,
+      logger: { warn() {}, error() {} },
+    });
+    try {
+      for (let index = 0; index < 11; index += 1) {
+        const result = await jsonAt(
+          trusted.baseUrl,
+          '/v1/auth/register',
+          'POST',
+          { displayName: `Trusted Proxy User ${index}` },
+          {
+            'Idempotency-Key': `trusted-proxy-registration-${index}`,
+            'X-Forwarded-For': `198.51.100.${index + 1}`,
+          },
+        );
+        assert.equal(result.response.status, 201);
+      }
+    } finally {
+      await trusted.server.shutdown();
+    }
+  });
+
   it('keeps guest identity stable and rejects normalized duplicate nicknames', async () => {
     const first = await json('/__dev/guest-session', 'POST', {
       deviceId: 'device-delta',
@@ -273,6 +392,16 @@ describe('local group chat REST loop', () => {
     });
     assert.equal(invite.response.status, 201);
     assert.equal(typeof invite.body.inviteToken, 'string');
+
+    const preview = await request(
+      `/v1/invites/preview?token=${encodeURIComponent(invite.body.inviteToken)}`,
+      { headers: { Authorization: `Bearer ${users.bob.accessToken}` } },
+    );
+    assert.equal(preview.response.status, 200);
+    assert.equal(preview.body.roomTitle, room.title);
+    assert.equal(preview.body.inviterDisplayName, 'Alice');
+    assert.equal(preview.body.expiresAt, expiresAt);
+    assert.equal(preview.body.remainingUses, 1);
 
     const accepted = await json('/v1/invites/accept', 'POST', {
       inviteToken: invite.body.inviteToken,
@@ -792,7 +921,9 @@ describe('local group chat REST loop', () => {
       [
         'agentProfileId',
         'agentProfileRevision',
+        'avatarResourceId',
         'bindingId',
+        'displayName',
         'ownerUserId',
         'participationMode',
         'policyRevision',

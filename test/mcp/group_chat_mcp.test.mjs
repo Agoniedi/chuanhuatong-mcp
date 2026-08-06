@@ -245,6 +245,7 @@ describe('stateless Group Chat MCP read loop', () => {
         'group_heartbeat_agent',
         'group_join_room',
         'group_list_rooms',
+        'group_poll_messages',
         'group_publish_agent_reply',
         'group_read_messages',
         'group_send_message',
@@ -355,6 +356,7 @@ describe('stateless Group Chat MCP read loop', () => {
           'group_heartbeat_agent',
           'group_join_room',
           'group_list_rooms',
+          'group_poll_messages',
           'group_publish_agent_reply',
           'group_read_messages',
           'group_send_message',
@@ -1252,6 +1254,59 @@ describe('stateless Group Chat MCP read loop', () => {
     assert.equal(forbidden.body.result.isError, true);
     assert.equal(
       JSON.parse(forbidden.body.result.content[0].text).error.code,
+      'forbidden',
+    );
+  });
+
+  it('returns new messages immediately with group_poll_messages', async () => {
+    const result = await callTool('group_poll_messages', {
+      roomId: contextRoom.id,
+      afterSeq: 0,
+      timeoutMs: 2000,
+    });
+    assert.equal(result.body.result.isError, undefined);
+    const content = result.body.result.structuredContent;
+    assert.ok(content.messages.length > 0);
+    assert.ok(content.nextSeq > 0);
+    assert.ok(content.highWaterSeq > 0);
+  });
+
+  it('returns empty when no new messages and 0ms timeout with group_poll_messages', async () => {
+    const current = await callTool('group_read_messages', {
+      roomId: contextRoom.id,
+      afterSeq: 0,
+      limit: 200,
+    });
+    const highWater = current.body.result.structuredContent.highWaterSeq;
+    const result = await callTool('group_poll_messages', {
+      roomId: contextRoom.id,
+      afterSeq: highWater,
+      timeoutMs: 0,
+    });
+    assert.equal(result.body.result.isError, undefined);
+    const content = result.body.result.structuredContent;
+    assert.deepEqual(content.messages, []);
+    assert.equal(content.nextSeq, highWater);
+  });
+
+  it('rejects timeoutMs exceeding 60000 with group_poll_messages', async () => {
+    const result = await callTool('group_poll_messages', {
+      roomId: contextRoom.id,
+      afterSeq: 0,
+      timeoutMs: 60001,
+    });
+    assert.equal(result.body.result.isError, true);
+  });
+
+  it('rejects non-member access with group_poll_messages', async () => {
+    const result = await callTool('group_poll_messages', {
+      roomId: contextRoom.id,
+      afterSeq: 0,
+      timeoutMs: 0,
+    }, { accessToken: users.charlie.accessToken });
+    assert.equal(result.body.result.isError, true);
+    assert.equal(
+      JSON.parse(result.body.result.content[0].text).error.code,
       'forbidden',
     );
   });

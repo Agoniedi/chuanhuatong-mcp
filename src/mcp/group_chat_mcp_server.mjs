@@ -19,6 +19,9 @@ const WRITE_ANNOTATIONS = Object.freeze({
 });
 const WAIT_MESSAGE_LIMIT = 200;
 const WAIT_POLL_INTERVAL_MS = 250;
+const POLL_MESSAGE_LIMIT = 200;
+const POLL_INTERVAL_MS = 2000;
+const POLL_MAX_TIMEOUT_MS = 60000;
 const MCP_RUNTIME_CAPABILITIES_VERSION = 1;
 
 const idSchema = z.string().min(1).max(128);
@@ -84,6 +87,8 @@ const publicAgentBindingSchema = z.object({
   ownerUserId: idSchema,
   agentProfileId: idSchema,
   agentProfileRevision: z.number().int().positive(),
+  displayName: z.string().min(1).max(80),
+  avatarResourceId: nullableResourceIdSchema,
   participationMode: z.enum(['off', 'manual', 'automatic']),
   publishMode: z.enum(['reviewRequired', 'automatic']),
   triggerScope: z.enum(['mentionsOnly', 'allHumanMessages', 'allMessages']),
@@ -368,6 +373,22 @@ async function waitForMessages({ store, userId, roomId, afterSeq, timeoutMs, sig
   }
 }
 
+async function pollMessages({ store, userId, roomId, afterSeq, timeoutMs, signal }) {
+  const deadline = Date.now() + timeoutMs;
+  while (true) {
+    const page = await readMessagesPage({
+      store,
+      userId,
+      roomId,
+      afterSeq,
+      limit: POLL_MESSAGE_LIMIT,
+    });
+    const remainingMs = deadline - Date.now();
+    if (page.messages.length > 0 || remainingMs <= 0) return page;
+    await delay(Math.min(POLL_INTERVAL_MS, remainingMs), undefined, { signal });
+  }
+}
+
 async function publishAutomaticAgentReply({ store, user, args }) {
   const requestFingerprint = toolFingerprint('group_publish_agent_reply', args);
   const created = await store.createAutomaticGenerationRequest({
@@ -648,6 +669,27 @@ export function createGroupChatMcpServer({
     outputSchema: readMessagesOutputSchema,
     annotations: READ_ONLY_ANNOTATIONS,
   }, toolHandler(async ({ roomId, afterSeq, timeoutMs }, extra) => waitForMessages({
+    store,
+    userId: user.userId,
+    roomId,
+    afterSeq,
+    timeoutMs,
+    signal: extra.signal,
+  }), logger));
+
+  server.registerTool('group_poll_messages', {
+    description: 'Long-poll for room messages with extended timeout. ' +
+      'Call after group_send_message to wait for replies. ' +
+      'Polls every 2s for up to 60s. Returns immediately when new messages arrive. ' +
+      'senderType is the authoritative human-or-agent identity; never infer sender type from the display name.',
+    inputSchema: z.object({
+      roomId: idSchema,
+      afterSeq: z.number().int().min(0).max(Number.MAX_SAFE_INTEGER),
+      timeoutMs: z.number().int().min(0).max(POLL_MAX_TIMEOUT_MS).default(POLL_MAX_TIMEOUT_MS),
+    }).strict(),
+    outputSchema: readMessagesOutputSchema,
+    annotations: READ_ONLY_ANNOTATIONS,
+  }, toolHandler(async ({ roomId, afterSeq, timeoutMs }, extra) => pollMessages({
     store,
     userId: user.userId,
     roomId,

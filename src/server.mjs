@@ -13,6 +13,7 @@ import { createGroupChatMcpServer } from './mcp/group_chat_mcp_server.mjs';
 const MAX_BODY_BYTES = 1024 * 1024;
 const MAX_INVITE_LIFETIME_MS = 30 * 24 * 60 * 60 * 1000;
 const MCP_RATE_LIMIT_WINDOW_MS = 60 * 1000;
+const REGISTRATION_RATE_LIMIT_WINDOW_MS = 3600 * 1000;
 const TIMESTAMP_PATTERN = /^\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}(?:\.\d{1,9})?Z$/;
 const GENERATION_STATUSES = [
   'queued',
@@ -168,6 +169,32 @@ function createMcpRateLimiter(limit, clock = Date.now) {
     }
     if (window.count >= limit) {
       throw new HttpError(429, 'rate_limited', 'MCP request rate limit exceeded', {
+        retryAfterSeconds: Math.max(1, Math.ceil((window.resetAt - now) / 1000)),
+      });
+    }
+    window.count += 1;
+  };
+}
+
+function createRegistrationRateLimiter(limit, clock = Date.now) {
+  const windows = new Map();
+  let nextSweepAt = 0;
+  return (ip) => {
+    const now = clock();
+    if (now >= nextSweepAt) {
+      for (const [candidateIp, window] of windows) {
+        if (window.resetAt <= now) windows.delete(candidateIp);
+      }
+      nextSweepAt = now + REGISTRATION_RATE_LIMIT_WINDOW_MS;
+    }
+
+    let window = windows.get(ip);
+    if (!window || window.resetAt <= now) {
+      window = { count: 0, resetAt: now + REGISTRATION_RATE_LIMIT_WINDOW_MS };
+      windows.set(ip, window);
+    }
+    if (window.count >= limit) {
+      throw new HttpError(429, 'rate_limited', 'Registration rate limit exceeded', {
         retryAfterSeconds: Math.max(1, Math.ceil((window.resetAt - now) / 1000)),
       });
     }
@@ -379,7 +406,13 @@ function attachRealtimeServer(server, store, logger, pollIntervalMs) {
     void (async () => {
       try {
         const url = new URL(request.url ?? '/', 'http://localhost');
-        if (request.method !== 'GET' || url.pathname !== '/v1/realtime' || url.search) {
+        if (request.method !== 'GET' || url.pathname !== '/v1/realtime') {
+          throw new HttpError(404, 'resource_not_found', 'Realtime route not found');
+        }
+        // Support token via query param for browser WebSocket (no custom headers)
+        if (url.searchParams.has('token')) {
+          request.headers.authorization = `Bearer ${url.searchParams.get('token')}`;
+        } else if (url.search) {
           throw new HttpError(404, 'resource_not_found', 'Realtime route not found');
         }
         const user = await authUser(store, request);
@@ -474,6 +507,30 @@ async function handleRequest(
     return;
   }
 
+  if (request.method === 'POST' && path === '/v1/auth/register') {
+    if (!options.publicRegistration) {
+      throw new HttpError(404, 'resource_not_found', 'Public registration is disabled');
+    }
+    const forwardedIp = options.trustProxy
+      ? request.headers['x-forwarded-for']?.split(',')[0]?.trim()
+      : null;
+    const ip = forwardedIp || request.socket.remoteAddress || '127.0.0.1';
+    options.checkRegistrationRateLimit(ip);
+    const body = await readJson(request);
+    const key = assertString(request.headers['idempotency-key'], 'Idempotency-Key');
+    assertFields(body, ['displayName'], ['displayName']);
+    const displayName = assertString(body.displayName, 'displayName', 1, 80).trim();
+    if (displayName.length === 0) {
+      throw new HttpError(400, 'invalid_request', 'displayName must not be blank');
+    }
+    write(201, await store.createUserRegistration({
+      displayName,
+      key,
+      requestFingerprint: fingerprint(request.method, path, body),
+    }));
+    return;
+  }
+
   if (path === '/mcp') {
     assertMcpOrigin(request, options.mcpAllowedOrigins);
     const user = await authUser(store, request);
@@ -495,6 +552,11 @@ async function handleRequest(
     throw new HttpError(404, 'resource_not_found', 'Route not found');
   }
   const user = await authUser(store, request);
+
+  if (request.method === 'GET' && path === '/v1/me') {
+    write(200, await store.getMe({ userId: user.userId }));
+    return;
+  }
 
   if (request.method === 'POST' && path === '/v1/agent-profiles') {
     const body = await readJson(request);
@@ -1093,6 +1155,12 @@ async function handleRequest(
     return;
   }
 
+  if (request.method === 'GET' && path === '/v1/invites/preview') {
+    const inviteToken = assertString(url.searchParams.get('token'), 'token', 22, 256);
+    write(200, await store.invitePreview({ inviteToken }));
+    return;
+  }
+
   if (request.method === 'POST' && path === '/v1/invites/accept') {
     const body = await readJson(request);
     assertFields(body, ['inviteToken'], ['inviteToken']);
@@ -1185,6 +1253,8 @@ async function handleRequest(
 
 export function createLocalServer({
   devAuthEnabled = false,
+  publicRegistration = process.env.PUBLIC_REGISTRATION === '1',
+  trustProxy = process.env.TRUST_PROXY === '1',
   store = new MemoryGroupChatStore(),
   logger = console,
   corsAllowOrigin = process.env.CORS_ALLOW_ORIGIN ?? '*',
@@ -1201,6 +1271,7 @@ export function createLocalServer({
     logger.warn?.('[local-dev] anonymous guest sessions are enabled for local development only.');
   }
   const checkMcpRateLimit = createMcpRateLimiter(mcpRateLimitPerMinute);
+  const checkRegistrationRateLimit = createRegistrationRateLimiter(10);
   let wakeOutbox = () => {};
   const server = createServer((request, response) => {
     const requestId = newId('req');
@@ -1210,8 +1281,11 @@ export function createLocalServer({
       response,
       {
         devAuthEnabled: effectiveDevAuthEnabled,
+        publicRegistration,
+        trustProxy,
         corsAllowOrigin,
         checkMcpRateLimit,
+        checkRegistrationRateLimit,
         logger,
         mcpAllowedOrigins: effectiveMcpAllowedOrigins,
       },
