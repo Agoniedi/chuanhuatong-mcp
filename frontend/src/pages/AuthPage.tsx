@@ -2,6 +2,7 @@ import { useRef, useState } from 'react';
 import { useNavigate, useSearchParams } from 'react-router-dom';
 import { useApp } from '../store/AppContext';
 import { register } from '../api/auth';
+import { newRequestId } from '../api/request-id';
 
 export default function AuthPage() {
   const [displayName, setDisplayName] = useState('');
@@ -25,7 +26,7 @@ export default function AuthPage() {
       if (registrationAttempt.current?.displayName !== name) {
         registrationAttempt.current = {
           displayName: name,
-          key: crypto.randomUUID(),
+          key: newRequestId(),
         };
       }
       const result = await register(name, registrationAttempt.current.key);

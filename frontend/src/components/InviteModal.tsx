@@ -1,4 +1,5 @@
 import { useState } from 'react';
+import { newRequestId } from '../api/request-id';
 
 interface Props {
   roomId: string;
@@ -28,7 +29,7 @@ export default function InviteModal({ roomId, onClose }: Props) {
         headers: {
           'Content-Type': 'application/json',
           'Authorization': `Bearer ${localStorage.getItem('chuanhuatong_token')}`,
-          'Idempotency-Key': crypto.randomUUID(),
+          'Idempotency-Key': newRequestId(),
         },
         body: JSON.stringify({
           expectedRoomRevision: room.revision,

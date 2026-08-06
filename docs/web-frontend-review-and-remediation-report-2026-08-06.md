@@ -2,17 +2,18 @@
 
 > 审查日期：2026-08-06
 > 审查对象：`docs/web-frontend-architecture.md`、`docs/development-report.md` 及对应实现
-> 修订范围：P1、P2 问题
-> 当前状态：本报告列出的 P1、P2 已完成修复；仍有测试与部署残余风险
+> 修订范围：P1、P2 问题及移动端联调阻断
+> 当前状态：P1、P2 与移动端 UUID 兼容问题已修复；仍有测试与部署残余风险
 
 ## 1. 结论摘要
 
-本次审查覆盖 Web 注册、邀请深链接、REST 写操作幂等、WebSocket 开发代理、消息分页与断线补偿、Agent 可见性以及交接文档真实性。
+本次审查覆盖 Web 注册、邀请深链接、REST 写操作幂等、WebSocket 开发代理、消息分页与断线补偿、Agent 可见性、交接文档真实性，以及安卓局域网浏览器兼容性。
 
 初次审查共确认 8 项需要修复的问题：4 项 P1、4 项 P2。修订后：
 
 - 4 项 P1 已完成修复，并通过邀请深链接、跨页消息加载和 WebSocket 断线补偿 E2E 验证。
 - 4 项 P2 已完成修复，并补充注册幂等、注册限流、`GET /v1/me`、邀请预览和 PostgreSQL 幂等路径测试。
+- 移动端实测发现的 `crypto.randomUUID()` 兼容性阻断已修复，所有前端请求 ID 改用 `crypto.getRandomValues()` 生成的 UUID v4；等待两台安卓复测。
 - 当前可执行的 Node.js 测试共 62 项：56 通过、0 失败、6 跳过。
 - 6 个跳过项依赖 `TEST_DATABASE_URL`，因此不能据此认定 PostgreSQL 真实环境已经验证通过。
 - 前端构建通过；lint 仅保留一个既有 Fast Refresh 警告；构建仍有两个既有无效动态导入警告。
@@ -63,6 +64,7 @@
 | P2-2 | P2 | 注册不支持幂等，响应丢失后 Token 与已创建身份无法恢复 | 已修复 | 同键复用用户并签发新 Token；改参返回 409 |
 | P2-3 | P2 | Agent 前端枚举与后端契约不一致，`off` 被显示为“手动” | 已修复 | TypeScript 构建通过；三态映射完成 |
 | P2-4 | P2 | 开发报告高估测试和部署完成度，部分命令与状态码错误 | 已修复 | 文档与代码、测试输出、仓库文件重新核对 |
+| MOB-1 | P1（移动端） | 局域网 HTTP 下 `crypto.randomUUID` 不可用，注册流程在发请求前失败 | 代码已修复，待安卓复测 | UUID v4 生成器 10,000 次唯一性与构建验证 |
 
 ## 4. P1 详细审查与修订
 
@@ -212,7 +214,7 @@ Vite 只为 `/v1` 配置了普通 HTTP 代理，没有启用 WebSocket Upgrade �
 
 这保证“用户创建”只发生一次，但首次响应和重放响应中的 Token 不相同。
 
-由于同键重放可以为原用户签发新 Token，注册幂等键在注册完成前具有身份恢复能力。调用方必须使用不可预测的高熵值并避免记录或泄露该请求头；内置前端使用 `crypto.randomUUID()`。公开部署时，反向代理也不应记录 `Idempotency-Key`。
+由于同键重放可以为原用户签发新 Token，注册幂等键在注册完成前具有身份恢复能力。调用方必须使用不可预测的高熵值并避免记录或泄露该请求头；内置前端使用 `crypto.getRandomValues()` 生成 UUID v4。公开部署时，反向代理也不应记录 `Idempotency-Key`。
 
 **修订**
 
@@ -293,6 +295,36 @@ Vite 只为 `/v1` 配置了普通 HTTP 代理，没有启用 WebSocket Upgrade �
 
 ## 6. 修改文件与职责映射
 
+### 5.5 MOB-1：移动端局域网 HTTP 不支持 crypto.randomUUID
+
+**复现证据**
+
+在安卓浏览器访问 `http://192.168.1.2:5173` 时，注册页显示：
+
+```text
+crypto.randomUUID is not a function
+```
+
+页面在调用后端注册接口之前就失败，因此用户无法开始注册。
+
+**根因**
+
+`crypto.randomUUID()` 要求更完整的 Web Crypto 安全上下文/浏览器实现。局域网 HTTP 开发地址不是 HTTPS 安全上下文，部分移动端浏览器仍提供 `crypto.getRandomValues()`，但不提供 `randomUUID()`。
+
+**修订**
+
+- 新增 `frontend/src/api/request-id.ts`。
+- 使用 `crypto.getRandomValues(new Uint8Array(16))` 生成 RFC 4122 UUID v4。
+- 替换注册、创建房间、发送消息、创建邀请、接受邀请的全部 `crypto.randomUUID()` 调用。
+- 不使用 `Math.random()`，避免降低注册幂等键和消息客户端 ID 的不可预测性。
+
+**验证**
+
+- 源码和构建产物中不再存在 `randomUUID()` 引用。
+- 生成器连续生成 10,000 个值，全部符合 UUID v4 格式且无重复。
+- 前端 TypeScript/Vite 构建通过，lint 无新增错误。
+- 两台安卓设备的实际注册、邀请和消息流程尚未重新执行，当前状态为“代码修复完成，设备复测待完成”。
+
 ### 6.1 P1 代码
 
 | 文件 | 修订内容 |
@@ -304,6 +336,7 @@ Vite 只为 `/v1` 配置了普通 HTTP 代理，没有启用 WebSocket Upgrade �
 | `frontend/vite.config.ts` | 启用 `/v1` WebSocket 代理 |
 | `frontend/src/store/AppContext.tsx` | 消息分页、去重、排序和游标统一 |
 | `frontend/src/pages/RoomPage.tsx` | 连接恢复时按最后序号补拉 |
+| `frontend/src/api/request-id.ts` | 生成兼容局域网 HTTP 的 UUID v4 |
 
 ### 6.2 P2 代码与测试
 
@@ -314,6 +347,7 @@ Vite 只为 `/v1` 配置了普通 HTTP 代理，没有启用 WebSocket Upgrade �
 | `test/server.test.mjs` | 注册、限流、`/v1/me`、邀请预览回归测试 |
 | `test/postgres_store.test.mjs` | PostgreSQL 同键并发注册测试 |
 | `frontend/src/api/auth.ts` | 注册请求发送幂等键 |
+| `frontend/src/api/request-id.ts` | 统一生成注册、房间、消息和邀请请求 ID |
 | `frontend/src/pages/AuthPage.tsx` | 网络失败重试复用注册键 |
 | `frontend/src/types.ts` | 修正 AgentBinding 枚举 |
 | `frontend/src/components/MemberPanel.tsx` | Agent 三态展示 |

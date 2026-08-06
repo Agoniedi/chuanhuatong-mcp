@@ -1,4 +1,5 @@
 import { apiRequest } from './client';
+import { newRequestId } from './request-id';
 import type { Message } from '../types';
 
 export async function listMessages(roomId: string, afterSeq: number = 0, limit: number = 50): Promise<{ items: Message[]; highWaterSeq: number; hasMore: boolean }> {
@@ -7,7 +8,7 @@ export async function listMessages(roomId: string, afterSeq: number = 0, limit: 
 }
 
 export async function sendMessage(roomId: string, text: string): Promise<Message> {
-  const clientMessageId = crypto.randomUUID();
+  const clientMessageId = newRequestId();
   return apiRequest<Message>('POST', `/v1/rooms/${roomId}/messages`, {
     clientMessageId,
     content: { schemaVersion: 1, type: 'text', text },

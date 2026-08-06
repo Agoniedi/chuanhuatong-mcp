@@ -1,4 +1,5 @@
 import { apiRequest } from './client';
+import { newRequestId } from './request-id';
 
 export interface InvitePreview {
   roomTitle: string;
@@ -14,6 +15,6 @@ export async function previewInvite(inviteToken: string): Promise<InvitePreview>
 
 export async function acceptInvite(inviteToken: string): Promise<{ room: any; membership: any }> {
   return apiRequest('POST', '/v1/invites/accept', { inviteToken }, {
-    operationId: crypto.randomUUID(),
+    operationId: newRequestId(),
   });
 }
