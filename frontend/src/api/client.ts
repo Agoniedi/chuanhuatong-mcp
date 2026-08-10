@@ -1,17 +1,3 @@
-const TOKEN_KEY = 'chuanhuatong_token';
-
-export function getToken(): string | null {
-  return localStorage.getItem(TOKEN_KEY);
-}
-
-export function setToken(token: string): void {
-  localStorage.setItem(TOKEN_KEY, token);
-}
-
-export function clearToken(): void {
-  localStorage.removeItem(TOKEN_KEY);
-}
-
 export class ApiError extends Error {
   status: number;
   code: string;
@@ -28,15 +14,10 @@ export async function apiRequest<T>(
   method: string,
   path: string,
   body?: unknown,
-  options?: { token?: string; idempotencyKey?: string; operationId?: string },
+  options?: { idempotencyKey?: string; operationId?: string },
 ): Promise<T> {
-  const headers: Record<string, string> = {
-    'Content-Type': 'application/json',
-  };
-  const token = options?.token ?? getToken();
-  if (token) {
-    headers['Authorization'] = `Bearer ${token}`;
-  }
+  const headers: Record<string, string> = {};
+  if (body !== undefined) headers['Content-Type'] = 'application/json';
   if (options?.idempotencyKey) {
     headers['Idempotency-Key'] = options.idempotencyKey;
   }
@@ -46,7 +27,8 @@ export async function apiRequest<T>(
   const response = await fetch(path, {
     method,
     headers,
-    body: body ? JSON.stringify(body) : undefined,
+    body: body === undefined ? undefined : JSON.stringify(body),
+    credentials: 'same-origin',
   });
   if (!response.ok) {
     const data = await response.json().catch(() => ({}));

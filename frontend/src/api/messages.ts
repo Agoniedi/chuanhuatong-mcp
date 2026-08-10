@@ -1,17 +1,38 @@
 import { apiRequest } from './client';
-import { newRequestId } from './request-id';
 import type { Message } from '../types';
 
-export async function listMessages(roomId: string, afterSeq: number = 0, limit: number = 50): Promise<{ items: Message[]; highWaterSeq: number; hasMore: boolean }> {
-  const params = new URLSearchParams({ afterSeq: String(afterSeq), limit: String(limit) });
+export interface MessagePage {
+  items: Message[];
+  highWaterSeq: number;
+  hasMore: boolean;
+  nextBeforeSeq?: number | null;
+}
+
+export function listLatestMessages(
+  roomId: string,
+  beforeSeq: number | null = null,
+  limit = 100,
+): Promise<MessagePage> {
+  const params = new URLSearchParams({ limit: String(limit) });
+  if (beforeSeq !== null) params.set('beforeSeq', String(beforeSeq));
   return apiRequest('GET', `/v1/rooms/${roomId}/messages?${params}`);
 }
 
-export async function sendMessage(roomId: string, text: string): Promise<Message> {
-  const clientMessageId = newRequestId();
-  return apiRequest<Message>('POST', `/v1/rooms/${roomId}/messages`, {
-    clientMessageId,
-    content: { schemaVersion: 1, type: 'text', text },
-    mentions: [],
-  }, { idempotencyKey: clientMessageId });
+export function listMessagesAfter(
+  roomId: string,
+  afterSeq: number,
+  limit = 200,
+): Promise<MessagePage> {
+  const params = new URLSearchParams({
+    afterSeq: String(afterSeq),
+    limit: String(limit),
+  });
+  return apiRequest('GET', `/v1/rooms/${roomId}/messages?${params}`);
+}
+
+export function markRoomRead(roomId: string, readSeq: number): Promise<{
+  roomId: string;
+  webReadSeq: number;
+}> {
+  return apiRequest('PUT', `/v1/rooms/${roomId}/read`, { readSeq });
 }

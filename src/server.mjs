@@ -1,5 +1,9 @@
 import { createHash, randomBytes } from 'node:crypto';
+import { createReadStream, existsSync, statSync } from 'node:fs';
 import { createServer, STATUS_CODES } from 'node:http';
+import { extname, resolve, sep } from 'node:path';
+import { pipeline } from 'node:stream/promises';
+import { fileURLToPath } from 'node:url';
 import { StreamableHTTPServerTransport } from '@modelcontextprotocol/sdk/server/streamableHttp.js';
 import { WebSocket, WebSocketServer } from 'ws';
 
@@ -8,12 +12,34 @@ import {
   MemoryGroupChatStore,
   PostgresGroupChatStore,
 } from './group_chat_store.mjs';
-import { createGroupChatMcpServer } from './mcp/group_chat_mcp_server.mjs';
+import {
+  createGroupChatMcpServer,
+  createRegistrationMcpServer,
+} from './mcp/group_chat_mcp_server.mjs';
+import { createPasswordDigest, verifyPasswordDigest } from './passwords.mjs';
 
 const MAX_BODY_BYTES = 1024 * 1024;
+const MAX_AVATAR_BYTES = 2 * 1024 * 1024;
+const AVATAR_MIME_TYPES = new Set(['image/jpeg', 'image/png', 'image/webp']);
 const MAX_INVITE_LIFETIME_MS = 30 * 24 * 60 * 60 * 1000;
 const MCP_RATE_LIMIT_WINDOW_MS = 60 * 1000;
 const REGISTRATION_RATE_LIMIT_WINDOW_MS = 3600 * 1000;
+const WEB_SESSION_COOKIE = 'chuanhuatong_session';
+const WEB_SESSION_MAX_AGE_SECONDS = 10 * 365 * 24 * 60 * 60;
+const FRONTEND_DIST = fileURLToPath(new URL('../frontend/dist/', import.meta.url));
+const STATIC_MIME_TYPES = new Map([
+  ['.css', 'text/css; charset=utf-8'],
+  ['.html', 'text/html; charset=utf-8'],
+  ['.ico', 'image/x-icon'],
+  ['.jpeg', 'image/jpeg'],
+  ['.jpg', 'image/jpeg'],
+  ['.js', 'application/javascript; charset=utf-8'],
+  ['.json', 'application/json; charset=utf-8'],
+  ['.png', 'image/png'],
+  ['.svg', 'image/svg+xml; charset=utf-8'],
+  ['.webp', 'image/webp'],
+]);
+const USERNAME_PATTERN = /^[A-Za-z0-9_]{3,32}$/;
 const TIMESTAMP_PATTERN = /^\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}(?:\.\d{1,9})?Z$/;
 const GENERATION_STATUSES = [
   'queued',
@@ -220,9 +246,30 @@ async function readJson(request) {
   }
 }
 
+async function readAvatar(request) {
+  const mimeType = request.headers['content-type']?.split(';')[0]?.trim().toLowerCase();
+  if (!AVATAR_MIME_TYPES.has(mimeType)) {
+    throw new HttpError(415, 'unsupported_media_type', 'Avatar must be JPEG, PNG, or WebP');
+  }
+  const chunks = [];
+  let size = 0;
+  for await (const chunk of request) {
+    size += chunk.length;
+    if (size > MAX_AVATAR_BYTES) {
+      throw new HttpError(413, 'payload_too_large', 'Avatar must be at most 2 MiB');
+    }
+    chunks.push(chunk);
+  }
+  if (size === 0) {
+    throw new HttpError(400, 'invalid_request', 'Avatar must not be empty');
+  }
+  return { mimeType, content: Buffer.concat(chunks) };
+}
+
 function applyCommonHeaders(response, requestId, corsAllowOrigin) {
   response.setHeader('x-request-id', requestId);
   response.setHeader('access-control-allow-origin', corsAllowOrigin);
+  if (corsAllowOrigin !== '*') response.setHeader('access-control-allow-credentials', 'true');
 }
 
 function writeJson(response, status, body, requestId, corsAllowOrigin) {
@@ -273,8 +320,128 @@ function bearerToken(request) {
   return assertString(header.slice('Bearer '.length), 'Bearer session', 1, 256);
 }
 
+function parseCookies(request) {
+  const header = request.headers.cookie;
+  if (typeof header !== 'string') return new Map();
+  const cookies = new Map();
+  for (const part of header.split(';')) {
+    const separator = part.indexOf('=');
+    if (separator < 0) continue;
+    const name = part.slice(0, separator).trim();
+    const value = part.slice(separator + 1).trim();
+    if (name) cookies.set(name, value);
+  }
+  return cookies;
+}
+
+function authenticationToken(request) {
+  const header = request.headers.authorization;
+  if (typeof header === 'string') return bearerToken(request);
+  const token = parseCookies(request).get(WEB_SESSION_COOKIE);
+  if (!token) throw new HttpError(401, 'authentication_required', 'Authenticated session required');
+  return assertString(token, 'Web session', 1, 256);
+}
+
+function webSessionCookie(token, secure) {
+  return [
+    `${WEB_SESSION_COOKIE}=${token}`,
+    'HttpOnly',
+    'SameSite=Lax',
+    'Path=/',
+    `Max-Age=${WEB_SESSION_MAX_AGE_SECONDS}`,
+    ...(secure ? ['Secure'] : []),
+  ].join('; ');
+}
+
+function clearedWebSessionCookie(secure) {
+  return [
+    `${WEB_SESSION_COOKIE}=`,
+    'HttpOnly',
+    'SameSite=Lax',
+    'Path=/',
+    'Max-Age=0',
+    ...(secure ? ['Secure'] : []),
+  ].join('; ');
+}
+
+function normalizedUsername(value) {
+  const username = assertString(value, 'username', 3, 32);
+  if (!USERNAME_PATTERN.test(username)) {
+    throw new HttpError(400, 'invalid_request', 'username must contain only letters, numbers, or underscores');
+  }
+  return { username, usernameKey: username.toLowerCase() };
+}
+
+function requestIp(request, options) {
+  const forwardedIp = options.trustProxy
+    ? request.headers['x-forwarded-for']?.split(',')[0]?.trim()
+    : null;
+  return forwardedIp || request.socket.remoteAddress || '127.0.0.1';
+}
+
+function mcpBaseUrl(request, options) {
+  const forwardedProtocol = options.trustProxy
+    ? request.headers['x-forwarded-proto']?.split(',')[0]?.trim()
+    : null;
+  const protocol = forwardedProtocol || (request.socket.encrypted ? 'https' : 'http');
+  const host = request.headers.host ?? '127.0.0.1';
+  return `${protocol}://${host}/mcp`;
+}
+
 async function authUser(store, request) {
-  return store.authenticate(bearerToken(request));
+  return store.authenticate(authenticationToken(request));
+}
+
+function isAllowedWebMutation(method, path) {
+  if (!['POST', 'PUT', 'PATCH', 'DELETE'].includes(method)) return true;
+  if (method === 'POST' && [
+    '/v1/auth/logout',
+    '/v1/auth/change-password',
+    '/v1/auth/upgrade',
+    '/v1/profile-resources',
+    '/v1/me/devices',
+    '/v1/agent-profiles',
+  ].includes(path)) return true;
+  if (method === 'PATCH' && path === '/v1/me') return true;
+  if (method === 'PATCH' && /^\/v1\/agent-profiles\/[^/]+$/.test(path)) return true;
+  if (method === 'DELETE' && /^\/v1\/me\/devices\/[^/]+$/.test(path)) return true;
+  return method === 'PUT' && /^\/v1\/rooms\/[^/]+\/read$/.test(path);
+}
+
+async function serveFrontend(
+  request,
+  response,
+  path,
+  requestId,
+  corsAllowOrigin,
+  frontendDist,
+) {
+  const frontendRoot = resolve(frontendDist);
+  const frontendIndex = resolve(frontendRoot, 'index.html');
+  if (!['GET', 'HEAD'].includes(request.method) || !existsSync(frontendIndex)) {
+    return false;
+  }
+  const relativePath = decodeURIComponent(path).replace(/^\/+/, '');
+  const candidate = resolve(frontendRoot, relativePath || 'index.html');
+  const insideDist = candidate === frontendRoot || candidate.startsWith(`${frontendRoot}${sep}`);
+  const filePath = insideDist && existsSync(candidate) && statSync(candidate).isFile()
+    ? candidate
+    : frontendIndex;
+  applyCommonHeaders(response, requestId, corsAllowOrigin);
+  response.statusCode = 200;
+  response.setHeader(
+    'content-type',
+    STATIC_MIME_TYPES.get(extname(filePath).toLowerCase()) ?? 'application/octet-stream',
+  );
+  response.setHeader('cache-control', filePath === frontendIndex
+    ? 'no-cache'
+    : 'public, max-age=31536000, immutable');
+  if (request.method === 'HEAD') {
+    response.end();
+  } else {
+    await pipeline(createReadStream(filePath), response);
+  }
+  return true;
 }
 
 async function handleMcpRequest(
@@ -286,9 +453,10 @@ async function handleMcpRequest(
   corsAllowOrigin,
   logger,
   wakeOutbox,
+  registration,
 ) {
-  if (request.method !== 'POST') {
-    response.setHeader('allow', 'POST');
+  if (!['GET', 'POST'].includes(request.method)) {
+    response.setHeader('allow', 'GET, POST');
     writeJson(response, 405, {
       jsonrpc: '2.0',
       error: { code: -32000, message: 'Method not allowed' },
@@ -297,12 +465,19 @@ async function handleMcpRequest(
     return;
   }
 
-  const mcpServer = createGroupChatMcpServer({
-    store,
-    user,
-    logger,
-    onMessageCreated: wakeOutbox,
-  });
+  const mcpServer = user
+    ? createGroupChatMcpServer({
+        store,
+        user,
+        mcpBaseUrl: registration.mcpBaseUrl,
+        logger,
+        onMessageCreated: wakeOutbox,
+      })
+    : createRegistrationMcpServer({
+        mcpBaseUrl: registration.mcpBaseUrl,
+        logger,
+        registerIdentity: registration.registerIdentity,
+      });
   const transport = new StreamableHTTPServerTransport({
     sessionIdGenerator: undefined,
     enableJsonResponse: true,
@@ -368,23 +543,28 @@ function attachRealtimeServer(server, store, logger, pollIntervalMs) {
         const entries = await store.listPendingOutboxEvents();
         for (const entry of entries) {
           const event = entry.event;
+          let recipientUserIds = [];
           if (event.type === 'message.created' && event.roomId) {
-            const recipients = await store.listRealtimeRecipientUserIds(
+            recipientUserIds = await store.listRealtimeRecipientUserIds(
               event.roomId,
               event.payload.seq,
             );
-            for (const userId of recipients) {
-              for (const socket of socketsByUserId.get(userId) ?? []) {
-                const active = await store.isSessionActive({
-                  userId,
-                  deviceId: socket.sessionDeviceId,
-                });
-                if (!active) {
-                  socket.close(1008, 'Session revoked');
-                  continue;
-                }
-                sendRealtimeEvent(socket, event);
+          } else if (event.type === 'profile.updated') {
+            recipientUserIds = await store.listProfileRecipientUserIds(
+              event.payload.ownerUserId,
+            );
+          }
+          for (const userId of recipientUserIds) {
+            for (const socket of socketsByUserId.get(userId) ?? []) {
+              const active = await store.isSessionActive({
+                userId,
+                deviceId: socket.sessionDeviceId,
+              });
+              if (!active) {
+                socket.close(1008, 'Session revoked');
+                continue;
               }
+              sendRealtimeEvent(socket, event);
             }
           }
           await store.markOutboxDispatched(entry.outboxId);
@@ -409,10 +589,10 @@ function attachRealtimeServer(server, store, logger, pollIntervalMs) {
         if (request.method !== 'GET' || url.pathname !== '/v1/realtime') {
           throw new HttpError(404, 'resource_not_found', 'Realtime route not found');
         }
-        // Support token via query param for browser WebSocket (no custom headers)
-        if (url.searchParams.has('token')) {
+        // Existing Bearer Header wins when both authentication forms are present.
+        if (!request.headers.authorization && url.searchParams.has('token')) {
           request.headers.authorization = `Bearer ${url.searchParams.get('token')}`;
-        } else if (url.search) {
+        } else if (url.search && !url.searchParams.has('token')) {
           throw new HttpError(404, 'resource_not_found', 'Realtime route not found');
         }
         const user = await authUser(store, request);
@@ -511,30 +691,89 @@ async function handleRequest(
     if (!options.publicRegistration) {
       throw new HttpError(404, 'resource_not_found', 'Public registration is disabled');
     }
-    const forwardedIp = options.trustProxy
-      ? request.headers['x-forwarded-for']?.split(',')[0]?.trim()
-      : null;
-    const ip = forwardedIp || request.socket.remoteAddress || '127.0.0.1';
-    options.checkRegistrationRateLimit(ip);
+    options.checkRegistrationRateLimit(requestIp(request, options));
     const body = await readJson(request);
-    const key = assertString(request.headers['idempotency-key'], 'Idempotency-Key');
-    assertFields(body, ['displayName'], ['displayName']);
+    assertFields(
+      body,
+      ['username', 'displayName', 'password', 'passwordConfirmation', 'bindingCode'],
+      ['username', 'displayName', 'password', 'passwordConfirmation', 'bindingCode'],
+    );
+    const { username, usernameKey } = normalizedUsername(body.username);
     const displayName = assertString(body.displayName, 'displayName', 1, 80).trim();
     if (displayName.length === 0) {
       throw new HttpError(400, 'invalid_request', 'displayName must not be blank');
     }
-    write(201, await store.createUserRegistration({
+    const password = assertString(body.password, 'password', 6, 128);
+    if (body.passwordConfirmation !== password) {
+      throw new HttpError(400, 'invalid_request', 'passwordConfirmation does not match password');
+    }
+    const bindingCode = assertString(body.bindingCode, 'bindingCode', 8, 9);
+    const digest = await createPasswordDigest(password);
+    const result = await store.registerWebAccount({
+      username,
+      usernameKey,
       displayName,
-      key,
-      requestFingerprint: fingerprint(request.method, path, body),
-    }));
+      passwordSalt: digest.salt,
+      passwordHash: digest.hash,
+      bindingCode,
+    });
+    response.setHeader('set-cookie', webSessionCookie(result.token, options.secureCookies));
+    write(201, result.user);
+    return;
+  }
+
+  if (request.method === 'POST' && path === '/v1/auth/login') {
+    const body = await readJson(request);
+    assertFields(body, ['username', 'password'], ['username', 'password']);
+    const { usernameKey } = normalizedUsername(body.username);
+    const password = assertString(body.password, 'password', 6, 128);
+    const credentials = await store.getWebLoginCredentials({ usernameKey });
+    if (!await verifyPasswordDigest(password, credentials.passwordSalt, credentials.passwordHash)) {
+      throw new HttpError(401, 'invalid_credentials', 'Username or password is incorrect');
+    }
+    const result = await store.createWebSession({ userId: credentials.userId, label: 'Web browser' });
+    response.setHeader('set-cookie', webSessionCookie(result.token, options.secureCookies));
+    write(200, result.user);
+    return;
+  }
+
+  if (request.method === 'POST' && path === '/v1/auth/reset-password') {
+    const body = await readJson(request);
+    assertFields(
+      body,
+      ['username', 'newPassword', 'passwordConfirmation', 'resetCode'],
+      ['username', 'newPassword', 'passwordConfirmation', 'resetCode'],
+    );
+    const { usernameKey } = normalizedUsername(body.username);
+    const password = assertString(body.newPassword, 'newPassword', 6, 128);
+    if (body.passwordConfirmation !== password) {
+      throw new HttpError(400, 'invalid_request', 'passwordConfirmation does not match newPassword');
+    }
+    const digest = await createPasswordDigest(password);
+    await store.resetWebPassword({
+      usernameKey,
+      resetCode: assertString(body.resetCode, 'resetCode', 8, 9),
+      passwordSalt: digest.salt,
+      passwordHash: digest.hash,
+    });
+    response.setHeader('set-cookie', clearedWebSessionCookie(options.secureCookies));
+    write(204);
     return;
   }
 
   if (path === '/mcp') {
     assertMcpOrigin(request, options.mcpAllowedOrigins);
-    const user = await authUser(store, request);
-    if (request.method === 'POST') options.checkMcpRateLimit(user.userId);
+    if (!request.headers.authorization && url.searchParams.has('token')) {
+      request.headers.authorization = `Bearer ${url.searchParams.get('token')}`;
+    }
+    let user = null;
+    if (request.headers.authorization) {
+      user = await store.authenticate(bearerToken(request));
+      if (request.method === 'POST') options.checkMcpRateLimit(user.userId);
+    } else if (!options.publicRegistration) {
+      throw new HttpError(401, 'authentication_required', 'Bearer session required');
+    }
+    const baseUrl = mcpBaseUrl(request, options);
     await handleMcpRequest(
       store,
       user,
@@ -544,17 +783,205 @@ async function handleRequest(
       options.corsAllowOrigin,
       options.logger,
       wakeOutbox,
+      {
+        mcpBaseUrl: baseUrl,
+        registerIdentity: async (args) => {
+          options.checkRegistrationRateLimit(requestIp(request, options));
+          return store.createMcpRegistration({
+            displayName: args.displayName.trim(),
+            deviceLabel: args.deviceLabel,
+            key: args.clientRequestId,
+            requestFingerprint: fingerprint('MCP', '/mcp/group_register', args),
+          });
+        },
+      },
     );
     return;
   }
 
   if (!path.startsWith('/v1/')) {
+    if (await serveFrontend(
+      request,
+      response,
+      path,
+      requestId,
+      options.corsAllowOrigin,
+      options.frontendDist,
+    )) return;
     throw new HttpError(404, 'resource_not_found', 'Route not found');
   }
   const user = await authUser(store, request);
+  if (!request.headers.authorization && !isAllowedWebMutation(request.method, path)) {
+    throw new HttpError(
+      403,
+      'web_read_only',
+      'Web sessions cannot change room state; use an MCP device token',
+    );
+  }
+
+  if (request.method === 'POST' && path === '/v1/auth/logout') {
+    await store.revokeDevice({ userId: user.userId, deviceId: user.deviceId });
+    response.setHeader('set-cookie', clearedWebSessionCookie(options.secureCookies));
+    write(204);
+    return;
+  }
+
+  if (request.method === 'POST' && path === '/v1/auth/change-password') {
+    const body = await readJson(request);
+    assertFields(
+      body,
+      ['currentPassword', 'newPassword', 'passwordConfirmation'],
+      ['currentPassword', 'newPassword', 'passwordConfirmation'],
+    );
+    const currentPassword = assertString(body.currentPassword, 'currentPassword', 6, 128);
+    const newPassword = assertString(body.newPassword, 'newPassword', 6, 128);
+    if (body.passwordConfirmation !== newPassword) {
+      throw new HttpError(400, 'invalid_request', 'passwordConfirmation does not match newPassword');
+    }
+    const credentials = await store.getWebLoginCredentialsByUserId({ userId: user.userId });
+    if (!await verifyPasswordDigest(
+      currentPassword,
+      credentials.passwordSalt,
+      credentials.passwordHash,
+    )) {
+      throw new HttpError(401, 'invalid_credentials', 'Current password is incorrect');
+    }
+    const digest = await createPasswordDigest(newPassword);
+    await store.changeWebPassword({
+      userId: user.userId,
+      currentDeviceId: user.deviceId,
+      passwordSalt: digest.salt,
+      passwordHash: digest.hash,
+    });
+    write(204);
+    return;
+  }
+
+  if (request.method === 'POST' && path === '/v1/auth/upgrade') {
+    const body = await readJson(request);
+    assertFields(
+      body,
+      ['username', 'password', 'passwordConfirmation'],
+      ['username', 'password', 'passwordConfirmation'],
+    );
+    const { username, usernameKey } = normalizedUsername(body.username);
+    const password = assertString(body.password, 'password', 6, 128);
+    if (body.passwordConfirmation !== password) {
+      throw new HttpError(400, 'invalid_request', 'passwordConfirmation does not match password');
+    }
+    const digest = await createPasswordDigest(password);
+    const result = await store.upgradeWebAccount({
+      userId: user.userId,
+      username,
+      usernameKey,
+      passwordSalt: digest.salt,
+      passwordHash: digest.hash,
+    });
+    response.setHeader('set-cookie', webSessionCookie(result.token, options.secureCookies));
+    write(200, result.user);
+    return;
+  }
 
   if (request.method === 'GET' && path === '/v1/me') {
     write(200, await store.getMe({ userId: user.userId }));
+    return;
+  }
+
+  if (request.method === 'PATCH' && path === '/v1/me') {
+    const body = await readJson(request);
+    const key = assertString(request.headers['operation-id'], 'Operation-Id');
+    assertFields(
+      body,
+      ['expectedProfileRevision', 'displayName', 'avatarResourceId'],
+      ['expectedProfileRevision'],
+    );
+    if (Object.keys(body).length < 2) {
+      throw new HttpError(400, 'invalid_request', 'At least one profile field is required');
+    }
+    let displayName;
+    if (Object.hasOwn(body, 'displayName')) {
+      displayName = assertString(body.displayName, 'displayName', 1, 80).trim();
+      if (displayName.length === 0) {
+        throw new HttpError(400, 'invalid_request', 'displayName must not be blank');
+      }
+    }
+    const avatarResourceId = Object.hasOwn(body, 'avatarResourceId')
+      ? assertNullableString(body.avatarResourceId, 'avatarResourceId')
+      : undefined;
+    const result = await store.updateMyProfile({
+      userId: user.userId,
+      expectedProfileRevision: assertInteger(
+        body.expectedProfileRevision,
+        'expectedProfileRevision',
+        1,
+        Number.MAX_SAFE_INTEGER,
+      ),
+      displayName,
+      avatarResourceId,
+      key,
+      requestFingerprint: fingerprint(request.method, path, body),
+    });
+    write(result.status, result.body);
+    return;
+  }
+
+  if (request.method === 'POST' && path === '/v1/profile-resources') {
+    const avatar = await readAvatar(request);
+    write(201, await store.createProfileResource({
+      userId: user.userId,
+      mimeType: avatar.mimeType,
+      content: avatar.content,
+    }));
+    return;
+  }
+
+  const profileResourceMatch = path.match(/^\/v1\/profile-resources\/([^/]+)$/);
+  if (request.method === 'GET' && profileResourceMatch) {
+    const resource = await store.getProfileResource({
+      resourceId: parsePathSegment(profileResourceMatch[1]),
+    });
+    response.statusCode = 200;
+    response.setHeader('content-type', resource.mimeType);
+    response.setHeader('content-length', String(resource.byteSize));
+    applyCommonHeaders(response, requestId, options.corsAllowOrigin);
+    response.end(resource.content);
+    return;
+  }
+
+  if (request.method === 'GET' && path === '/v1/me/devices') {
+    write(200, { items: await store.listDevices({ userId: user.userId }) });
+    return;
+  }
+
+  if (request.method === 'POST' && path === '/v1/me/devices') {
+    const body = await readJson(request);
+    assertFields(body, ['label'], ['label']);
+    const result = await store.createMcpDeviceSession({
+      userId: user.userId,
+      label: assertString(body.label, 'label', 1, 80),
+    });
+    const urlWithToken = new URL(mcpBaseUrl(request, options));
+    urlWithToken.searchParams.set('token', result.token);
+    write(201, {
+      ...result,
+      mcpUrl: urlWithToken.toString(),
+      authorizationHeader: `Bearer ${result.token}`,
+    });
+    return;
+  }
+
+  const deviceMatch = path.match(/^\/v1\/me\/devices\/([^/]+)$/);
+  if (request.method === 'DELETE' && deviceMatch) {
+    await store.revokeDevice({
+      userId: user.userId,
+      deviceId: parsePathSegment(deviceMatch[1]),
+    });
+    write(204);
+    return;
+  }
+
+  if (request.method === 'GET' && path === '/v1/agent-profiles') {
+    write(200, { items: await store.listAgentProfiles({ userId: user.userId }) });
     return;
   }
 
@@ -1176,17 +1603,51 @@ async function handleRequest(
     return;
   }
 
+  const webReadMatch = path.match(/^\/v1\/rooms\/([^/]+)\/read$/);
+  if (request.method === 'PUT' && webReadMatch) {
+    const body = await readJson(request);
+    assertFields(body, ['readSeq'], ['readSeq']);
+    write(200, await store.updateWebRoomRead({
+      userId: user.userId,
+      roomId: parsePathSegment(webReadMatch[1]),
+      readSeq: assertInteger(body.readSeq, 'readSeq', 0, Number.MAX_SAFE_INTEGER),
+    }));
+    return;
+  }
+
   const messagesMatch = path.match(/^\/v1\/rooms\/([^/]+)\/messages$/);
   if (messagesMatch) {
     const roomId = parsePathSegment(messagesMatch[1]);
     if (request.method === 'GET') {
       const afterSeqValue = url.searchParams.get('afterSeq');
+      const beforeSeqValue = url.searchParams.get('beforeSeq');
+      if (afterSeqValue !== null && beforeSeqValue !== null) {
+        throw new HttpError(400, 'invalid_request', 'afterSeq and beforeSeq cannot be combined');
+      }
       const limitValue = url.searchParams.get('limit');
-      const afterSeq = afterSeqValue === null ? 0 : Number(afterSeqValue);
-      const limit = limitValue === null ? 50 : Number(limitValue);
-      assertInteger(afterSeq, 'afterSeq', 0, Number.MAX_SAFE_INTEGER);
+      const limit = limitValue === null ? (afterSeqValue === null ? 100 : 50) : Number(limitValue);
       assertInteger(limit, 'limit', 1, 200);
-      write(200, await store.listMessages({ userId: user.userId, roomId, afterSeq, limit }));
+      if (afterSeqValue !== null) {
+        const afterSeq = Number(afterSeqValue);
+        assertInteger(afterSeq, 'afterSeq', 0, Number.MAX_SAFE_INTEGER);
+        write(200, await store.listMessages({
+          userId: user.userId,
+          roomId,
+          afterSeq,
+          limit,
+        }));
+      } else {
+        const beforeSeq = beforeSeqValue === null ? null : Number(beforeSeqValue);
+        if (beforeSeq !== null) {
+          assertInteger(beforeSeq, 'beforeSeq', 1, Number.MAX_SAFE_INTEGER);
+        }
+        write(200, await store.listWebMessages({
+          userId: user.userId,
+          roomId,
+          beforeSeq,
+          limit,
+        }));
+      }
       return;
     }
     if (request.method === 'POST') {
@@ -1261,6 +1722,8 @@ export function createLocalServer({
   mcpAllowedOrigins = parseMcpAllowedOrigins(process.env.MCP_ALLOWED_ORIGINS),
   mcpRateLimitPerMinute = Number(process.env.MCP_RATE_LIMIT_PER_MINUTE ?? 300),
   outboxPollIntervalMs = 250,
+  secureCookies = process.env.NODE_ENV === 'production',
+  frontendDist = FRONTEND_DIST,
 } = {}) {
   if (!Number.isInteger(mcpRateLimitPerMinute) || mcpRateLimitPerMinute < 1) {
     throw new Error('MCP_RATE_LIMIT_PER_MINUTE must be a positive integer');
@@ -1288,6 +1751,8 @@ export function createLocalServer({
         checkRegistrationRateLimit,
         logger,
         mcpAllowedOrigins: effectiveMcpAllowedOrigins,
+        secureCookies,
+        frontendDist,
       },
       requestId,
       wakeOutbox,

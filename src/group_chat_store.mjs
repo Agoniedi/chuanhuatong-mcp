@@ -9,6 +9,9 @@ const AGENT_RUNTIME_LEASE_DURATION_MS = 60 * 1000;
 const AGENT_MESSAGES_PER_CYCLE_LIMIT = 1;
 const ABSOLUTE_CONSECUTIVE_AI_LIMIT = 20;
 const PUBLIC_REGISTRATION_PRINCIPAL_ID = 'public-registration';
+const ONE_TIME_CODE_ALPHABET = '23456789ABCDEFGHJKLMNPQRSTUVWXYZ';
+const WEB_BINDING_CODE_TTL_MS = 24 * 60 * 60 * 1000;
+const WEB_RESET_CODE_TTL_MS = 30 * 60 * 1000;
 const REGENERATABLE_GENERATION_STATUSES = new Set([
   'discarded',
   'failed',
@@ -22,6 +25,17 @@ function newId(prefix) {
 
 function hash(value) {
   return createHash('sha256').update(value).digest('hex');
+}
+
+function newOneTimeCode() {
+  const bytes = randomBytes(8);
+  let value = '';
+  for (const byte of bytes) value += ONE_TIME_CODE_ALPHABET[byte % ONE_TIME_CODE_ALPHABET.length];
+  return `${value.slice(0, 4)}-${value.slice(4)}`;
+}
+
+function normalizeOneTimeCode(value) {
+  return value.replaceAll('-', '').toUpperCase();
 }
 
 function handoffMessageId(key) {
@@ -349,16 +363,6 @@ function idempotencyConflict() {
   );
 }
 
-function requireOwnedAvatar(avatarResourceId) {
-  if (avatarResourceId !== null) {
-    throw new HttpError(
-      403,
-      'forbidden',
-      'Avatar resource ownership cannot be verified',
-    );
-  }
-}
-
 function requireMembership(room, userId) {
   const membership = room.members.get(userId);
   if (!membership) throw new HttpError(403, 'forbidden', 'Room membership required');
@@ -410,9 +414,16 @@ export class MemoryGroupChatStore {
     this.clock = clock;
     this.usersByDeviceId = new Map();
     this.userDevices = new Set();
+    this.deviceMetadata = new Map();
     this.userIdByNicknameKey = new Map();
     this.usersById = new Map();
     this.sessions = new Map();
+    this.webAccountsByUserId = new Map();
+    this.userIdByUsernameKey = new Map();
+    this.webBindingCodes = new Map();
+    this.webPasswordResetCodes = new Map();
+    this.profileResources = new Map();
+    this.webRoomReads = new Map();
     this.rooms = new Map();
     this.invites = new Map();
     this.messagesByRoom = new Map();
@@ -484,6 +495,52 @@ export class MemoryGroupChatStore {
     return request;
   }
 
+  _rememberDevice(userId, deviceId, kind, label) {
+    this.userDevices.add(`${userId}:${deviceId}`);
+    this.deviceMetadata.set(`${userId}:${deviceId}`, { userId, deviceId, kind, label });
+  }
+
+  _createSession(user, { deviceId, kind, label, prefix }) {
+    this._rememberDevice(user.id, deviceId, kind, label);
+    const token = `${prefix}_${randomBytes(24).toString('base64url')}`;
+    this.sessions.set(hash(token), { userId: user.id, deviceId });
+    return token;
+  }
+
+  _enqueueProfileUpdated(profileType, ownerUserId, profile) {
+    this.outbox.push({
+      id: String(this.nextOutboxId++),
+      eventId: newId('evt'),
+      type: 'profile.updated',
+      payload: { profileType, ownerUserId, profile: clone(profile) },
+      occurredAt: this.clock().toISOString(),
+      dispatchedAt: null,
+    });
+  }
+
+  _issueWebBindingCode(userId) {
+    for (const [codeHash, entry] of this.webBindingCodes) {
+      if (entry.userId === userId) this.webBindingCodes.delete(codeHash);
+    }
+    const code = newOneTimeCode();
+    const expiresAt = new Date(this.clock().getTime() + WEB_BINDING_CODE_TTL_MS).toISOString();
+    this.webBindingCodes.set(hash(normalizeOneTimeCode(code)), { userId, expiresAt });
+    return { bindingCode: code, expiresAt };
+  }
+
+  _issueWebPasswordResetCode(userId) {
+    if (!this.webAccountsByUserId.has(userId)) {
+      throw new HttpError(409, 'web_account_required', 'Web account is not configured');
+    }
+    for (const [codeHash, entry] of this.webPasswordResetCodes) {
+      if (entry.userId === userId) this.webPasswordResetCodes.delete(codeHash);
+    }
+    const code = newOneTimeCode();
+    const expiresAt = new Date(this.clock().getTime() + WEB_RESET_CODE_TTL_MS).toISOString();
+    this.webPasswordResetCodes.set(hash(normalizeOneTimeCode(code)), { userId, expiresAt });
+    return { resetCode: code, expiresAt };
+  }
+
   _requireReadyRuntime(binding, user) {
     const runtime = this.agentRuntimes.get(this._runtimeKey(binding.id, user.deviceId));
     if (
@@ -523,10 +580,6 @@ export class MemoryGroupChatStore {
   async createGuestSession({ deviceId, displayName }) {
     const nicknameKey = displayName.normalize('NFKC').toLowerCase();
     const existing = this.usersByDeviceId.get(deviceId);
-    const nicknameOwnerId = this.userIdByNicknameKey.get(nicknameKey);
-    if (nicknameOwnerId && nicknameOwnerId !== existing?.id) {
-      throw new HttpError(409, 'conflict', 'Nickname is already in use');
-    }
     let user = existing;
     if (user) {
       if (user.displayName !== displayName) {
@@ -548,7 +601,7 @@ export class MemoryGroupChatStore {
       this.usersByDeviceId.set(deviceId, user);
       this.usersById.set(user.id, user);
     }
-    this.userDevices.add(`${user.id}:${deviceId}`);
+    this._rememberDevice(user.id, deviceId, 'legacy', 'Development session');
     this.userIdByNicknameKey.set(nicknameKey, user.id);
     const accessToken = `dev_${randomBytes(24).toString('base64url')}`;
     this.sessions.set(hash(accessToken), { userId: user.id, deviceId });
@@ -570,10 +623,6 @@ export class MemoryGroupChatStore {
     }
     const deviceId = `web_${randomBytes(12).toString('base64url')}`;
     const nicknameKey = displayName.normalize('NFKC').toLowerCase();
-    const nicknameOwnerId = this.userIdByNicknameKey.get(nicknameKey);
-    if (nicknameOwnerId) {
-      throw new HttpError(409, 'conflict', 'Nickname is already in use');
-    }
     const user = {
       id: newId('usr'),
       deviceId,
@@ -585,7 +634,7 @@ export class MemoryGroupChatStore {
     };
     this.usersByDeviceId.set(deviceId, user);
     this.usersById.set(user.id, user);
-    this.userDevices.add(`${user.id}:${deviceId}`);
+    this._rememberDevice(user.id, deviceId, 'web', 'Legacy web session');
     this.userIdByNicknameKey.set(nicknameKey, user.id);
     const accessToken = `ct_${randomBytes(24).toString('base64url')}`;
     this.sessions.set(hash(accessToken), { userId: user.id, deviceId });
@@ -596,6 +645,239 @@ export class MemoryGroupChatStore {
     };
     this._saveReplay(replay.recordKey, requestFingerprint, 201, body);
     return { token: accessToken, ...body };
+  }
+
+  async createMcpRegistration({ displayName, deviceLabel, key, requestFingerprint }) {
+    const replay = this._replay(
+      PUBLIC_REGISTRATION_PRINCIPAL_ID,
+      'createMcpRegistration',
+      key,
+      requestFingerprint,
+    );
+    let user;
+    if (replay.response) {
+      user = this.usersById.get(replay.response.body.userId);
+    } else {
+      const deviceId = `mcp_${randomBytes(12).toString('base64url')}`;
+      const nicknameKey = displayName.normalize('NFKC').toLowerCase();
+      user = {
+        id: newId('usr'),
+        deviceId,
+        handle: `guest_${hash(deviceId).slice(0, 12)}`,
+        displayName,
+        nicknameKey,
+        avatarResourceId: null,
+        profileRevision: 1,
+      };
+      this.usersByDeviceId.set(deviceId, user);
+      this.usersById.set(user.id, user);
+      this._saveReplay(replay.recordKey, requestFingerprint, 201, {
+        userId: user.id,
+        displayName: user.displayName,
+        handle: user.handle,
+      });
+    }
+    const deviceId = replay.response
+      ? `mcp_${randomBytes(12).toString('base64url')}`
+      : user.deviceId;
+    const token = this._createSession(user, {
+      deviceId,
+      kind: 'mcp',
+      label: deviceLabel,
+      prefix: 'ct',
+    });
+    return {
+      token,
+      ...publicUser(user),
+      ...this._issueWebBindingCode(user.id),
+    };
+  }
+
+  async issueWebBindingCode({ userId }) {
+    if (!this.usersById.has(userId)) {
+      throw new HttpError(404, 'resource_not_found', 'User not found');
+    }
+    return this._issueWebBindingCode(userId);
+  }
+
+  async registerWebAccount({ username, usernameKey, displayName, passwordSalt, passwordHash, bindingCode }) {
+    if (this.userIdByUsernameKey.has(usernameKey)) {
+      throw new HttpError(409, 'username_conflict', 'Username is already in use');
+    }
+    const codeHash = hash(normalizeOneTimeCode(bindingCode));
+    const code = this.webBindingCodes.get(codeHash);
+    if (!code || Date.parse(code.expiresAt) <= this.clock().getTime()) {
+      throw new HttpError(400, 'invalid_binding_code', 'Binding code is invalid or expired');
+    }
+    if (this.webAccountsByUserId.has(code.userId)) {
+      throw new HttpError(409, 'web_account_exists', 'Web account is already configured');
+    }
+    const user = this.usersById.get(code.userId);
+    user.handle = username;
+    user.displayName = displayName;
+    user.nicknameKey = displayName.normalize('NFKC').toLowerCase();
+    user.profileRevision += 1;
+    const now = this.clock().toISOString();
+    this.webAccountsByUserId.set(user.id, {
+      userId: user.id,
+      username,
+      usernameKey,
+      passwordSalt,
+      passwordHash,
+      createdAt: now,
+      updatedAt: now,
+    });
+    this.userIdByUsernameKey.set(usernameKey, user.id);
+    this.webBindingCodes.delete(codeHash);
+    return this.createWebSession({ userId: user.id, label: 'Web browser' });
+  }
+
+  async upgradeWebAccount({ userId, username, usernameKey, passwordSalt, passwordHash }) {
+    if (this.webAccountsByUserId.has(userId)) {
+      throw new HttpError(409, 'web_account_exists', 'Web account is already configured');
+    }
+    if (this.userIdByUsernameKey.has(usernameKey)) {
+      throw new HttpError(409, 'username_conflict', 'Username is already in use');
+    }
+    const user = this.usersById.get(userId);
+    const now = this.clock().toISOString();
+    user.handle = username;
+    user.profileRevision += 1;
+    this.webAccountsByUserId.set(userId, {
+      userId,
+      username,
+      usernameKey,
+      passwordSalt,
+      passwordHash,
+      createdAt: now,
+      updatedAt: now,
+    });
+    this.userIdByUsernameKey.set(usernameKey, userId);
+    return this.createWebSession({ userId, label: 'Web browser' });
+  }
+
+  async getWebLoginCredentials({ usernameKey }) {
+    const userId = this.userIdByUsernameKey.get(usernameKey);
+    const account = userId ? this.webAccountsByUserId.get(userId) : null;
+    if (!account) throw new HttpError(401, 'invalid_credentials', 'Username or password is incorrect');
+    return clone(account);
+  }
+
+  async getWebLoginCredentialsByUserId({ userId }) {
+    const account = this.webAccountsByUserId.get(userId);
+    if (!account) {
+      throw new HttpError(409, 'web_account_required', 'Web account is not configured');
+    }
+    return clone(account);
+  }
+
+  async changeWebPassword({ userId, currentDeviceId, passwordSalt, passwordHash }) {
+    const account = this.webAccountsByUserId.get(userId);
+    if (!account) {
+      throw new HttpError(409, 'web_account_required', 'Web account is not configured');
+    }
+    account.passwordSalt = passwordSalt;
+    account.passwordHash = passwordHash;
+    account.updatedAt = this.clock().toISOString();
+    for (const [tokenHash, session] of this.sessions) {
+      const device = this.deviceMetadata.get(`${userId}:${session.deviceId}`);
+      if (
+        session.userId === userId &&
+        device?.kind === 'web' &&
+        session.deviceId !== currentDeviceId
+      ) {
+        this.sessions.delete(tokenHash);
+      }
+    }
+  }
+
+  async createWebSession({ userId, label }) {
+    const user = this.usersById.get(userId);
+    const deviceId = `web_${randomBytes(12).toString('base64url')}`;
+    const token = this._createSession(user, { deviceId, kind: 'web', label, prefix: 'web' });
+    return { token, user: publicUser(user) };
+  }
+
+  async createMcpDeviceSession({ userId, label }) {
+    const user = this.usersById.get(userId);
+    const deviceId = `mcp_${randomBytes(12).toString('base64url')}`;
+    const token = this._createSession(user, { deviceId, kind: 'mcp', label, prefix: 'ct' });
+    return { token, deviceId, label };
+  }
+
+  async listDevices({ userId }) {
+    const activeDeviceIds = new Set(
+      [...this.sessions.values()]
+        .filter((session) => session.userId === userId)
+        .map((session) => session.deviceId),
+    );
+    return [...this.deviceMetadata.values()]
+      .filter((device) => device.userId === userId)
+      .map((device) => ({ ...device, active: activeDeviceIds.has(device.deviceId) }));
+  }
+
+  async revokeDevice({ userId, deviceId }) {
+    for (const [tokenHash, session] of this.sessions) {
+      if (session.userId === userId && session.deviceId === deviceId) {
+        this.sessions.delete(tokenHash);
+      }
+    }
+  }
+
+  async issueWebPasswordResetCode({ userId }) {
+    return this._issueWebPasswordResetCode(userId);
+  }
+
+  async resetWebPassword({ usernameKey, resetCode, passwordSalt, passwordHash }) {
+    const userId = this.userIdByUsernameKey.get(usernameKey);
+    const account = userId ? this.webAccountsByUserId.get(userId) : null;
+    const codeHash = hash(normalizeOneTimeCode(resetCode));
+    const code = this.webPasswordResetCodes.get(codeHash);
+    if (!account || !code || code.userId !== userId || Date.parse(code.expiresAt) <= this.clock().getTime()) {
+      throw new HttpError(400, 'invalid_reset_code', 'Reset code is invalid or expired');
+    }
+    account.passwordSalt = passwordSalt;
+    account.passwordHash = passwordHash;
+    account.updatedAt = this.clock().toISOString();
+    this.webPasswordResetCodes.delete(codeHash);
+    for (const [tokenHash, session] of this.sessions) {
+      const device = this.deviceMetadata.get(`${userId}:${session.deviceId}`);
+      if (session.userId === userId && device?.kind === 'web') this.sessions.delete(tokenHash);
+    }
+  }
+
+  _requireOwnedAvatar(userId, avatarResourceId) {
+    if (avatarResourceId === null) return;
+    const resource = this.profileResources.get(avatarResourceId);
+    if (!resource || resource.ownerUserId !== userId) {
+      throw new HttpError(403, 'forbidden', 'Avatar resource owner required');
+    }
+  }
+
+  async createProfileResource({ userId, mimeType, content }) {
+    const resource = {
+      id: newId('resource'),
+      ownerUserId: userId,
+      mimeType,
+      content: Buffer.from(content),
+      byteSize: content.length,
+      createdAt: this.clock().toISOString(),
+    };
+    this.profileResources.set(resource.id, resource);
+    return {
+      id: resource.id,
+      mimeType: resource.mimeType,
+      byteSize: resource.byteSize,
+      createdAt: resource.createdAt,
+    };
+  }
+
+  async getProfileResource({ resourceId }) {
+    const resource = this.profileResources.get(resourceId);
+    if (!resource) {
+      throw new HttpError(404, 'resource_not_found', 'Profile resource not found');
+    }
+    return { ...resource, content: Buffer.from(resource.content) };
   }
 
   async getMe({ userId }) {
@@ -621,6 +903,7 @@ export class MemoryGroupChatStore {
     userId,
     expectedProfileRevision,
     displayName,
+    avatarResourceId,
     key,
     requestFingerprint,
   }) {
@@ -630,25 +913,51 @@ export class MemoryGroupChatStore {
     if (expectedProfileRevision !== user.profileRevision) {
       throw new HttpError(409, 'request_version_conflict', 'Profile revision does not match');
     }
-    const nicknameKey = displayName.normalize('NFKC').toLowerCase();
-    const nicknameOwnerId = this.userIdByNicknameKey.get(nicknameKey);
-    if (nicknameOwnerId && nicknameOwnerId !== userId) {
-      throw new HttpError(409, 'conflict', 'Nickname is already in use');
+    if (avatarResourceId !== undefined) {
+      this._requireOwnedAvatar(userId, avatarResourceId);
     }
-    this.userIdByNicknameKey.delete(user.nicknameKey);
-    user.displayName = displayName;
-    user.nicknameKey = nicknameKey;
+    if (displayName !== undefined) {
+      const nicknameKey = displayName.normalize('NFKC').toLowerCase();
+      this.userIdByNicknameKey.delete(user.nicknameKey);
+      user.displayName = displayName;
+      user.nicknameKey = nicknameKey;
+      this.userIdByNicknameKey.set(nicknameKey, userId);
+    }
+    if (avatarResourceId !== undefined) user.avatarResourceId = avatarResourceId;
     user.profileRevision += 1;
-    this.userIdByNicknameKey.set(nicknameKey, userId);
     const body = publicUser(user);
     this._saveReplay(replay.recordKey, requestFingerprint, 200, body);
+    this._enqueueProfileUpdated('human', userId, body);
     return { status: 200, body };
   }
 
   async listRooms(userId) {
     return [...this.rooms.values()]
       .filter((room) => room.members.has(userId))
-      .map(roomSnapshot);
+      .map((room) => {
+        const membership = room.members.get(userId);
+        const defaultReadSeq = Math.max(0, membership.joinedSeq - 1);
+        const webReadSeq = this.webRoomReads.get(`${userId}:${room.id}`) ?? defaultReadSeq;
+        return {
+          ...roomSnapshot(room),
+          webReadSeq,
+          unreadCount: Math.max(0, room.lastSeq - webReadSeq),
+        };
+      });
+  }
+
+  async updateWebRoomRead({ userId, roomId, readSeq }) {
+    const room = this._room(roomId);
+    const membership = requireMembership(room, userId);
+    const minimum = Math.max(0, membership.joinedSeq - 1);
+    if (readSeq < minimum || readSeq > room.lastSeq) {
+      throw new HttpError(400, 'invalid_request', 'readSeq is outside visible room history');
+    }
+    const key = `${userId}:${roomId}`;
+    const current = this.webRoomReads.get(key) ?? minimum;
+    const webReadSeq = Math.max(current, readSeq);
+    this.webRoomReads.set(key, webReadSeq);
+    return { roomId, webReadSeq };
   }
 
   async listRoomsPage({ userId, afterRoomId, limit }) {
@@ -673,7 +982,7 @@ export class MemoryGroupChatStore {
     key,
     requestFingerprint,
   }) {
-    requireOwnedAvatar(avatarResourceId);
+    this._requireOwnedAvatar(userId, avatarResourceId);
     const replay = this._replay(userId, 'createAgentProfile', key, requestFingerprint);
     if (replay.response) return replay.response;
     const createdAt = this.clock().toISOString();
@@ -691,6 +1000,13 @@ export class MemoryGroupChatStore {
     const body = agentProfileSnapshot(profile);
     this._saveReplay(replay.recordKey, requestFingerprint, 201, body);
     return { status: 201, body };
+  }
+
+  async listAgentProfiles({ userId }) {
+    return [...this.agentProfiles.values()]
+      .filter((profile) => profile.ownerUserId === userId)
+      .sort((left, right) => left.createdAt.localeCompare(right.createdAt))
+      .map(agentProfileSnapshot);
   }
 
   async getAgentProfile({ agentProfileId }) {
@@ -715,7 +1031,7 @@ export class MemoryGroupChatStore {
       throw new HttpError(409, 'request_version_conflict', 'Profile revision does not match');
     }
     if (Object.hasOwn(changes, 'avatarResourceId')) {
-      requireOwnedAvatar(changes.avatarResourceId);
+      this._requireOwnedAvatar(userId, changes.avatarResourceId);
     }
     if (Object.hasOwn(changes, 'displayName')) profile.displayName = changes.displayName;
     if (Object.hasOwn(changes, 'avatarResourceId')) {
@@ -726,6 +1042,7 @@ export class MemoryGroupChatStore {
     profile.updatedAt = this.clock().toISOString();
     const body = agentProfileSnapshot(profile);
     this._saveReplay(replay.recordKey, requestFingerprint, 200, body);
+    this._enqueueProfileUpdated('agent', userId, body);
     return { status: 200, body };
   }
 
@@ -974,7 +1291,7 @@ export class MemoryGroupChatStore {
   }) {
     const room = this._room(roomId);
     requireMembership(room, user.userId);
-    requireOwnedAvatar(publicProfile.avatarResourceId);
+    this._requireOwnedAvatar(user.userId, publicProfile.avatarResourceId);
     const now = this.clock();
     const bindingKey = this._bindingKey(roomId, user.userId);
     let binding = this.roomAgentBindings.get(bindingKey);
@@ -1582,6 +1899,7 @@ export class MemoryGroupChatStore {
     key,
     requestFingerprint,
     automatic = false,
+    precedingHumanMessage = null,
   }) {
     const request = this._generationRequest(generationRequestId);
     if (request.ownerUserId !== user.userId) {
@@ -1636,7 +1954,14 @@ export class MemoryGroupChatStore {
     if (messages.some((message) => message.generationRequestId === request.id)) {
       throw new HttpError(409, 'generation_state_conflict', 'Generation request is already published');
     }
-    if (messages.some((message) => message.clientMessageId === clientMessageId)) {
+    if (
+      precedingHumanMessage?.clientMessageId === clientMessageId ||
+      messages.some(
+        (message) =>
+          message.clientMessageId === clientMessageId ||
+          message.clientMessageId === precedingHumanMessage?.clientMessageId,
+      )
+    ) {
       throw new HttpError(409, 'conflict', 'Client message ID is already in use');
     }
     if (
@@ -1657,14 +1982,16 @@ export class MemoryGroupChatStore {
         'Agent reply already published for this trigger batch',
       );
     }
-    requireAgentLoopCapacity({
-      messages,
-      bindings: this.roomAgentBindings,
-      roomId: request.roomId,
-      ownerUserId: user.userId,
-      triggerScope: binding.triggerScope,
-    });
-    for (const mention of mentions) {
+    if (precedingHumanMessage === null) {
+      requireAgentLoopCapacity({
+        messages,
+        bindings: this.roomAgentBindings,
+        roomId: request.roomId,
+        ownerUserId: user.userId,
+        triggerScope: binding.triggerScope,
+      });
+    }
+    for (const mention of [...(precedingHumanMessage?.mentions ?? []), ...mentions]) {
       if (mention.kind === 'user' && !room.members.has(mention.targetId)) {
         throw new HttpError(400, 'invalid_request', 'Mention target is not a room member');
       }
@@ -1679,6 +2006,17 @@ export class MemoryGroupChatStore {
         throw new HttpError(400, 'invalid_request', 'Mentioned agent is not visible in the room');
       }
     }
+    if (precedingHumanMessage?.replyToMessageId) {
+      const target = messages.find(
+        (message) => message.id === precedingHumanMessage.replyToMessageId,
+      );
+      if (!target) {
+        throw new HttpError(404, 'resource_not_found', 'Reply target not found');
+      }
+      if (target.seq < membership.joinedSeq) {
+        throw new HttpError(403, 'history_not_visible', 'Reply target is outside membership history');
+      }
+    }
     if (replyToMessageId !== null) {
       const target = messages.find((message) => message.id === replyToMessageId);
       if (!target) {
@@ -1690,10 +2028,28 @@ export class MemoryGroupChatStore {
     }
     const profile = this._agentProfile(binding.agentProfileId);
     const createdAt = this.clock().toISOString();
+    const humanMessage = precedingHumanMessage === null
+      ? null
+      : {
+          id: newId('msg'),
+          roomId: request.roomId,
+          seq: room.lastSeq + 1,
+          clientMessageId: precedingHumanMessage.clientMessageId,
+          sender: {
+            kind: 'human',
+            userId: user.userId,
+            displayNameSnapshot: user.displayName,
+            avatarResourceIdSnapshot: user.avatarResourceId,
+          },
+          content: { schemaVersion: 1, type: 'text', text: precedingHumanMessage.text },
+          mentions: clone(precedingHumanMessage.mentions),
+          replyToMessageId: precedingHumanMessage.replyToMessageId,
+          createdAt,
+        };
     const message = {
       id: newId('msg'),
       roomId: request.roomId,
-      seq: room.lastSeq + 1,
+      seq: room.lastSeq + (humanMessage === null ? 1 : 2),
       clientMessageId,
       sender: {
         kind: 'agent',
@@ -1710,6 +2066,7 @@ export class MemoryGroupChatStore {
       createdAt,
     };
     room.lastSeq = message.seq;
+    if (humanMessage !== null) messages.push(humanMessage);
     messages.push(message);
     request.status = 'published';
     request.requestVersion += 1;
@@ -1721,8 +2078,20 @@ export class MemoryGroupChatStore {
     const body = {
       generationRequest: generationRequestSnapshot(request),
       message: clone(message),
+      ...(humanMessage === null ? {} : { humanMessage: clone(humanMessage) }),
     };
     this._saveReplay(replay.recordKey, requestFingerprint, 200, body);
+    if (humanMessage !== null) {
+      this.outbox.push({
+        id: String(this.nextOutboxId++),
+        eventId: newId('evt'),
+        type: 'message.created',
+        roomId: request.roomId,
+        payload: clone(humanMessage),
+        occurredAt: createdAt,
+        dispatchedAt: null,
+      });
+    }
     this.outbox.push({
       id: String(this.nextOutboxId++),
       eventId: newId('evt'),
@@ -1856,6 +2225,25 @@ export class MemoryGroupChatStore {
       items: visible.slice(0, limit).map(clone),
       highWaterSeq: room.lastSeq,
       hasMore: visible.length > limit,
+    };
+  }
+
+  async listWebMessages({ userId, roomId, beforeSeq, limit }) {
+    const room = this._room(roomId);
+    const membership = requireMembership(room, userId);
+    const upperBound = beforeSeq ?? room.lastSeq + 1;
+    const visible = this.messagesByRoom.get(roomId)
+      .filter(
+        (message) => message.seq < upperBound && message.seq >= membership.joinedSeq,
+      )
+      .sort((left, right) => right.seq - left.seq);
+    const page = visible.slice(0, limit);
+    const items = page.reverse().map(clone);
+    return {
+      items,
+      highWaterSeq: room.lastSeq,
+      hasMore: visible.length > limit,
+      nextBeforeSeq: items.length > 0 ? items[0].seq : null,
     };
   }
 
@@ -2039,6 +2427,15 @@ export class MemoryGroupChatStore {
     return [...room.members.values()]
       .filter((membership) => membership.joinedSeq <= messageSeq)
       .map((membership) => membership.userId);
+  }
+
+  async listProfileRecipientUserIds(ownerUserId) {
+    const recipients = new Set([ownerUserId]);
+    for (const room of this.rooms.values()) {
+      if (!room.members.has(ownerUserId)) continue;
+      for (const membership of room.members.values()) recipients.add(membership.userId);
+    }
+    return [...recipients];
   }
 }
 
@@ -2351,6 +2748,97 @@ export class PostgresGroupChatStore {
     );
   }
 
+  async _createDeviceSession(client, {
+    userId,
+    deviceId,
+    kind,
+    label,
+    prefix,
+  }) {
+    const now = this.clock();
+    const resolvedDeviceId = deviceId ?? `${kind}_${randomBytes(12).toString('base64url')}`;
+    const token = `${prefix}_${randomBytes(24).toString('base64url')}`;
+    await client.query(
+      `INSERT INTO user_devices(
+         user_id, device_id, kind, label, created_at, updated_at
+       ) VALUES ($1, $2, $3, $4, $5, $5)`,
+      [userId, resolvedDeviceId, kind, label, now],
+    );
+    await client.query(
+      `INSERT INTO sessions(token_hash, user_id, device_id, created_at)
+       VALUES ($1, $2, $3, $4)`,
+      [hash(token), userId, resolvedDeviceId, now],
+    );
+    return { token, deviceId: resolvedDeviceId, label };
+  }
+
+  async _issueWebBindingCode(client, userId) {
+    const user = await client.query('SELECT 1 FROM users WHERE id = $1', [userId]);
+    if (user.rowCount === 0) {
+      throw new HttpError(404, 'resource_not_found', 'User not found');
+    }
+    const code = newOneTimeCode();
+    const now = this.clock();
+    const expiresAt = new Date(now.getTime() + WEB_BINDING_CODE_TTL_MS);
+    await client.query(
+      `INSERT INTO web_binding_codes(user_id, code_hash, expires_at, created_at)
+       VALUES ($1, $2, $3, $4)
+       ON CONFLICT (user_id) DO UPDATE
+       SET code_hash = EXCLUDED.code_hash,
+           expires_at = EXCLUDED.expires_at,
+           created_at = EXCLUDED.created_at`,
+      [userId, hash(normalizeOneTimeCode(code)), expiresAt, now],
+    );
+    return { bindingCode: code, expiresAt: expiresAt.toISOString() };
+  }
+
+  async _issueWebPasswordResetCode(client, userId) {
+    const account = await client.query(
+      'SELECT 1 FROM web_accounts WHERE user_id = $1',
+      [userId],
+    );
+    if (account.rowCount === 0) {
+      throw new HttpError(409, 'web_account_required', 'Web account is not configured');
+    }
+    const code = newOneTimeCode();
+    const now = this.clock();
+    const expiresAt = new Date(now.getTime() + WEB_RESET_CODE_TTL_MS);
+    await client.query(
+      `INSERT INTO web_password_reset_codes(user_id, code_hash, expires_at, created_at)
+       VALUES ($1, $2, $3, $4)
+       ON CONFLICT (user_id) DO UPDATE
+       SET code_hash = EXCLUDED.code_hash,
+           expires_at = EXCLUDED.expires_at,
+           created_at = EXCLUDED.created_at`,
+      [userId, hash(normalizeOneTimeCode(code)), expiresAt, now],
+    );
+    return { resetCode: code, expiresAt: expiresAt.toISOString() };
+  }
+
+  async _requireOwnedAvatar(client, userId, avatarResourceId) {
+    if (avatarResourceId === null) return;
+    const result = await client.query(
+      'SELECT 1 FROM profile_resources WHERE id = $1 AND owner_user_id = $2',
+      [avatarResourceId, userId],
+    );
+    if (result.rowCount === 0) {
+      throw new HttpError(403, 'forbidden', 'Avatar resource owner required');
+    }
+  }
+
+  async _enqueueProfileUpdated(client, profileType, ownerUserId, profile) {
+    await client.query(
+      `INSERT INTO outbox_events(
+         event_id, event_type, room_id, payload, occurred_at, dispatched_at
+       ) VALUES ($1, 'profile.updated', NULL, $2, $3, NULL)`,
+      [
+        newId('evt'),
+        { profileType, ownerUserId, profile },
+        this.clock(),
+      ],
+    );
+  }
+
   async _room(client, roomId, { lock = false } = {}) {
     const result = await client.query(
       `SELECT * FROM rooms WHERE id = $1${lock ? ' FOR UPDATE' : ''}`,
@@ -2584,6 +3072,400 @@ export class PostgresGroupChatStore {
     }
   }
 
+  async createMcpRegistration({ displayName, deviceLabel, key, requestFingerprint }) {
+    return this._transaction(async (client) => {
+      const replay = await this._replay(
+        client,
+        PUBLIC_REGISTRATION_PRINCIPAL_ID,
+        'createMcpRegistration',
+        key,
+        requestFingerprint,
+      );
+      let body;
+      let deviceId;
+      if (replay) {
+        body = replay.body;
+      } else {
+        const now = this.clock();
+        deviceId = `mcp_${randomBytes(12).toString('base64url')}`;
+        const id = newId('usr');
+        const inserted = await client.query(
+          `INSERT INTO users(
+             id, device_id, handle, display_name, nickname_key,
+             avatar_resource_id, profile_revision, created_at, updated_at
+           ) VALUES ($1, $2, $3, $4, $5, NULL, 1, $6, $6)
+           RETURNING *`,
+          [
+            id,
+            deviceId,
+            `guest_${hash(deviceId).slice(0, 12)}`,
+            displayName,
+            displayName.normalize('NFKC').toLowerCase(),
+            now,
+          ],
+        );
+        body = publicUser(rowToUser(inserted.rows[0]));
+        await this._saveReplay(client, {
+          principalId: PUBLIC_REGISTRATION_PRINCIPAL_ID,
+          operation: 'createMcpRegistration',
+          key,
+          requestFingerprint,
+          status: 201,
+          body,
+        });
+      }
+      const session = await this._createDeviceSession(client, {
+        userId: body.userId,
+        deviceId,
+        kind: 'mcp',
+        label: deviceLabel,
+        prefix: 'ct',
+      });
+      return {
+        token: session.token,
+        ...body,
+        ...await this._issueWebBindingCode(client, body.userId),
+      };
+    });
+  }
+
+  async issueWebBindingCode({ userId }) {
+    return this._transaction((client) => this._issueWebBindingCode(client, userId));
+  }
+
+  async registerWebAccount({
+    username,
+    usernameKey,
+    displayName,
+    passwordSalt,
+    passwordHash,
+    bindingCode,
+  }) {
+    try {
+      return await this._transaction(async (client) => {
+        const codeHash = hash(normalizeOneTimeCode(bindingCode));
+        const codeResult = await client.query(
+          'SELECT * FROM web_binding_codes WHERE code_hash = $1 FOR UPDATE',
+          [codeHash],
+        );
+        const code = codeResult.rows[0];
+        if (!code || new Date(code.expires_at).getTime() <= this.clock().getTime()) {
+          throw new HttpError(400, 'invalid_binding_code', 'Binding code is invalid or expired');
+        }
+        const existing = await client.query(
+          'SELECT 1 FROM web_accounts WHERE user_id = $1',
+          [code.user_id],
+        );
+        if (existing.rowCount > 0) {
+          throw new HttpError(409, 'web_account_exists', 'Web account is already configured');
+        }
+        const now = this.clock();
+        await client.query(
+          `INSERT INTO web_accounts(
+             user_id, username, username_key, password_salt, password_hash,
+             created_at, updated_at
+           ) VALUES ($1, $2, $3, $4, $5, $6, $6)`,
+          [code.user_id, username, usernameKey, passwordSalt, passwordHash, now],
+        );
+        const updated = await client.query(
+          `UPDATE users
+              SET handle = $1, display_name = $2, nickname_key = $3,
+                  profile_revision = profile_revision + 1, updated_at = $4
+            WHERE id = $5
+            RETURNING *`,
+          [
+            username,
+            displayName,
+            displayName.normalize('NFKC').toLowerCase(),
+            now,
+            code.user_id,
+          ],
+        );
+        await client.query('DELETE FROM web_binding_codes WHERE user_id = $1', [code.user_id]);
+        const session = await this._createDeviceSession(client, {
+          userId: code.user_id,
+          kind: 'web',
+          label: 'Web browser',
+          prefix: 'web',
+        });
+        return { token: session.token, user: publicUser(rowToUser(updated.rows[0])) };
+      });
+    } catch (error) {
+      if (error?.code === '23505' && error?.constraint === 'web_accounts_pkey') {
+        throw new HttpError(409, 'web_account_exists', 'Web account is already configured');
+      }
+      if (
+        error?.code === '23505' &&
+        ['web_accounts_username_key_key', 'users_handle_key'].includes(error.constraint)
+      ) {
+        throw new HttpError(409, 'username_conflict', 'Username is already in use');
+      }
+      throw error;
+    }
+  }
+
+  async upgradeWebAccount({ userId, username, usernameKey, passwordSalt, passwordHash }) {
+    try {
+      return await this._transaction(async (client) => {
+        const userResult = await client.query(
+          'SELECT * FROM users WHERE id = $1 FOR UPDATE',
+          [userId],
+        );
+        if (userResult.rowCount === 0) {
+          throw new HttpError(404, 'resource_not_found', 'User not found');
+        }
+        const existing = await client.query(
+          'SELECT 1 FROM web_accounts WHERE user_id = $1',
+          [userId],
+        );
+        if (existing.rowCount > 0) {
+          throw new HttpError(409, 'web_account_exists', 'Web account is already configured');
+        }
+        const now = this.clock();
+        await client.query(
+          `INSERT INTO web_accounts(
+             user_id, username, username_key, password_salt, password_hash,
+             created_at, updated_at
+           ) VALUES ($1, $2, $3, $4, $5, $6, $6)`,
+          [userId, username, usernameKey, passwordSalt, passwordHash, now],
+        );
+        const updated = await client.query(
+          `UPDATE users
+              SET handle = $1, profile_revision = profile_revision + 1, updated_at = $2
+            WHERE id = $3
+            RETURNING *`,
+          [username, now, userId],
+        );
+        const session = await this._createDeviceSession(client, {
+          userId,
+          kind: 'web',
+          label: 'Web browser',
+          prefix: 'web',
+        });
+        return { token: session.token, user: publicUser(rowToUser(updated.rows[0])) };
+      });
+    } catch (error) {
+      if (error?.code === '23505' && error?.constraint === 'web_accounts_pkey') {
+        throw new HttpError(409, 'web_account_exists', 'Web account is already configured');
+      }
+      if (
+        error?.code === '23505' &&
+        ['web_accounts_username_key_key', 'users_handle_key'].includes(error.constraint)
+      ) {
+        throw new HttpError(409, 'username_conflict', 'Username is already in use');
+      }
+      throw error;
+    }
+  }
+
+  async getWebLoginCredentials({ usernameKey }) {
+    const result = await this.pool.query(
+      `SELECT user_id, username, username_key, password_salt, password_hash,
+              created_at, updated_at
+         FROM web_accounts
+        WHERE username_key = $1`,
+      [usernameKey],
+    );
+    if (result.rowCount === 0) {
+      throw new HttpError(401, 'invalid_credentials', 'Username or password is incorrect');
+    }
+    const row = result.rows[0];
+    return {
+      userId: row.user_id,
+      username: row.username,
+      usernameKey: row.username_key,
+      passwordSalt: row.password_salt,
+      passwordHash: row.password_hash,
+      createdAt: iso(row.created_at),
+      updatedAt: iso(row.updated_at),
+    };
+  }
+
+  async getWebLoginCredentialsByUserId({ userId }) {
+    const result = await this.pool.query(
+      `SELECT user_id, username, username_key, password_salt, password_hash,
+              created_at, updated_at
+         FROM web_accounts
+        WHERE user_id = $1`,
+      [userId],
+    );
+    if (result.rowCount === 0) {
+      throw new HttpError(409, 'web_account_required', 'Web account is not configured');
+    }
+    const row = result.rows[0];
+    return {
+      userId: row.user_id,
+      username: row.username,
+      usernameKey: row.username_key,
+      passwordSalt: row.password_salt,
+      passwordHash: row.password_hash,
+      createdAt: iso(row.created_at),
+      updatedAt: iso(row.updated_at),
+    };
+  }
+
+  async changeWebPassword({ userId, currentDeviceId, passwordSalt, passwordHash }) {
+    await this._transaction(async (client) => {
+      const updated = await client.query(
+        `UPDATE web_accounts
+            SET password_salt = $1, password_hash = $2, updated_at = $3
+          WHERE user_id = $4`,
+        [passwordSalt, passwordHash, this.clock(), userId],
+      );
+      if (updated.rowCount === 0) {
+        throw new HttpError(409, 'web_account_required', 'Web account is not configured');
+      }
+      await client.query(
+        `DELETE FROM sessions s
+         USING user_devices d
+         WHERE s.user_id = $1
+           AND s.device_id <> $2
+           AND d.user_id = s.user_id
+           AND d.device_id = s.device_id
+           AND d.kind = 'web'`,
+        [userId, currentDeviceId],
+      );
+    });
+  }
+
+  async createWebSession({ userId, label }) {
+    return this._transaction(async (client) => {
+      const result = await client.query('SELECT * FROM users WHERE id = $1', [userId]);
+      if (result.rowCount === 0) {
+        throw new HttpError(404, 'resource_not_found', 'User not found');
+      }
+      const session = await this._createDeviceSession(client, {
+        userId,
+        kind: 'web',
+        label,
+        prefix: 'web',
+      });
+      return { token: session.token, user: publicUser(rowToUser(result.rows[0])) };
+    });
+  }
+
+  async createMcpDeviceSession({ userId, label }) {
+    return this._transaction(async (client) => {
+      const user = await client.query('SELECT 1 FROM users WHERE id = $1', [userId]);
+      if (user.rowCount === 0) {
+        throw new HttpError(404, 'resource_not_found', 'User not found');
+      }
+      return this._createDeviceSession(client, {
+        userId,
+        kind: 'mcp',
+        label,
+        prefix: 'ct',
+      });
+    });
+  }
+
+  async listDevices({ userId }) {
+    const result = await this.pool.query(
+      `SELECT d.user_id, d.device_id, d.kind, d.label,
+              EXISTS (
+                SELECT 1 FROM sessions s
+                 WHERE s.user_id = d.user_id AND s.device_id = d.device_id
+              ) AS active
+         FROM user_devices d
+        WHERE d.user_id = $1
+        ORDER BY d.created_at, d.device_id`,
+      [userId],
+    );
+    return result.rows.map((row) => ({
+      userId: row.user_id,
+      deviceId: row.device_id,
+      kind: row.kind,
+      label: row.label,
+      active: row.active,
+    }));
+  }
+
+  async revokeDevice({ userId, deviceId }) {
+    await this.pool.query(
+      'DELETE FROM sessions WHERE user_id = $1 AND device_id = $2',
+      [userId, deviceId],
+    );
+  }
+
+  async issueWebPasswordResetCode({ userId }) {
+    return this._transaction((client) => this._issueWebPasswordResetCode(client, userId));
+  }
+
+  async resetWebPassword({ usernameKey, resetCode, passwordSalt, passwordHash }) {
+    await this._transaction(async (client) => {
+      const codeHash = hash(normalizeOneTimeCode(resetCode));
+      const result = await client.query(
+        `SELECT a.user_id, c.expires_at
+           FROM web_accounts a
+           JOIN web_password_reset_codes c ON c.user_id = a.user_id
+          WHERE a.username_key = $1 AND c.code_hash = $2
+          FOR UPDATE OF a, c`,
+        [usernameKey, codeHash],
+      );
+      const row = result.rows[0];
+      if (!row || new Date(row.expires_at).getTime() <= this.clock().getTime()) {
+        throw new HttpError(400, 'invalid_reset_code', 'Reset code is invalid or expired');
+      }
+      await client.query(
+        `UPDATE web_accounts
+            SET password_salt = $1, password_hash = $2, updated_at = $3
+          WHERE user_id = $4`,
+        [passwordSalt, passwordHash, this.clock(), row.user_id],
+      );
+      await client.query(
+        'DELETE FROM web_password_reset_codes WHERE user_id = $1',
+        [row.user_id],
+      );
+      await client.query(
+        `DELETE FROM sessions s
+         USING user_devices d
+         WHERE s.user_id = $1
+           AND d.user_id = s.user_id
+           AND d.device_id = s.device_id
+           AND d.kind = 'web'`,
+        [row.user_id],
+      );
+    });
+  }
+
+  async createProfileResource({ userId, mimeType, content }) {
+    const id = newId('resource');
+    const createdAt = this.clock();
+    await this.pool.query(
+      `INSERT INTO profile_resources(
+         id, owner_user_id, mime_type, content, byte_size, created_at
+       ) VALUES ($1, $2, $3, $4, $5, $6)`,
+      [id, userId, mimeType, content, content.length, createdAt],
+    );
+    return {
+      id,
+      mimeType,
+      byteSize: content.length,
+      createdAt: createdAt.toISOString(),
+    };
+  }
+
+  async getProfileResource({ resourceId }) {
+    const result = await this.pool.query(
+      `SELECT id, owner_user_id, mime_type, content, byte_size, created_at
+         FROM profile_resources
+        WHERE id = $1`,
+      [resourceId],
+    );
+    if (result.rowCount === 0) {
+      throw new HttpError(404, 'resource_not_found', 'Profile resource not found');
+    }
+    const row = result.rows[0];
+    return {
+      id: row.id,
+      ownerUserId: row.owner_user_id,
+      mimeType: row.mime_type,
+      content: row.content,
+      byteSize: row.byte_size,
+      createdAt: iso(row.created_at),
+    };
+  }
+
   async getMe({ userId }) {
     const result = await this.pool.query(
       'SELECT * FROM users WHERE id = $1',
@@ -2621,6 +3503,7 @@ export class PostgresGroupChatStore {
     userId,
     expectedProfileRevision,
     displayName,
+    avatarResourceId,
     key,
     requestFingerprint,
   }) {
@@ -2643,15 +3526,21 @@ export class PostgresGroupChatStore {
             safeInteger(user.profile_revision, 'users.profile_revision')) {
           throw new HttpError(409, 'request_version_conflict', 'Profile revision does not match');
         }
+        if (avatarResourceId !== undefined) {
+          await this._requireOwnedAvatar(client, userId, avatarResourceId);
+        }
         const updated = await client.query(
           `UPDATE users
-              SET display_name = $1, nickname_key = $2,
-                  profile_revision = profile_revision + 1, updated_at = $3
-            WHERE id = $4
+              SET display_name = $1, nickname_key = $2, avatar_resource_id = $3,
+                  profile_revision = profile_revision + 1, updated_at = $4
+            WHERE id = $5
             RETURNING *`,
           [
-            displayName,
-            displayName.normalize('NFKC').toLowerCase(),
+            displayName ?? user.display_name,
+            displayName === undefined
+              ? user.nickname_key
+              : displayName.normalize('NFKC').toLowerCase(),
+            avatarResourceId === undefined ? user.avatar_resource_id : avatarResourceId,
             this.clock(),
             userId,
           ],
@@ -2665,6 +3554,7 @@ export class PostgresGroupChatStore {
           status: 200,
           body,
         });
+        await this._enqueueProfileUpdated(client, 'human', userId, body);
         return { status: 200, body };
       });
     } catch (error) {
@@ -2677,14 +3567,52 @@ export class PostgresGroupChatStore {
 
   async listRooms(userId) {
     const result = await this.pool.query(
-      `SELECT r.*
+      `SELECT r.*,
+              COALESCE(w.read_seq, GREATEST(0, m.joined_seq - 1)) AS web_read_seq
          FROM rooms r
          JOIN room_members m ON m.room_id = r.id
+         LEFT JOIN web_room_reads w ON w.room_id = r.id AND w.user_id = m.user_id
         WHERE m.user_id = $1
         ORDER BY r.updated_at DESC, r.id`,
       [userId],
     );
-    return result.rows.map(rowToRoom);
+    return result.rows.map((row) => {
+      const room = rowToRoom(row);
+      const webReadSeq = safeInteger(row.web_read_seq, 'web_room_reads.read_seq');
+      return {
+        ...room,
+        webReadSeq,
+        unreadCount: Math.max(0, room.lastSeq - webReadSeq),
+      };
+    });
+  }
+
+  async updateWebRoomRead({ userId, roomId, readSeq }) {
+    return this._transaction(async (client) => {
+      const room = await this._room(client, roomId);
+      const membership = await this._membership(client, roomId, userId);
+      const minimum = Math.max(
+        0,
+        safeInteger(membership.joined_seq, 'room_members.joined_seq') - 1,
+      );
+      const lastSeq = safeInteger(room.last_seq, 'rooms.last_seq');
+      if (readSeq < minimum || readSeq > lastSeq) {
+        throw new HttpError(400, 'invalid_request', 'readSeq is outside visible room history');
+      }
+      const result = await client.query(
+        `INSERT INTO web_room_reads(user_id, room_id, read_seq, updated_at)
+         VALUES ($1, $2, $3, $4)
+         ON CONFLICT (user_id, room_id) DO UPDATE
+         SET read_seq = GREATEST(web_room_reads.read_seq, EXCLUDED.read_seq),
+             updated_at = EXCLUDED.updated_at
+         RETURNING read_seq`,
+        [userId, roomId, readSeq, this.clock()],
+      );
+      return {
+        roomId,
+        webReadSeq: safeInteger(result.rows[0].read_seq, 'web_room_reads.read_seq'),
+      };
+    });
   }
 
   async listRoomsPage({ userId, afterRoomId, limit }) {
@@ -2712,8 +3640,8 @@ export class PostgresGroupChatStore {
     key,
     requestFingerprint,
   }) {
-    requireOwnedAvatar(avatarResourceId);
     return this._transaction(async (client) => {
+      await this._requireOwnedAvatar(client, userId, avatarResourceId);
       const replay = await this._replay(
         client,
         userId,
@@ -2744,6 +3672,16 @@ export class PostgresGroupChatStore {
     });
   }
 
+  async listAgentProfiles({ userId }) {
+    const result = await this.pool.query(
+      `SELECT * FROM agent_profiles
+        WHERE owner_user_id = $1
+        ORDER BY created_at, id`,
+      [userId],
+    );
+    return result.rows.map(rowToAgentProfile);
+  }
+
   async getAgentProfile({ agentProfileId }) {
     const result = await this.pool.query(
       'SELECT * FROM agent_profiles WHERE id = $1',
@@ -2763,9 +3701,6 @@ export class PostgresGroupChatStore {
     key,
     requestFingerprint,
   }) {
-    if (Object.hasOwn(changes, 'avatarResourceId')) {
-      requireOwnedAvatar(changes.avatarResourceId);
-    }
     return this._transaction(async (client) => {
       const result = await client.query(
         'SELECT * FROM agent_profiles WHERE id = $1 FOR UPDATE',
@@ -2777,6 +3712,9 @@ export class PostgresGroupChatStore {
       const profile = result.rows[0];
       if (profile.owner_user_id !== userId) {
         throw new HttpError(403, 'forbidden', 'Agent profile owner required');
+      }
+      if (Object.hasOwn(changes, 'avatarResourceId')) {
+        await this._requireOwnedAvatar(client, userId, changes.avatarResourceId);
       }
       const replay = await this._replay(
         client,
@@ -2815,6 +3753,7 @@ export class PostgresGroupChatStore {
         status: 200,
         body,
       });
+      await this._enqueueProfileUpdated(client, 'agent', userId, body);
       return { status: 200, body };
     });
   }
@@ -3266,8 +4205,8 @@ export class PostgresGroupChatStore {
     runtimeCapabilitiesVersion,
     localConfigRevision,
   }) {
-    requireOwnedAvatar(publicProfile.avatarResourceId);
     return this._transaction(async (client) => {
+      await this._requireOwnedAvatar(client, user.userId, publicProfile.avatarResourceId);
       await this._room(client, roomId);
       await this._membership(client, roomId, user.userId, { lock: true });
       const now = this.clock();
@@ -4179,6 +5118,7 @@ export class PostgresGroupChatStore {
     key,
     requestFingerprint,
     automatic = false,
+    precedingHumanMessage = null,
   }) {
     return this._transaction(async (client) => {
       const request = await this._generationRequest(client, generationRequestId, { lock: true });
@@ -4241,10 +5181,20 @@ export class PostgresGroupChatStore {
           'Binding policy revision does not match',
         );
       }
+      if (precedingHumanMessage?.clientMessageId === clientMessageId) {
+        throw new HttpError(409, 'conflict', 'Client message ID is already in use');
+      }
+      const clientMessageIds = [
+        clientMessageId,
+        ...(precedingHumanMessage === null
+          ? []
+          : [precedingHumanMessage.clientMessageId]),
+      ];
       const existing = await client.query(
         `SELECT 1 FROM messages
-          WHERE generation_request_id = $1 OR (room_id = $2 AND client_message_id = $3)`,
-        [generationRequestId, request.room_id, clientMessageId],
+          WHERE generation_request_id = $1
+             OR (room_id = $2 AND client_message_id = ANY($3::text[]))`,
+        [generationRequestId, request.room_id, clientMessageIds],
       );
       if (existing.rowCount > 0) {
         throw new HttpError(409, 'conflict', 'Generation or client message is already published');
@@ -4265,71 +5215,76 @@ export class PostgresGroupChatStore {
           );
         }
       }
-      const loopState = await client.query(
-        `WITH cycle AS (
-           SELECT COALESCE((
-             SELECT seq FROM messages
-              WHERE room_id = $1 AND sender->>'kind' = 'human'
-              ORDER BY seq DESC
-              LIMIT 1
-           ), 0) AS start_seq
-         )
-         SELECT
-           COUNT(*) FILTER (WHERE m.sender->>'kind' = 'agent') AS ai_count,
-           COUNT(*) FILTER (
-             WHERE m.sender->>'kind' = 'agent' AND m.sender->>'userId' = $2
-           ) AS owner_ai_count,
-           (
-             SELECT COUNT(*) FROM room_agent_bindings
-              WHERE room_id = $1 AND participation_mode = 'automatic'
-           ) AS enabled_agent_count
-           FROM messages m CROSS JOIN cycle c
-          WHERE m.room_id = $1 AND m.seq > c.start_seq`,
-        [request.room_id, user.userId],
-      );
-      const aiCount = safeInteger(loopState.rows[0].ai_count, 'AI message count');
-      const ownerAiCount = safeInteger(
-        loopState.rows[0].owner_ai_count,
-        'Agent message count',
-      );
-      const enabledAgentCount = safeInteger(
-        loopState.rows[0].enabled_agent_count,
-        'Enabled agent count',
-      );
-      if (
-        binding.trigger_scope === 'allMessages' &&
-        aiCount >= ABSOLUTE_CONSECUTIVE_AI_LIMIT
-      ) {
-        throw new HttpError(
-          409,
-          'agent_loop_limit_reached',
-          'Room consecutive AI message limit reached; wait for a human message',
+      if (precedingHumanMessage === null) {
+        const loopState = await client.query(
+          `WITH cycle AS (
+             SELECT COALESCE((
+               SELECT seq FROM messages
+                WHERE room_id = $1 AND sender->>'kind' = 'human'
+                ORDER BY seq DESC
+                LIMIT 1
+             ), 0) AS start_seq
+           )
+           SELECT
+             COUNT(*) FILTER (WHERE m.sender->>'kind' = 'agent') AS ai_count,
+             COUNT(*) FILTER (
+               WHERE m.sender->>'kind' = 'agent' AND m.sender->>'userId' = $2
+             ) AS owner_ai_count,
+             (
+               SELECT COUNT(*) FROM room_agent_bindings
+                WHERE room_id = $1 AND participation_mode = 'automatic'
+             ) AS enabled_agent_count
+             FROM messages m CROSS JOIN cycle c
+            WHERE m.room_id = $1 AND m.seq > c.start_seq`,
+          [request.room_id, user.userId],
         );
-      }
-      if (
-        binding.trigger_scope !== 'allMessages' &&
-        ownerAiCount >= AGENT_MESSAGES_PER_CYCLE_LIMIT
-      ) {
-        throw new HttpError(
-          409,
-          'agent_loop_limit_reached',
-          'Agent reply already published for the current human cycle; stop the current assistant turn',
+        const aiCount = safeInteger(loopState.rows[0].ai_count, 'AI message count');
+        const ownerAiCount = safeInteger(
+          loopState.rows[0].owner_ai_count,
+          'Agent message count',
         );
-      }
-      const roomLimit = Math.min(
-        Math.max(enabledAgentCount, 1) * AGENT_MESSAGES_PER_CYCLE_LIMIT,
-        ABSOLUTE_CONSECUTIVE_AI_LIMIT,
-      );
-      if (binding.trigger_scope !== 'allMessages' && aiCount >= roomLimit) {
-        throw new HttpError(
-          409,
-          'agent_loop_limit_reached',
-          'Room AI message limit reached for the current human cycle',
+        const enabledAgentCount = safeInteger(
+          loopState.rows[0].enabled_agent_count,
+          'Enabled agent count',
         );
+        if (
+          binding.trigger_scope === 'allMessages' &&
+          aiCount >= ABSOLUTE_CONSECUTIVE_AI_LIMIT
+        ) {
+          throw new HttpError(
+            409,
+            'agent_loop_limit_reached',
+            'Room consecutive AI message limit reached; wait for a human message',
+          );
+        }
+        if (
+          binding.trigger_scope !== 'allMessages' &&
+          ownerAiCount >= AGENT_MESSAGES_PER_CYCLE_LIMIT
+        ) {
+          throw new HttpError(
+            409,
+            'agent_loop_limit_reached',
+            'Agent reply already published for the current human cycle; stop the current assistant turn',
+          );
+        }
+        const roomLimit = Math.min(
+          Math.max(enabledAgentCount, 1) * AGENT_MESSAGES_PER_CYCLE_LIMIT,
+          ABSOLUTE_CONSECUTIVE_AI_LIMIT,
+        );
+        if (binding.trigger_scope !== 'allMessages' && aiCount >= roomLimit) {
+          throw new HttpError(
+            409,
+            'agent_loop_limit_reached',
+            'Room AI message limit reached for the current human cycle',
+          );
+        }
       }
-      const mentionedUserIds = mentions
-        .filter((mention) => mention.kind === 'user')
-        .map((mention) => mention.targetId);
+      const allMentions = [...(precedingHumanMessage?.mentions ?? []), ...mentions];
+      const mentionedUserIds = [...new Set(
+        allMentions
+          .filter((mention) => mention.kind === 'user')
+          .map((mention) => mention.targetId),
+      )];
       if (mentionedUserIds.length > 0) {
         const targets = await client.query(
           `SELECT user_id FROM room_members
@@ -4340,9 +5295,11 @@ export class PostgresGroupChatStore {
           throw new HttpError(400, 'invalid_request', 'Mention target is not a room member');
         }
       }
-      const mentionedAgentIds = mentions
-        .filter((mention) => mention.kind === 'agent')
-        .map((mention) => mention.targetId);
+      const mentionedAgentIds = [...new Set(
+        allMentions
+          .filter((mention) => mention.kind === 'agent')
+          .map((mention) => mention.targetId),
+      )];
       if (mentionedAgentIds.length > 0) {
         const targets = await client.query(
           `SELECT agent_profile_id FROM room_agent_bindings
@@ -4372,6 +5329,25 @@ export class PostgresGroupChatStore {
           );
         }
       }
+      if (precedingHumanMessage?.replyToMessageId) {
+        const target = await client.query(
+          'SELECT seq FROM messages WHERE id = $1 AND room_id = $2',
+          [precedingHumanMessage.replyToMessageId, request.room_id],
+        );
+        if (target.rowCount === 0) {
+          throw new HttpError(404, 'resource_not_found', 'Reply target not found');
+        }
+        if (
+          safeInteger(target.rows[0].seq, 'messages.seq') <
+          safeInteger(membership.joined_seq, 'room_members.joined_seq')
+        ) {
+          throw new HttpError(
+            403,
+            'history_not_visible',
+            'Reply target is outside membership history',
+          );
+        }
+      }
       const profileResult = await client.query(
         'SELECT * FROM agent_profiles WHERE id = $1',
         [binding.agent_profile_id],
@@ -4381,7 +5357,49 @@ export class PostgresGroupChatStore {
       }
       const profile = profileResult.rows[0];
       const now = this.clock();
-      const seq = safeInteger(room.last_seq, 'rooms.last_seq') + 1;
+      const firstSeq = safeInteger(room.last_seq, 'rooms.last_seq') + 1;
+      const humanMessage = precedingHumanMessage === null
+        ? null
+        : {
+            id: newId('msg'),
+            roomId: request.room_id,
+            seq: firstSeq,
+            clientMessageId: precedingHumanMessage.clientMessageId,
+            sender: {
+              kind: 'human',
+              userId: user.userId,
+              displayNameSnapshot: user.displayName,
+              avatarResourceIdSnapshot: user.avatarResourceId,
+            },
+            content: {
+              schemaVersion: 1,
+              type: 'text',
+              text: precedingHumanMessage.text,
+            },
+            mentions: precedingHumanMessage.mentions,
+            replyToMessageId: precedingHumanMessage.replyToMessageId,
+            createdAt: now.toISOString(),
+          };
+      if (humanMessage !== null) {
+        await client.query(
+          `INSERT INTO messages(
+             id, room_id, seq, client_message_id, sender, content, mentions,
+             reply_to_message_id, generation_request_id, trigger_through_seq, created_at
+           ) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, NULL, NULL, $9)`,
+          [
+            humanMessage.id,
+            humanMessage.roomId,
+            humanMessage.seq,
+            humanMessage.clientMessageId,
+            humanMessage.sender,
+            humanMessage.content,
+            JSON.stringify(humanMessage.mentions),
+            humanMessage.replyToMessageId,
+            now,
+          ],
+        );
+      }
+      const seq = firstSeq + (humanMessage === null ? 0 : 1);
       const message = {
         id: newId('msg'),
         roomId: request.room_id,
@@ -4434,6 +5452,7 @@ export class PostgresGroupChatStore {
       const body = {
         generationRequest: rowToGenerationRequest(changed.rows[0]),
         message,
+        ...(humanMessage === null ? {} : { humanMessage }),
       };
       await this._saveReplay(client, {
         principalId: user.userId,
@@ -4443,6 +5462,14 @@ export class PostgresGroupChatStore {
         status: 200,
         body,
       });
+      if (humanMessage !== null) {
+        await client.query(
+          `INSERT INTO outbox_events(
+             event_id, event_type, room_id, payload, occurred_at, dispatched_at
+           ) VALUES ($1, 'message.created', $2, $3, $4, NULL)`,
+          [newId('evt'), request.room_id, humanMessage, now],
+        );
+      }
       await client.query(
         `INSERT INTO outbox_events(
            event_id, event_type, room_id, payload, occurred_at, dispatched_at
@@ -4681,6 +5708,33 @@ export class PostgresGroupChatStore {
       items: result.rows.slice(0, limit).map(rowToMessage),
       highWaterSeq,
       hasMore: result.rows.length > limit,
+    };
+  }
+
+  async listWebMessages({ userId, roomId, beforeSeq, limit }) {
+    const room = await this._room(this.pool, roomId);
+    const membership = await this._membership(this.pool, roomId, userId);
+    const highWaterSeq = safeInteger(room.last_seq, 'rooms.last_seq');
+    const upperBound = beforeSeq ?? highWaterSeq + 1;
+    const result = await this.pool.query(
+      `SELECT * FROM messages
+        WHERE room_id = $1 AND seq < $2 AND seq >= $3 AND seq <= $4
+        ORDER BY seq DESC
+        LIMIT $5`,
+      [
+        roomId,
+        upperBound,
+        safeInteger(membership.joined_seq, 'room_members.joined_seq'),
+        highWaterSeq,
+        limit + 1,
+      ],
+    );
+    const items = result.rows.slice(0, limit).reverse().map(rowToMessage);
+    return {
+      items,
+      highWaterSeq,
+      hasMore: result.rows.length > limit,
+      nextBeforeSeq: items.length > 0 ? items[0].seq : null,
     };
   }
 
@@ -4940,6 +5994,18 @@ export class PostgresGroupChatStore {
       `SELECT user_id FROM room_members
         WHERE room_id = $1 AND joined_seq <= $2`,
       [roomId, messageSeq],
+    );
+    return result.rows.map((row) => row.user_id);
+  }
+
+  async listProfileRecipientUserIds(ownerUserId) {
+    const result = await this.pool.query(
+      `SELECT DISTINCT target.user_id
+         FROM room_members owner
+         JOIN room_members target ON target.room_id = owner.room_id
+        WHERE owner.user_id = $1
+       UNION SELECT $1`,
+      [ownerUserId],
     );
     return result.rows.map((row) => row.user_id);
   }

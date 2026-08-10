@@ -190,6 +190,40 @@ const publishAgentReplyOutputSchema = z.object({
   message: messageSchema,
 }).strict();
 
+const publishHumanAndAgentOutputSchema = z.object({
+  humanMessage: messageSchema,
+  agentMessage: messageSchema,
+  nextAction: z.literal('stop_current_turn'),
+}).strict();
+
+const oneTimeCodeOutputSchema = z.object({
+  expiresAt: timestampSchema,
+}).strict();
+
+const webBindingCodeOutputSchema = oneTimeCodeOutputSchema.extend({
+  bindingCode: z.string().length(9),
+}).strict();
+
+const webResetCodeOutputSchema = oneTimeCodeOutputSchema.extend({
+  resetCode: z.string().length(9),
+}).strict();
+
+const mcpDeviceOutputSchema = z.object({
+  deviceId: idSchema,
+  label: z.string().min(1).max(80),
+  token: z.string().min(1).max(256),
+  mcpUrl: z.string().url(),
+  authorizationHeader: z.string().min(1).max(300),
+}).strict();
+
+const mcpRegistrationOutputSchema = mcpDeviceOutputSchema.omit({ deviceId: true }).extend({
+  userId: idSchema,
+  handle: idSchema,
+  displayName: z.string().min(1).max(80),
+  bindingCode: z.string().length(9),
+  expiresAt: timestampSchema,
+}).strict();
+
 const DEFAULT_HANDOFF_INVITE_EXPIRES_IN_SECONDS = 7 * 24 * 60 * 60;
 const DEFAULT_HANDOFF_INVITE_MAX_USES = 10;
 const handoffItemSchema = z.string().min(1).max(2000);
@@ -281,6 +315,16 @@ function successResult(value) {
   return {
     content: [{ type: 'text', text: JSON.stringify(value) }],
     structuredContent: value,
+  };
+}
+
+function tokenConfiguration(mcpBaseUrl, token) {
+  const url = new URL(mcpBaseUrl);
+  url.searchParams.set('token', token);
+  return {
+    token,
+    mcpUrl: url.toString(),
+    authorizationHeader: `Bearer ${token}`,
   };
 }
 
@@ -389,8 +433,15 @@ async function pollMessages({ store, userId, roomId, afterSeq, timeoutMs, signal
   }
 }
 
-async function publishAutomaticAgentReply({ store, user, args }) {
-  const requestFingerprint = toolFingerprint('group_publish_agent_reply', args);
+async function publishAutomaticAgentReply({
+  store,
+  user,
+  args,
+  operationName = 'group_publish_agent_reply',
+  fingerprintArgs = args,
+  precedingHumanMessage = null,
+}) {
+  const requestFingerprint = toolFingerprint(operationName, fingerprintArgs);
   const created = await store.createAutomaticGenerationRequest({
     user,
     roomId: args.roomId,
@@ -447,6 +498,7 @@ async function publishAutomaticAgentReply({ store, user, args }) {
     leaseEpoch: generationRequest.leaseId ? generationRequest.leaseEpoch : null,
     key: args.triggerBatchId,
     requestFingerprint,
+    precedingHumanMessage,
   });
   return {
     generationRequestId: published.body.generationRequest.id,
@@ -454,10 +506,20 @@ async function publishAutomaticAgentReply({ store, user, args }) {
     status: 'published',
     nextAction: 'stop_current_turn',
     message: toMcpMessage(published.body.message),
+    ...(published.body.humanMessage
+      ? { humanMessage: toMcpMessage(published.body.humanMessage) }
+      : {}),
   };
 }
 
-async function publishAgentReplyWithRuntimeRecovery({ store, user, args }) {
+async function publishAgentReplyWithRuntimeRecovery({
+  store,
+  user,
+  args,
+  operationName,
+  fingerprintArgs,
+  precedingHumanMessage,
+}) {
   let binding = null;
   try {
     binding = await store.getMyRoomAgentBinding({
@@ -501,17 +563,32 @@ async function publishAgentReplyWithRuntimeRecovery({ store, user, args }) {
     });
   }
   try {
-    return await publishAutomaticAgentReply({ store, user, args });
+    return await publishAutomaticAgentReply({
+      store,
+      user,
+      args,
+      operationName,
+      fingerprintArgs,
+      precedingHumanMessage,
+    });
   } catch (error) {
     if (!(error instanceof HttpError) || error.code !== 'runtime_not_ready') throw error;
     await store.recoverMyAgentRuntime({ user, roomId: args.roomId });
-    return publishAutomaticAgentReply({ store, user, args });
+    return publishAutomaticAgentReply({
+      store,
+      user,
+      args,
+      operationName,
+      fingerprintArgs,
+      precedingHumanMessage,
+    });
   }
 }
 
 export function createGroupChatMcpServer({
   store,
   user,
+  mcpBaseUrl = 'http://127.0.0.1/mcp',
   logger = console,
   onMessageCreated = () => {},
 }) {
@@ -519,6 +596,35 @@ export function createGroupChatMcpServer({
     name: 'chuanhuatong-mcp',
     version: '0.1.0',
   });
+
+  server.registerTool('group_create_web_binding_code', {
+    description: 'Create a one-time code that lets the authenticated human identity create its optional Web account. The code expires after 24 hours and replaces any previous binding code.',
+    inputSchema: z.object({}).strict(),
+    outputSchema: webBindingCodeOutputSchema,
+    annotations: WRITE_ANNOTATIONS,
+  }, toolHandler(() => store.issueWebBindingCode({ userId: user.userId }), logger));
+
+  server.registerTool('group_create_web_password_reset_code', {
+    description: 'Create a one-time code for resetting the Web account password. Use only when the human explicitly asks to recover Web access.',
+    inputSchema: z.object({}).strict(),
+    outputSchema: webResetCodeOutputSchema,
+    annotations: WRITE_ANNOTATIONS,
+  }, toolHandler(() => store.issueWebPasswordResetCode({ userId: user.userId }), logger));
+
+  server.registerTool('group_create_mcp_device_token', {
+    description: 'Create a separate long-lived MCP token for another device owned by the authenticated human. Return the complete URL and Bearer Header once; keep them secret.',
+    inputSchema: z.object({
+      label: z.string().min(1).max(80),
+    }).strict(),
+    outputSchema: mcpDeviceOutputSchema,
+    annotations: WRITE_ANNOTATIONS,
+  }, toolHandler(async (args) => {
+    const result = await store.createMcpDeviceSession({
+      userId: user.userId,
+      label: args.label,
+    });
+    return { ...result, ...tokenConfiguration(mcpBaseUrl, result.token) };
+  }, logger));
 
   server.registerTool('group_set_display_name', {
     description: 'Change the authenticated human user\'s group-chat display name when the user explicitly requests it. Future human messages use the new name; existing message snapshots do not change.',
@@ -777,6 +883,58 @@ export function createGroupChatMcpServer({
     return toMcpMessage(result.body);
   }, logger));
 
+  server.registerTool('group_send_message_and_agent_reply', {
+    description: 'Atomically publish one explicitly requested human message followed by one AI agent reply. The human text is posted exactly as supplied unless the human asked for rewriting before this call. Both messages succeed or neither is visible. After success, stop the current assistant turn.',
+    inputSchema: z.object({
+      roomId: idSchema,
+      humanClientMessageId: idSchema,
+      humanText: z.string().min(1).max(32768),
+      humanMentions: mentionsSchema.default([]),
+      humanReplyToMessageId: idSchema.nullable().default(null),
+      triggerBatchId: idSchema,
+      triggerMessageIds: triggerMessageIdsSchema,
+      agentClientMessageId: idSchema,
+      agentText: z.string().min(1).max(32768),
+      publicProfile: publicProfileInputSchema.optional(),
+      triggerScope: z.enum(['mentionsOnly', 'allHumanMessages', 'allMessages']).optional(),
+      agentMentions: mentionsSchema.default([]),
+      agentReplyToMessageId: idSchema.nullable().default(null),
+    }).strict(),
+    outputSchema: publishHumanAndAgentOutputSchema,
+    annotations: WRITE_ANNOTATIONS,
+  }, toolHandler(async (args) => {
+    const agentArgs = {
+      roomId: args.roomId,
+      triggerBatchId: args.triggerBatchId,
+      triggerMessageIds: args.triggerMessageIds,
+      clientMessageId: args.agentClientMessageId,
+      text: args.agentText,
+      publicProfile: args.publicProfile,
+      triggerScope: args.triggerScope,
+      mentions: args.agentMentions,
+      replyToMessageId: args.agentReplyToMessageId,
+    };
+    const result = await publishAgentReplyWithRuntimeRecovery({
+      store,
+      user,
+      args: agentArgs,
+      operationName: 'group_send_message_and_agent_reply',
+      fingerprintArgs: args,
+      precedingHumanMessage: {
+        clientMessageId: args.humanClientMessageId,
+        text: args.humanText,
+        mentions: args.humanMentions,
+        replyToMessageId: args.humanReplyToMessageId,
+      },
+    });
+    onMessageCreated();
+    return {
+      humanMessage: result.humanMessage,
+      agentMessage: result.message,
+      nextAction: result.nextAction,
+    };
+  }, logger));
+
   server.registerTool('group_handoff_to_room', {
     description: 'Atomically create a room owned by the caller, post a structured context handoff message as the caller, and create an invite code for other users to join and read the handoff context in one step. Compose the message from the current conversation: contextSummary as background, decisions as confirmed conclusions, and openQuestions as open items. Keep the assembled text within 32768 characters; the server rejects longer input. Returns the room, the seeded message, and the invite code.',
     inputSchema: handoffInputSchema,
@@ -834,5 +992,41 @@ export function createGroupChatMcpServer({
     return result;
   }, logger));
 
+  return server;
+}
+
+export function createRegistrationMcpServer({
+  registerIdentity,
+  mcpBaseUrl,
+  logger = console,
+}) {
+  const server = new McpServer({
+    name: 'chuanhuatong-mcp-registration',
+    version: '0.1.0',
+  });
+  server.registerTool('group_register', {
+    description: 'Register a new human identity and this MCP device. Ask the human for their public display name before calling. The MCP token works immediately; Web binding is optional.',
+    inputSchema: z.object({
+      clientRequestId: idSchema,
+      displayName: z.string().min(1).max(80).refine(
+        (value) => value.trim().length > 0,
+        'displayName must not be blank',
+      ),
+      deviceLabel: z.string().min(1).max(80).default('MCP device'),
+    }).strict(),
+    outputSchema: mcpRegistrationOutputSchema,
+    annotations: WRITE_ANNOTATIONS,
+  }, toolHandler(async (args) => {
+    const result = await registerIdentity(args);
+    return {
+      userId: result.userId,
+      handle: result.handle,
+      displayName: result.displayName,
+      label: args.deviceLabel,
+      bindingCode: result.bindingCode,
+      expiresAt: result.expiresAt,
+      ...tokenConfiguration(mcpBaseUrl, result.token),
+    };
+  }, logger));
   return server;
 }

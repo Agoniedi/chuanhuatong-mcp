@@ -34,6 +34,13 @@ const migrations = [
       import.meta.url,
     ),
   ],
+  [
+    '007_web_accounts_and_resources',
+    new URL(
+      '../migrations/007_web_accounts_and_resources.sql',
+      import.meta.url,
+    ),
+  ],
 ];
 
 export async function runMigrations(pool, logger = console) {

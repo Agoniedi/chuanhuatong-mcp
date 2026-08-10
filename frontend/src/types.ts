@@ -15,6 +15,8 @@ export interface Room {
   historyVisibility: string;
   createdAt: string;
   updatedAt: string;
+  webReadSeq: number;
+  unreadCount: number;
 }
 
 export interface MessageContent {
@@ -73,11 +75,31 @@ export interface AgentBinding {
   updatedAt: string;
 }
 
-export interface RegisterResponse {
-  token: string;
-  userId: string;
+export interface AgentProfile {
+  id: string;
+  ownerUserId: string;
   displayName: string;
-  handle: string;
+  avatarResourceId: string | null;
+  shortBio: string;
+  profileRevision: number;
+  createdAt: string;
+  updatedAt: string;
+}
+
+export interface DeviceInfo {
+  userId: string;
+  deviceId: string;
+  kind: 'mcp' | 'web' | 'legacy';
+  label: string;
+  active: boolean;
+}
+
+export interface McpDeviceCreation {
+  token: string;
+  deviceId: string;
+  label: string;
+  mcpUrl: string;
+  authorizationHeader: string;
 }
 
 export interface WsEvent {
@@ -98,4 +120,13 @@ export interface MessageCreatedEvent extends WsEvent {
   type: 'message.created';
   roomId: string;
   payload: Message;
+}
+
+export interface ProfileUpdatedEvent extends WsEvent {
+  type: 'profile.updated';
+  payload: {
+    profileType: 'human' | 'agent';
+    ownerUserId: string;
+    profile: User | AgentProfile;
+  };
 }

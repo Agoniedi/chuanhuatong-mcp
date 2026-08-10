@@ -90,6 +90,184 @@ describe('PostgreSQL group chat storage', () => {
   );
 
   it(
+    'persists MCP registration, optional Web identity, device sessions, and password resets',
+    { skip: !process.env.TEST_DATABASE_URL },
+    async () => {
+      const baseUrl = process.env.TEST_DATABASE_URL;
+      const schema = `chuanhuatong_test_${randomBytes(8).toString('hex')}`;
+      const admin = new pg.Pool({ connectionString: baseUrl });
+      await admin.query(`CREATE SCHEMA "${schema}"`);
+
+      const isolatedUrl = new URL(baseUrl);
+      isolatedUrl.searchParams.set('options', `-csearch_path=${schema}`);
+      let store;
+      try {
+        store = await PostgresGroupChatStore.connect({
+          connectionString: isolatedUrl.toString(),
+          migrate: true,
+          logger: { info() {} },
+        });
+        const registrationRequest = {
+          displayName: 'Postgres Web Reader',
+          deviceLabel: 'Primary MCP device',
+          key: 'postgres-web-registration',
+          requestFingerprint: 'postgres-web-registration-fingerprint',
+        };
+        const registration = await store.createMcpRegistration(registrationRequest);
+        const replay = await store.createMcpRegistration(registrationRequest);
+        assert.equal(replay.userId, registration.userId);
+        assert.notEqual(replay.token, registration.token);
+        assert.equal((await store.authenticate(registration.token)).userId, registration.userId);
+
+        const duplicateDisplayName = await store.createMcpRegistration({
+          ...registrationRequest,
+          key: 'postgres-duplicate-display-name',
+          requestFingerprint: 'postgres-duplicate-display-name-fingerprint',
+        });
+        assert.notEqual(duplicateDisplayName.userId, registration.userId);
+
+        const replacementCode = await store.issueWebBindingCode({
+          userId: registration.userId,
+        });
+        await assert.rejects(
+          store.registerWebAccount({
+            username: 'postgres_reader',
+            usernameKey: 'postgres_reader',
+            displayName: 'Postgres Reader',
+            passwordSalt: 'salt-before-reset',
+            passwordHash: 'hash-before-reset',
+            bindingCode: replay.bindingCode,
+          }),
+          (error) => error.status === 400 && error.code === 'invalid_binding_code',
+        );
+        const webRegistration = await store.registerWebAccount({
+          username: 'postgres_reader',
+          usernameKey: 'postgres_reader',
+          displayName: 'Postgres Reader',
+          passwordSalt: 'salt-before-reset',
+          passwordHash: 'hash-before-reset',
+          bindingCode: replacementCode.bindingCode,
+        });
+        assert.equal(webRegistration.user.handle, 'postgres_reader');
+        assert.equal(
+          (await store.authenticate(webRegistration.token)).userId,
+          registration.userId,
+        );
+        const credentials = await store.getWebLoginCredentials({
+          usernameKey: 'postgres_reader',
+        });
+        assert.equal(credentials.userId, registration.userId);
+        assert.equal(credentials.passwordHash, 'hash-before-reset');
+
+        const avatarContent = Buffer.from([0x89, 0x50, 0x4e, 0x47]);
+        const avatar = await store.createProfileResource({
+          userId: registration.userId,
+          mimeType: 'image/png',
+          content: avatarContent,
+        });
+        const storedAvatar = await store.getProfileResource({ resourceId: avatar.id });
+        assert.equal(storedAvatar.mimeType, 'image/png');
+        assert.deepEqual(storedAvatar.content, avatarContent);
+        const updatedProfile = await store.updateMyProfile({
+          userId: registration.userId,
+          expectedProfileRevision: webRegistration.user.profileRevision,
+          avatarResourceId: avatar.id,
+          key: 'postgres-user-avatar',
+          requestFingerprint: 'postgres-user-avatar-fingerprint',
+        });
+        assert.equal(updatedProfile.body.avatarResourceId, avatar.id);
+        const agentProfile = await store.createAgentProfile({
+          userId: registration.userId,
+          displayName: 'Postgres Reader AI',
+          avatarResourceId: avatar.id,
+          shortBio: '',
+          key: 'postgres-agent-avatar',
+          requestFingerprint: 'postgres-agent-avatar-fingerprint',
+        });
+        assert.equal(
+          (await store.listAgentProfiles({ userId: registration.userId }))[0].id,
+          agentProfile.body.id,
+        );
+        assert.ok(
+          (await store.listPendingOutboxEvents())
+            .some((entry) => entry.event.type === 'profile.updated'),
+        );
+
+        const secondMcpDevice = await store.createMcpDeviceSession({
+          userId: registration.userId,
+          label: 'Secondary MCP device',
+        });
+        assert.equal((await store.authenticate(secondMcpDevice.token)).userId, registration.userId);
+        await store.revokeDevice({
+          userId: registration.userId,
+          deviceId: secondMcpDevice.deviceId,
+        });
+        await assert.rejects(
+          store.authenticate(secondMcpDevice.token),
+          (error) => error.status === 401 && error.code === 'session_revoked',
+        );
+        assert.equal(
+          (await store.listDevices({ userId: registration.userId }))
+            .find((device) => device.deviceId === secondMcpDevice.deviceId)
+            .active,
+          false,
+        );
+
+        const additionalWebSession = await store.createWebSession({
+          userId: registration.userId,
+          label: 'Second Web browser',
+        });
+        const currentWebDevice = await store.authenticate(webRegistration.token);
+        await store.changeWebPassword({
+          userId: registration.userId,
+          currentDeviceId: currentWebDevice.deviceId,
+          passwordSalt: 'salt-after-change',
+          passwordHash: 'hash-after-change',
+        });
+        assert.equal(
+          (await store.getWebLoginCredentialsByUserId({ userId: registration.userId }))
+            .passwordHash,
+          'hash-after-change',
+        );
+        await assert.rejects(
+          store.authenticate(additionalWebSession.token),
+          (error) => error.status === 401 && error.code === 'session_revoked',
+        );
+        assert.equal(
+          (await store.authenticate(webRegistration.token)).userId,
+          registration.userId,
+        );
+        const resetWebSession = await store.createWebSession({
+          userId: registration.userId,
+          label: 'Web browser before reset',
+        });
+        const reset = await store.issueWebPasswordResetCode({ userId: registration.userId });
+        await store.resetWebPassword({
+          usernameKey: 'postgres_reader',
+          resetCode: reset.resetCode,
+          passwordSalt: 'salt-after-reset',
+          passwordHash: 'hash-after-reset',
+        });
+        assert.equal(
+          (await store.getWebLoginCredentials({ usernameKey: 'postgres_reader' })).passwordHash,
+          'hash-after-reset',
+        );
+        for (const token of [webRegistration.token, resetWebSession.token]) {
+          await assert.rejects(
+            store.authenticate(token),
+            (error) => error.status === 401 && error.code === 'session_revoked',
+          );
+        }
+        assert.equal((await store.authenticate(registration.token)).userId, registration.userId);
+      } finally {
+        await store?.close().catch(() => {});
+        await admin.query(`DROP SCHEMA "${schema}" CASCADE`);
+        await admin.end();
+      }
+    },
+  );
+
+  it(
     'atomically consumes a single-use room invite under concurrent joins',
     { skip: !process.env.TEST_DATABASE_URL },
     async () => {
@@ -704,6 +882,155 @@ describe('PostgreSQL group chat storage', () => {
           messages.items.map((message) => message.clientMessageId),
           ['postgres-automatic-trigger', 'postgres-automatic-reply'],
         );
+
+        const createStartedRequest = async (suffix, triggerMessageId) => {
+          const requestFingerprint = `postgres-atomic-${suffix}-fingerprint`;
+          const request = await store.createAutomaticGenerationRequest({
+            user,
+            roomId: room.body.id,
+            triggerBatchId: `postgres-atomic-${suffix}`,
+            triggerMessageIds: [triggerMessageId],
+            key: `postgres-atomic-${suffix}`,
+            requestFingerprint,
+          });
+          const requestClaim = await store.claimGenerationRequest({
+            user,
+            generationRequestId: request.body.id,
+            expectedRequestVersion: request.body.requestVersion,
+            key: `postgres-atomic-${suffix}`,
+            requestFingerprint,
+          });
+          const requestStart = await store.startGenerationRequest({
+            user,
+            generationRequestId: request.body.id,
+            expectedRequestVersion: requestClaim.body.requestVersion,
+            leaseId: requestClaim.body.leaseId,
+            leaseEpoch: requestClaim.body.leaseEpoch,
+            key: `postgres-atomic-${suffix}`,
+            requestFingerprint,
+          });
+          return { request, requestFingerprint, requestStart };
+        };
+
+        const atomic = await createStartedRequest('success', trigger.body.id);
+        const atomicPublishRequest = {
+          user,
+          generationRequestId: atomic.request.body.id,
+          expectedRequestVersion: atomic.requestStart.body.requestVersion,
+          expectedBindingPolicyRevision: binding.body.policyRevision,
+          clientMessageId: 'postgres-atomic-agent',
+          text: 'PostgreSQL atomic agent answer',
+          mentions: [],
+          replyToMessageId: null,
+          leaseId: atomic.requestStart.body.leaseId,
+          leaseEpoch: atomic.requestStart.body.leaseEpoch,
+          key: 'postgres-atomic-success',
+          requestFingerprint: atomic.requestFingerprint,
+          precedingHumanMessage: {
+            clientMessageId: 'postgres-atomic-human',
+            text: 'PostgreSQL atomic human message',
+            mentions: [],
+            replyToMessageId: null,
+          },
+        };
+        const atomicPublished = await store.publishAutomaticGenerationRequest(
+          atomicPublishRequest,
+        );
+        assert.equal(
+          atomicPublished.body.message.seq,
+          atomicPublished.body.humanMessage.seq + 1,
+        );
+        assert.deepEqual(
+          await store.publishAutomaticGenerationRequest(atomicPublishRequest),
+          atomicPublished,
+        );
+
+        const failedAtomic = await createStartedRequest(
+          'failure',
+          atomicPublished.body.humanMessage.id,
+        );
+        await assert.rejects(
+          store.publishAutomaticGenerationRequest({
+            user,
+            generationRequestId: failedAtomic.request.body.id,
+            expectedRequestVersion: failedAtomic.requestStart.body.requestVersion,
+            expectedBindingPolicyRevision: binding.body.policyRevision,
+            clientMessageId: 'postgres-failed-atomic-agent',
+            text: 'Invalid PostgreSQL atomic agent answer',
+            mentions: [{ kind: 'agent', targetId: 'missing-agent-profile' }],
+            replyToMessageId: null,
+            leaseId: failedAtomic.requestStart.body.leaseId,
+            leaseEpoch: failedAtomic.requestStart.body.leaseEpoch,
+            key: 'postgres-atomic-failure',
+            requestFingerprint: failedAtomic.requestFingerprint,
+            precedingHumanMessage: {
+              clientMessageId: 'postgres-failed-atomic-human',
+              text: 'This PostgreSQL human message must roll back',
+              mentions: [],
+              replyToMessageId: null,
+            },
+          }),
+          (error) => error.code === 'invalid_request',
+        );
+        const afterAtomic = await store.listMessages({
+          userId: user.userId,
+          roomId: room.body.id,
+          afterSeq: 0,
+          limit: 10,
+        });
+        assert.deepEqual(
+          afterAtomic.items.map((message) => message.clientMessageId),
+          [
+            'postgres-automatic-trigger',
+            'postgres-automatic-reply',
+            'postgres-atomic-human',
+            'postgres-atomic-agent',
+          ],
+        );
+        const latestWebPage = await store.listWebMessages({
+          userId: user.userId,
+          roomId: room.body.id,
+          beforeSeq: null,
+          limit: 2,
+        });
+        assert.deepEqual(
+          latestWebPage.items.map((message) => message.clientMessageId),
+          ['postgres-atomic-human', 'postgres-atomic-agent'],
+        );
+        assert.equal(latestWebPage.hasMore, true);
+        const olderWebPage = await store.listWebMessages({
+          userId: user.userId,
+          roomId: room.body.id,
+          beforeSeq: latestWebPage.nextBeforeSeq,
+          limit: 2,
+        });
+        assert.deepEqual(
+          olderWebPage.items.map((message) => message.clientMessageId),
+          ['postgres-automatic-trigger', 'postgres-automatic-reply'],
+        );
+        assert.equal(olderWebPage.hasMore, false);
+        assert.equal((await store.listRooms(user.userId))[0].unreadCount, 4);
+        assert.deepEqual(
+          await store.updateWebRoomRead({
+            userId: user.userId,
+            roomId: room.body.id,
+            readSeq: 3,
+          }),
+          { roomId: room.body.id, webReadSeq: 3 },
+        );
+        assert.deepEqual(
+          await store.updateWebRoomRead({
+            userId: user.userId,
+            roomId: room.body.id,
+            readSeq: 2,
+          }),
+          { roomId: room.body.id, webReadSeq: 3 },
+        );
+        const membershipRead = await store.pool.query(
+          'SELECT read_seq FROM room_members WHERE room_id = $1 AND user_id = $2',
+          [room.body.id, user.userId],
+        );
+        assert.equal(Number(membershipRead.rows[0].read_seq), 0);
       } finally {
         await store?.close().catch(() => {});
         await admin.query(`DROP SCHEMA "${schema}" CASCADE`);

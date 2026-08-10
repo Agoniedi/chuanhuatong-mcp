@@ -1,5 +1,8 @@
 import assert from 'node:assert/strict';
 import { once } from 'node:events';
+import { mkdir, mkdtemp, rm, writeFile } from 'node:fs/promises';
+import { tmpdir } from 'node:os';
+import { join, sep } from 'node:path';
 import { after, before, describe, it } from 'node:test';
 import WebSocket from 'ws';
 import { MemoryGroupChatStore } from '../src/group_chat_store.mjs';
@@ -191,6 +194,35 @@ after(async () => {
 });
 
 describe('local group chat REST loop', () => {
+  it('serves the built Web app and SPA routes from the same origin', async () => {
+    const frontendDist = await mkdtemp(join(tmpdir(), 'chuanhuatong-static-'));
+    const assets = join(frontendDist, 'assets');
+    await mkdir(assets);
+    await writeFile(join(frontendDist, 'index.html'), '<main>read-only web</main>', 'utf8');
+    await writeFile(join(assets, 'app.js'), 'globalThis.loaded = true;', 'utf8');
+    const isolated = await startIsolatedServer({
+      store: new MemoryGroupChatStore(),
+      frontendDist: `${frontendDist}${sep}`,
+      logger: { warn() {}, error() {} },
+    });
+    try {
+      const root = await fetch(`${isolated.baseUrl}/`);
+      assert.equal(root.status, 200);
+      assert.equal(root.headers.get('content-type'), 'text/html; charset=utf-8');
+      assert.equal(await root.text(), '<main>read-only web</main>');
+
+      const spaRoute = await fetch(`${isolated.baseUrl}/rooms/example`);
+      assert.equal(await spaRoute.text(), '<main>read-only web</main>');
+
+      const asset = await fetch(`${isolated.baseUrl}/assets/app.js`);
+      assert.equal(asset.headers.get('content-type'), 'application/javascript; charset=utf-8');
+      assert.equal(await asset.text(), 'globalThis.loaded = true;');
+    } finally {
+      await isolated.server.shutdown();
+      await rm(frontendDist, { recursive: true, force: true });
+    }
+  });
+
   it('does not expose guest sessions when development authentication is disabled', async () => {
     const previousNodeEnv = process.env.NODE_ENV;
     process.env.NODE_ENV = 'production';
@@ -213,55 +245,20 @@ describe('local group chat REST loop', () => {
     }
   });
 
-  it('registers one user idempotently and returns a valid replacement token on replay', async () => {
+  it('rejects the retired display-name-only Web registration contract', async () => {
     const isolated = await startIsolatedServer({
       publicRegistration: true,
       logger: { warn() {}, error() {} },
     });
     try {
-      const missingKey = await jsonAt(
+      const result = await jsonAt(
         isolated.baseUrl,
         '/v1/auth/register',
         'POST',
-        { displayName: 'Missing Registration Key' },
+        { displayName: 'Legacy Registration User' },
       );
-      const headers = { 'Idempotency-Key': 'registration-idempotency-1' };
-      const first = await jsonAt(
-        isolated.baseUrl,
-        '/v1/auth/register',
-        'POST',
-        { displayName: 'Registration User' },
-        headers,
-      );
-      const replay = await jsonAt(
-        isolated.baseUrl,
-        '/v1/auth/register',
-        'POST',
-        { displayName: 'Registration User' },
-        headers,
-      );
-      const conflict = await jsonAt(
-        isolated.baseUrl,
-        '/v1/auth/register',
-        'POST',
-        { displayName: 'Different Registration User' },
-        headers,
-      );
-      const me = await requestAt(isolated.baseUrl, '/v1/me', {
-        headers: { Authorization: `Bearer ${replay.body.token}` },
-      });
-
-      assert.equal(missingKey.response.status, 400);
-      assert.equal(missingKey.body.error.code, 'invalid_request');
-      assert.equal(first.response.status, 201);
-      assert.equal(replay.response.status, 201);
-      assert.equal(replay.body.userId, first.body.userId);
-      assert.notEqual(replay.body.token, first.body.token);
-      assert.equal(conflict.response.status, 409);
-      assert.equal(conflict.body.error.code, 'idempotency_conflict');
-      assert.equal(me.response.status, 200);
-      assert.equal(me.body.userId, first.body.userId);
-      assert.equal(me.body.displayName, 'Registration User');
+      assert.equal(result.response.status, 400);
+      assert.equal(result.body.error.code, 'invalid_request');
     } finally {
       await isolated.server.shutdown();
     }
@@ -280,11 +277,10 @@ describe('local group chat REST loop', () => {
           'POST',
           { displayName: `Untrusted Proxy User ${index}` },
           {
-            'Idempotency-Key': `untrusted-proxy-registration-${index}`,
             'X-Forwarded-For': `203.0.113.${index + 1}`,
           },
         );
-        assert.equal(result.response.status, index < 10 ? 201 : 429);
+        assert.equal(result.response.status, index < 10 ? 400 : 429);
       }
     } finally {
       await untrusted.server.shutdown();
@@ -303,18 +299,17 @@ describe('local group chat REST loop', () => {
           'POST',
           { displayName: `Trusted Proxy User ${index}` },
           {
-            'Idempotency-Key': `trusted-proxy-registration-${index}`,
             'X-Forwarded-For': `198.51.100.${index + 1}`,
           },
         );
-        assert.equal(result.response.status, 201);
+        assert.equal(result.response.status, 400);
       }
     } finally {
       await trusted.server.shutdown();
     }
   });
 
-  it('keeps guest identity stable and rejects normalized duplicate nicknames', async () => {
+  it('keeps guest identity stable and allows duplicate display names', async () => {
     const first = await json('/__dev/guest-session', 'POST', {
       deviceId: 'device-delta',
       displayName: 'Delta',
@@ -338,8 +333,8 @@ describe('local group chat REST loop', () => {
 
     assert.equal(first.response.status, 200);
     assert.equal(resumed.body.user.userId, first.body.user.userId);
-    assert.equal(duplicate.response.status, 409);
-    assert.equal(duplicate.body.error.code, 'conflict');
+    assert.equal(duplicate.response.status, 200);
+    assert.notEqual(duplicate.body.user.userId, first.body.user.userId);
     assert.equal(renamed.body.user.userId, first.body.user.userId);
     assert.equal(renamed.body.user.profileRevision, 2);
     assert.equal(released.response.status, 200);
@@ -507,6 +502,81 @@ describe('local group chat REST loop', () => {
     assert.equal(visible.body.items.length, 1);
     assert.equal(visible.body.items[0].seq, 2);
     assert.equal(visible.body.highWaterSeq, 2);
+  });
+
+  it('loads the latest 100 messages backwards and keeps Web read state independent', async () => {
+    const store = new MemoryGroupChatStore();
+    const session = await store.createGuestSession({
+      deviceId: 'web-history-pagination-device',
+      displayName: 'History Reader',
+    });
+    const room = await store.createRoom({
+      userId: session.user.userId,
+      title: 'History pagination room',
+      key: 'web-history-room',
+      requestFingerprint: 'web-history-room-fingerprint',
+    });
+    for (let index = 1; index <= 105; index += 1) {
+      await store.createHumanMessage({
+        user: session.user,
+        roomId: room.body.id,
+        clientMessageId: `web-history-message-${index}`,
+        text: `Message ${index}`,
+        mentions: [],
+        replyToMessageId: null,
+        key: `web-history-message-${index}`,
+        requestFingerprint: `web-history-message-${index}-fingerprint`,
+      });
+    }
+
+    const isolated = await startIsolatedServer({
+      store,
+      logger: { warn() {}, error() {} },
+    });
+    try {
+      const auth = { Authorization: `Bearer ${session.accessToken}` };
+      const latest = await requestAt(
+        isolated.baseUrl,
+        `/v1/rooms/${room.body.id}/messages`,
+        { headers: auth },
+      );
+      assert.equal(latest.response.status, 200);
+      assert.equal(latest.body.items.length, 100);
+      assert.deepEqual(
+        [latest.body.items[0].seq, latest.body.items.at(-1).seq],
+        [6, 105],
+      );
+      assert.equal(latest.body.hasMore, true);
+
+      const older = await requestAt(
+        isolated.baseUrl,
+        `/v1/rooms/${room.body.id}/messages?beforeSeq=${latest.body.nextBeforeSeq}`,
+        { headers: auth },
+      );
+      assert.deepEqual(older.body.items.map((message) => message.seq), [1, 2, 3, 4, 5]);
+      assert.equal(older.body.hasMore, false);
+
+      const unreadRooms = await requestAt(isolated.baseUrl, '/v1/rooms', { headers: auth });
+      assert.equal(unreadRooms.body.items[0].unreadCount, 105);
+      const marked = await requestAt(
+        isolated.baseUrl,
+        `/v1/rooms/${room.body.id}/read`,
+        {
+          method: 'PUT',
+          headers: { ...auth, 'content-type': 'application/json' },
+          body: JSON.stringify({ readSeq: 105 }),
+        },
+      );
+      assert.equal(marked.body.webReadSeq, 105);
+      assert.equal(
+        (await store.getMembership({ userId: session.user.userId, roomId: room.body.id })).readSeq,
+        0,
+      );
+      const readRooms = await requestAt(isolated.baseUrl, '/v1/rooms', { headers: auth });
+      assert.equal(readRooms.body.items[0].unreadCount, 0);
+    } finally {
+      await isolated.server.shutdown();
+    }
   });
 
   it('authenticates realtime connections and broadcasts each new message once', async () => {
@@ -712,6 +782,161 @@ describe('local group chat REST loop', () => {
     });
     assert.equal(mine.response.status, 200);
     assert.equal(typeof mine.body.readSeq, 'number');
+  });
+
+  it('stores authenticated avatar resources and applies owned avatars to profiles', async () => {
+    const auth = { Authorization: `Bearer ${users.alice.accessToken}` };
+    const content = Buffer.from([0x89, 0x50, 0x4e, 0x47]);
+    const uploadResponse = await fetch(`${baseUrl}/v1/profile-resources`, {
+      method: 'POST',
+      headers: { ...auth, 'content-type': 'image/png' },
+      body: content,
+    });
+    const uploaded = await uploadResponse.json();
+    assert.equal(uploadResponse.status, 201);
+    assert.equal(uploaded.mimeType, 'image/png');
+    assert.equal(uploaded.byteSize, content.length);
+
+    const unauthenticated = await fetch(
+      `${baseUrl}/v1/profile-resources/${uploaded.id}`,
+    );
+    assert.equal(unauthenticated.status, 401);
+    const download = await fetch(`${baseUrl}/v1/profile-resources/${uploaded.id}`, {
+      headers: { Authorization: `Bearer ${users.bob.accessToken}` },
+    });
+    assert.equal(download.status, 200);
+    assert.equal(download.headers.get('content-type'), 'image/png');
+    assert.deepEqual(Buffer.from(await download.arrayBuffer()), content);
+
+    const before = await request('/v1/me', { headers: auth });
+    const updated = await json('/v1/me', 'PATCH', {
+      expectedProfileRevision: before.body.profileRevision,
+      avatarResourceId: uploaded.id,
+    }, {
+      ...auth,
+      'Operation-Id': 'user-avatar-update-alice',
+    });
+    assert.equal(updated.response.status, 200);
+    assert.equal(updated.body.avatarResourceId, uploaded.id);
+
+    const agent = await json('/v1/agent-profiles', 'POST', {
+      displayName: 'Alice Avatar Assistant',
+      avatarResourceId: uploaded.id,
+      shortBio: '',
+    }, {
+      ...auth,
+      'Idempotency-Key': 'agent-profile-owned-avatar',
+    });
+    assert.equal(agent.response.status, 201);
+    assert.equal(agent.body.avatarResourceId, uploaded.id);
+    const profiles = await request('/v1/agent-profiles', { headers: auth });
+    assert.ok(profiles.body.items.some((profile) => profile.id === agent.body.id));
+
+    const foreignUse = await json('/v1/agent-profiles', 'POST', {
+      displayName: 'Foreign Avatar Assistant',
+      avatarResourceId: uploaded.id,
+      shortBio: '',
+    }, {
+      Authorization: `Bearer ${users.bob.accessToken}`,
+      'Idempotency-Key': 'agent-profile-foreign-avatar',
+    });
+    assert.equal(foreignUse.response.status, 403);
+    assert.equal(foreignUse.body.error.code, 'forbidden');
+
+    const unsupported = await fetch(`${baseUrl}/v1/profile-resources`, {
+      method: 'POST',
+      headers: { ...auth, 'content-type': 'image/gif' },
+      body: content,
+    });
+    assert.equal(unsupported.status, 415);
+    const oversized = await fetch(`${baseUrl}/v1/profile-resources`, {
+      method: 'POST',
+      headers: { ...auth, 'content-type': 'image/webp' },
+      body: Buffer.alloc(2 * 1024 * 1024 + 1),
+    });
+    assert.equal(oversized.status, 413);
+  });
+
+  it('pushes profile updates to the owner and users in shared rooms', async () => {
+    const aliceAuth = { Authorization: `Bearer ${users.alice.accessToken}` };
+    const room = await json('/v1/rooms', 'POST', {
+      title: 'Profile update recipients',
+    }, {
+      ...aliceAuth,
+      'Idempotency-Key': 'profile-update-room',
+    });
+    const invite = await json(`/v1/rooms/${room.body.id}/invites`, 'POST', {
+      expectedRoomRevision: room.body.revision,
+      expiresAt: new Date(Date.now() + 60 * 60 * 1000).toISOString(),
+      maxUses: 1,
+    }, {
+      ...aliceAuth,
+      'Idempotency-Key': 'profile-update-invite',
+    });
+    await json('/v1/invites/accept', 'POST', {
+      inviteToken: invite.body.inviteToken,
+    }, {
+      Authorization: `Bearer ${users.bob.accessToken}`,
+      'Operation-Id': 'profile-update-join-bob',
+    });
+
+    const aliceSocket = await openRealtime(users.alice.accessToken);
+    const bobSocket = await openRealtime(users.bob.accessToken);
+    try {
+      const aliceEvent = waitForRealtimeEvent(aliceSocket, 'profile.updated');
+      const bobEvent = waitForRealtimeEvent(bobSocket, 'profile.updated');
+      const me = await request('/v1/me', { headers: aliceAuth });
+      const updated = await json('/v1/me', 'PATCH', {
+        expectedProfileRevision: me.body.profileRevision,
+        displayName: me.body.displayName,
+      }, {
+        ...aliceAuth,
+        'Operation-Id': 'profile-update-realtime',
+      });
+      assert.equal(updated.response.status, 200);
+      for (const event of await Promise.all([aliceEvent, bobEvent])) {
+        assert.equal(event.payload.profileType, 'human');
+        assert.equal(event.payload.ownerUserId, users.alice.user.userId);
+        assert.deepEqual(event.payload.profile, updated.body);
+      }
+    } finally {
+      await Promise.all([closeRealtime(aliceSocket), closeRealtime(bobSocket)]);
+    }
+  });
+
+  it('creates, lists, and revokes independent MCP device tokens', async () => {
+    const auth = { Authorization: `Bearer ${users.alice.accessToken}` };
+    const created = await json('/v1/me/devices', 'POST', {
+      label: 'Settings-created MCP device',
+    }, auth);
+    assert.equal(created.response.status, 201);
+    assert.match(created.body.token, /^ct_/);
+    assert.match(created.body.mcpUrl, /\/mcp\?token=/);
+
+    const me = await request('/v1/me', {
+      headers: { Authorization: `Bearer ${created.body.token}` },
+    });
+    assert.equal(me.response.status, 200);
+    assert.equal(me.body.userId, users.alice.user.userId);
+    const urlTokenRejected = await request(
+      `/v1/me?token=${encodeURIComponent(created.body.token)}`,
+    );
+    assert.equal(urlTokenRejected.response.status, 401);
+
+    const devices = await request('/v1/me/devices', { headers: auth });
+    assert.equal(
+      devices.body.items.find((device) => device.deviceId === created.body.deviceId).active,
+      true,
+    );
+    const revoked = await request(`/v1/me/devices/${created.body.deviceId}`, {
+      method: 'DELETE',
+      headers: auth,
+    });
+    assert.equal(revoked.response.status, 204);
+    const afterRevoke = await request('/v1/me', {
+      headers: { Authorization: `Bearer ${created.body.token}` },
+    });
+    assert.equal(afterRevoke.response.status, 401);
   });
 
   it('keeps agent profiles public while restricting mutations to the owner', async () => {

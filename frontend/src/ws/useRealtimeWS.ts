@@ -1,5 +1,4 @@
 import { useEffect, useRef, useCallback } from 'react';
-import { getToken } from '../api/client';
 import type { WsEvent } from '../types';
 
 type WsStatus = 'connecting' | 'open' | 'reconnecting' | 'closed';
@@ -21,12 +20,9 @@ export function useRealtimeWS(
   onStatusChangeRef.current = onStatusChange;
 
   const connect = useCallback(() => {
-    const token = getToken();
-    if (!token) return;
-
     onStatusChangeRef.current('connecting');
     const protocol = location.protocol === 'https:' ? 'wss:' : 'ws:';
-    const wsUrl = `${protocol}//${location.host}/v1/realtime?token=${encodeURIComponent(token)}`;
+    const wsUrl = `${protocol}//${location.host}/v1/realtime`;
     const ws = new WebSocket(wsUrl);
 
     ws.onopen = () => {
