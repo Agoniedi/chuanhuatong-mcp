@@ -150,12 +150,13 @@ const messageSchema = z.object({
   content: z.object({
     schemaVersion: z.literal(1),
     type: z.literal('text'),
-    text: z.string().min(1).max(32768),
+    text: z.string().max(32768),
   }).strict(),
   mentions: z.array(mentionSchema),
   replyToMessageId: idSchema.nullable(),
   generationRequestId: idSchema.optional(),
   triggerThroughSeq: z.number().int().nonnegative().optional(),
+  recalledAt: timestampSchema.nullable(),
   createdAt: timestampSchema,
 }).strict();
 
@@ -382,6 +383,7 @@ function toMcpMessage(message) {
   return {
     senderType: message.sender.kind,
     senderDisplayName: message.sender.displayNameSnapshot,
+    recalledAt: message.recalledAt ?? null,
     ...message,
   };
 }
@@ -747,7 +749,7 @@ export function createGroupChatMcpServer({
   }), logger));
 
   server.registerTool('group_read_messages', {
-    description: 'Read one bounded page of visible room messages after a sequence cursor. senderType is the authoritative human-or-agent identity; never infer sender type from the display name. Use nextSeq in a later user-initiated turn. If messages is empty, stop the current assistant turn instead of polling again.',
+    description: 'Read one bounded page of visible room messages after a sequence cursor. senderType is the authoritative human-or-agent identity; never infer sender type from the display name. recalledAt is null for normal messages and an ISO timestamp for recalled messages, whose text is empty. Use nextSeq in a later user-initiated turn. If messages is empty, stop the current assistant turn instead of polling again.',
     inputSchema: z.object({
       roomId: idSchema,
       afterSeq: z.number().int().min(0).max(Number.MAX_SAFE_INTEGER),
@@ -766,7 +768,7 @@ export function createGroupChatMcpServer({
   }, logger));
 
   server.registerTool('group_wait_for_messages', {
-    description: 'Perform one bounded long-poll for visible room messages. senderType is the authoritative human-or-agent identity; never infer sender type from the display name. Call at most once per assistant turn. Standard MCP tool calls cannot monitor indefinitely: when messages is empty, stop the current assistant turn and do not call this tool again in the same turn.',
+    description: 'Perform one bounded long-poll for visible room messages. senderType is the authoritative human-or-agent identity; never infer sender type from the display name. recalledAt is null for normal messages and an ISO timestamp for recalled messages, whose text is empty. Call at most once per assistant turn. Standard MCP tool calls cannot monitor indefinitely: when messages is empty, stop the current assistant turn and do not call this tool again in the same turn.',
     inputSchema: z.object({
       roomId: idSchema,
       afterSeq: z.number().int().min(0).max(Number.MAX_SAFE_INTEGER),
@@ -787,7 +789,8 @@ export function createGroupChatMcpServer({
     description: 'Long-poll for room messages with extended timeout. ' +
       'Call after group_send_message to wait for replies. ' +
       'Polls every 2s for up to 60s. Returns immediately when new messages arrive. ' +
-      'senderType is the authoritative human-or-agent identity; never infer sender type from the display name.',
+      'senderType is the authoritative human-or-agent identity; never infer sender type from the display name. ' +
+      'recalledAt is null for normal messages and an ISO timestamp for recalled messages, whose text is empty.',
     inputSchema: z.object({
       roomId: idSchema,
       afterSeq: z.number().int().min(0).max(Number.MAX_SAFE_INTEGER),
@@ -972,7 +975,7 @@ export function createGroupChatMcpServer({
   }, logger));
 
   server.registerTool('group_publish_agent_reply', {
-    description: 'Publish exactly one AI agent message in response to selected visible room messages. For a new binding, triggerScope defaults to allMessages. For an existing binding, omit triggerScope to preserve its policy, or explicitly set allMessages when replying to a human or agent room message; choose allHumanMessages or mentionsOnly for stricter automatic participation. Each agent may answer the same trigger message set only once, and the server stops a run of 20 consecutive AI messages. For the first reply in a room, include publicProfile to configure and activate the agent in this same call; omit it after the binding exists, and reuse the exact value only for an idempotent retry after a lost response. This tool updates an explicitly requested trigger scope and automatically recovers the existing room-agent runtime, so do not call group_activate_agent or group_heartbeat_agent before it. Use this, not group_send_message, when speaking as the AI agent. After success, obey nextAction=stop_current_turn: stop the current assistant turn without reading or publishing again.',
+    description: 'Publish exactly one AI agent message in response to selected visible room messages. For a new binding, triggerScope defaults to allMessages. For an existing binding, omit triggerScope to preserve its policy, or explicitly set allMessages when replying to a human or agent room message; choose allHumanMessages or mentionsOnly for stricter automatic participation. triggerMessageIds must contain at least one visible message ID. Reuse the same triggerBatchId only to retry an interrupted call; for a later reply, generate a new triggerBatchId and use the message ID from the newest read or poll result. The server stops a run of 20 consecutive AI messages. For the first reply in a room, include publicProfile to configure and activate the agent in this same call; omit it after the binding exists, and reuse the exact value only for an idempotent retry after a lost response. This tool updates an explicitly requested trigger scope and automatically recovers the existing room-agent runtime, so do not call group_activate_agent or group_heartbeat_agent before it. Use this, not group_send_message, when speaking as the AI agent. After success, obey nextAction=stop_current_turn: stop the current assistant turn without reading or publishing again.',
     inputSchema: z.object({
       roomId: idSchema,
       triggerBatchId: idSchema,

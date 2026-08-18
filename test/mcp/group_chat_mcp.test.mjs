@@ -700,6 +700,39 @@ describe('stateless Group Chat MCP read loop', () => {
     assert.equal(empty.body.result.structuredContent.nextSeq, 3);
   });
 
+  it('returns recalled messages through every MCP read tool', async () => {
+    const room = (await callTool('group_create_room', {
+      clientRequestId: 'mcp-recalled-message-room',
+      title: 'MCP recalled message room',
+    })).body.result.structuredContent;
+    const sent = await callTool('group_send_message', {
+      roomId: room.id,
+      clientMessageId: 'mcp-recalled-message-source',
+      text: 'This message will be recalled.',
+    });
+    const message = sent.body.result.structuredContent;
+    const recalled = await json(
+      `/v1/rooms/${room.id}/messages/${message.id}/recall`,
+      'POST',
+      {},
+      { Authorization: `Bearer ${users.alice.accessToken}` },
+    );
+    assert.equal(recalled.response.status, 200);
+
+    for (const [toolName, args] of [
+      ['group_read_messages', { roomId: room.id, afterSeq: 0, limit: 10 }],
+      ['group_wait_for_messages', { roomId: room.id, afterSeq: 0, timeoutMs: 0 }],
+      ['group_poll_messages', { roomId: room.id, afterSeq: 0, timeoutMs: 0 }],
+    ]) {
+      const result = await callTool(toolName, args);
+      assert.equal(result.body.result.isError, undefined);
+      const recalledMessage = result.body.result.structuredContent.messages[0];
+      assert.equal(recalledMessage.id, message.id);
+      assert.equal(recalledMessage.content.text, '');
+      assert.equal(typeof recalledMessage.recalledAt, 'string');
+    }
+  });
+
   it('changes the authenticated human display name through MCP', async () => {
     const session = await json('/__dev/guest-session', 'POST', {
       deviceId: 'mcp-device-profile-update',
@@ -1662,18 +1695,14 @@ describe('stateless Group Chat MCP read loop', () => {
     });
     assert.equal(agentTriggered.body.result.isError, undefined);
 
-    const duplicateTrigger = await callTool('group_publish_agent_reply', {
+    const followUp = await callTool('group_publish_agent_reply', {
       roomId: room.id,
       triggerBatchId: 'mcp-duplicate-agent-trigger-batch',
       triggerMessageIds: [firstReply.body.result.structuredContent.message.id],
       clientMessageId: 'mcp-duplicate-agent-trigger-reply',
-      text: 'Do not answer the same trigger twice.',
+      text: 'A later turn can add a follow-up to the same message.',
     });
-    assert.equal(duplicateTrigger.body.result.isError, true);
-    assert.equal(
-      JSON.parse(duplicateTrigger.body.result.content[0].text).error.code,
-      'agent_loop_limit_reached',
-    );
+    assert.equal(followUp.body.result.isError, undefined);
 
     const strictHumanOnly = await callTool('group_publish_agent_reply', {
       roomId: room.id,

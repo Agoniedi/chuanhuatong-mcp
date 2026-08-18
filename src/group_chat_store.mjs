@@ -1748,22 +1748,6 @@ export class MemoryGroupChatStore {
       triggers,
       humanTriggersOnly,
     });
-    if (
-      binding.triggerScope === 'allMessages' &&
-      [...this.generationRequests.values()].some(
-        (request) =>
-          request.bindingId === binding.id &&
-          request.source === 'automatic' &&
-          request.status === 'published' &&
-          JSON.stringify(request.triggerMessageIds) === JSON.stringify(triggerMessageIds),
-      )
-    ) {
-      throw new HttpError(
-        409,
-        'agent_loop_limit_reached',
-        'Agent reply already published for this trigger batch',
-      );
-    }
     const triggerSequences = triggers.map((message) => message.seq);
     const now = this.clock().toISOString();
     const request = {
@@ -2122,24 +2106,6 @@ export class MemoryGroupChatStore {
       )
     ) {
       throw new HttpError(409, 'conflict', 'Client message ID is already in use');
-    }
-    if (
-      binding.triggerScope === 'allMessages' &&
-      [...this.generationRequests.values()].some(
-        (candidate) =>
-          candidate.id !== request.id &&
-          candidate.bindingId === binding.id &&
-          candidate.source === 'automatic' &&
-          candidate.status === 'published' &&
-          JSON.stringify(candidate.triggerMessageIds) ===
-            JSON.stringify(request.triggerMessageIds),
-      )
-    ) {
-      throw new HttpError(
-        409,
-        'agent_loop_limit_reached',
-        'Agent reply already published for this trigger batch',
-      );
     }
     if (precedingHumanMessage === null) {
       requireAgentLoopCapacity({
@@ -5074,22 +5040,6 @@ export class PostgresGroupChatStore {
         triggers: triggerResult.rows,
         humanTriggersOnly,
       });
-      if (binding.trigger_scope === 'allMessages') {
-        const duplicate = await client.query(
-          `SELECT 1 FROM generation_requests
-            WHERE binding_id = $1 AND source = 'automatic' AND status = 'published'
-              AND trigger_message_ids = $2::jsonb
-            LIMIT 1`,
-          [binding.id, JSON.stringify(triggerMessageIds)],
-        );
-        if (duplicate.rowCount > 0) {
-          throw new HttpError(
-            409,
-            'agent_loop_limit_reached',
-            'Agent reply already published for this trigger batch',
-          );
-        }
-      }
       const bindingPolicyRevision = safeInteger(
         binding.policy_revision,
         'room_agent_bindings.policy_revision',
@@ -5557,22 +5507,6 @@ export class PostgresGroupChatStore {
       );
       if (existing.rowCount > 0) {
         throw new HttpError(409, 'conflict', 'Generation or client message is already published');
-      }
-      if (binding.trigger_scope === 'allMessages') {
-        const duplicateTrigger = await client.query(
-          `SELECT 1 FROM generation_requests
-            WHERE id <> $1 AND binding_id = $2 AND source = 'automatic'
-              AND status = 'published' AND trigger_message_ids = $3::jsonb
-            LIMIT 1`,
-          [request.id, binding.id, JSON.stringify(snapshot.triggerMessageIds)],
-        );
-        if (duplicateTrigger.rowCount > 0) {
-          throw new HttpError(
-            409,
-            'agent_loop_limit_reached',
-            'Agent reply already published for this trigger batch',
-          );
-        }
       }
       if (precedingHumanMessage === null) {
         const loopState = await client.query(
