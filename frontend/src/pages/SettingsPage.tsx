@@ -175,6 +175,9 @@ export default function SettingsPage() {
   };
 
   const deactivate = async (deviceId: string) => {
+    if (!window.confirm('停用后，这台 MCP 设备当前的 Token 会立即永久失效，且无法恢复。确定停用吗？')) {
+      return;
+    }
     setError(null);
     try {
       await revokeDevice(deviceId);

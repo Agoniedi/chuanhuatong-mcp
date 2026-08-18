@@ -181,6 +181,23 @@ test('logs in, sends a message, and keeps room administration restricted', async
   expect(await page.locator('html').evaluate(element =>
     element.style.getPropertyValue('--bubble-self-top'))).toBe('#12abef');
 
+  const e2eDevice = page.locator('.device-row').filter({ hasText: 'E2E MCP device' });
+  let deviceRevocationRequested = false;
+  page.on('request', request => {
+    if (request.method() === 'DELETE' && /\/v1\/me\/devices\/[^/]+$/.test(request.url())) {
+      deviceRevocationRequested = true;
+    }
+  });
+  page.once('dialog', dialog => dialog.dismiss());
+  await e2eDevice.getByRole('button', { name: '停用', exact: true }).click();
+  await page.waitForTimeout(100);
+  expect(deviceRevocationRequested).toBe(false);
+  page.once('dialog', dialog => dialog.accept());
+  const revokedDevice = page.waitForResponse(response =>
+    response.request().method() === 'DELETE' && /\/v1\/me\/devices\/[^/]+$/.test(response.url()));
+  await e2eDevice.getByRole('button', { name: '停用', exact: true }).click();
+  expect((await revokedDevice).status()).toBe(204);
+
   await page.getByLabel('聊天背景图').setInputFiles({
     name: 'background.png',
     mimeType: 'image/png',
