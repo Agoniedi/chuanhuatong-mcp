@@ -402,6 +402,12 @@ function isAllowedWebMutation(method, path) {
     '/v1/me/devices',
     '/v1/agent-profiles',
   ].includes(path)) return true;
+  if (method === 'POST' && /^\/v1\/rooms\/[^/]+\/messages$/.test(path)) return true;
+  if (method === 'POST' && /^\/v1\/rooms\/[^/]+\/messages\/[^/]+\/recall$/.test(path)) {
+    return true;
+  }
+  if (method === 'DELETE' && /^\/v1\/rooms\/[^/]+$/.test(path)) return true;
+  if (method === 'PUT' && /^\/v1\/rooms\/[^/]+\/world$/.test(path)) return true;
   if (method === 'PATCH' && path === '/v1/me') return true;
   if (method === 'PATCH' && /^\/v1\/agent-profiles\/[^/]+$/.test(path)) return true;
   if (method === 'DELETE' && /^\/v1\/me\/devices\/[^/]+$/.test(path)) return true;
@@ -543,12 +549,16 @@ function attachRealtimeServer(server, store, logger, pollIntervalMs) {
         const entries = await store.listPendingOutboxEvents();
         for (const entry of entries) {
           const event = entry.event;
+          let publicEvent = event;
           let recipientUserIds = [];
-          if (event.type === 'message.created' && event.roomId) {
+          if (['message.created', 'message.recalled'].includes(event.type) && event.roomId) {
             recipientUserIds = await store.listRealtimeRecipientUserIds(
               event.roomId,
               event.payload.seq,
             );
+          } else if (event.type === 'room.deleted') {
+            recipientUserIds = event.payload.recipientUserIds;
+            publicEvent = { ...event, payload: { roomId: event.roomId } };
           } else if (event.type === 'profile.updated') {
             recipientUserIds = await store.listProfileRecipientUserIds(
               event.payload.ownerUserId,
@@ -564,7 +574,7 @@ function attachRealtimeServer(server, store, logger, pollIntervalMs) {
                 socket.close(1008, 'Session revoked');
                 continue;
               }
-              sendRealtimeEvent(socket, event);
+              sendRealtimeEvent(socket, publicEvent);
             }
           }
           await store.markOutboxDispatched(entry.outboxId);
@@ -1074,6 +1084,19 @@ async function handleRequest(
     return;
   }
 
+  if (request.method === 'GET' && path === '/v1/world/rooms') {
+    write(200, { items: await store.listWorldRooms() });
+    return;
+  }
+
+  const worldRoomDetailMatch = path.match(/^\/v1\/world\/rooms\/([^/]+)$/);
+  if (request.method === 'GET' && worldRoomDetailMatch) {
+    write(200, await store.getWorldRoom({
+      roomId: parsePathSegment(worldRoomDetailMatch[1]),
+    }));
+    return;
+  }
+
   if (request.method === 'POST' && path === '/v1/rooms') {
     const body = await readJson(request);
     const key = assertString(request.headers['idempotency-key'], 'Idempotency-Key');
@@ -1090,11 +1113,38 @@ async function handleRequest(
   }
 
   const roomMatch = path.match(/^\/v1\/rooms\/([^/]+)$/);
-  if (request.method === 'GET' && roomMatch) {
-    write(200, await store.getRoom({
+  if (roomMatch) {
+    const roomId = parsePathSegment(roomMatch[1]);
+    if (request.method === 'GET') {
+      write(200, await store.getRoom({ userId: user.userId, roomId }));
+      return;
+    }
+    if (request.method === 'DELETE') {
+      await store.deleteRoom({ userId: user.userId, roomId });
+      wakeOutbox();
+      write(204);
+      return;
+    }
+  }
+
+  const worldRoomMatch = path.match(/^\/v1\/rooms\/([^/]+)\/world$/);
+  if (request.method === 'PUT' && worldRoomMatch) {
+    const body = await readJson(request);
+    const key = assertString(request.headers['operation-id'], 'Operation-Id');
+    assertFields(body, ['published', 'summary'], ['published']);
+    if (typeof body.published !== 'boolean') {
+      throw new HttpError(400, 'invalid_request', 'published must be a boolean');
+    }
+    const summary = body.summary === undefined
+      ? ''
+      : assertString(body.summary, 'summary', 0, 300);
+    const result = await store.updateWorldRoom({
       userId: user.userId,
-      roomId: parsePathSegment(roomMatch[1]),
-    }));
+      roomId: parsePathSegment(worldRoomMatch[1]),
+      published: body.published,
+      summary,
+    });
+    write(200, result);
     return;
   }
 
@@ -1707,6 +1757,22 @@ async function handleRequest(
       write(result.status, result.body);
       return;
     }
+  }
+
+  const recallMessageMatch = path.match(
+    /^\/v1\/rooms\/([^/]+)\/messages\/([^/]+)\/recall$/,
+  );
+  if (request.method === 'POST' && recallMessageMatch) {
+    const body = await readJson(request);
+    assertFields(body, [], []);
+    const message = await store.recallMessage({
+      userId: user.userId,
+      roomId: parsePathSegment(recallMessageMatch[1]),
+      messageId: parsePathSegment(recallMessageMatch[2]),
+    });
+    wakeOutbox();
+    write(200, message);
+    return;
   }
 
   throw new HttpError(404, 'resource_not_found', 'Route not found');

@@ -29,7 +29,7 @@ test.beforeAll(async () => {
   const owner = await store.authenticate(registration.token);
   const room = await store.createRoom({
     userId: owner.userId,
-    title: '只读验收房间',
+    title: '聊天验收房间',
     key: 'e2e-room',
     requestFingerprint: 'e2e-room-fingerprint',
   });
@@ -92,14 +92,14 @@ test.afterAll(async () => {
   await server.shutdown();
 });
 
-test('logs in and keeps the room observer strictly read-only', async ({ page }) => {
+test('logs in, sends a message, and keeps room administration restricted', async ({ page }) => {
   await page.goto(`${baseUrl}/auth`);
   await expect(page.locator('.brand-mark')).toHaveCount(0);
   await page.getByLabel('用户名', { exact: true }).fill('e2e_reader');
   await page.getByLabel('密码', { exact: true }).fill('secret6');
   await page.getByRole('button', { name: '登录', exact: true }).last().click();
 
-  const room = page.getByRole('button', { name: /只读验收房间/ });
+  const room = page.getByRole('button', { name: /聊天验收房间/ });
   await expect(room).toContainText('2');
   const markedRead = page.waitForResponse(response =>
     response.request().method() === 'PUT' && response.url().endsWith('/read'));
@@ -120,15 +120,34 @@ test('logs in and keeps the room observer strictly read-only', async ({ page }) 
     getComputedStyle(element).borderRadius)).toBe('30%');
   expect(await page.locator('html').evaluate(element =>
     getComputedStyle(element).getPropertyValue('--bubble-self-top').trim())).toBe('#55789c');
-  await expect(page.locator('.readonly-bar')).toHaveCount(0);
-  await expect(page.locator('.send-bar')).toHaveCount(0);
-  await expect(page.getByRole('button', { name: /发送|邀请|创建房间/ })).toHaveCount(0);
+  const messageInput = page.getByRole('textbox', { name: '消息' });
+  await expect(messageInput).toBeVisible();
+  await expect(page.getByRole('button', { name: '发送', exact: true })).toBeDisabled();
+  await messageInput.fill('来自网页的新消息');
+  const sentResponse = page.waitForResponse(response =>
+    response.request().method() === 'POST' && response.url().endsWith('/messages'));
+  await messageInput.press('Enter');
+  expect((await sentResponse).status()).toBe(201);
+  const sentMessage = page.getByRole('article').filter({ hasText: '来自网页的新消息' });
+  await expect(sentMessage).toBeVisible();
+  await expect(messageInput).toHaveValue('');
+  const recalledResponse = page.waitForResponse(response =>
+    response.request().method() === 'POST' && response.url().endsWith('/recall'));
+  const sentBubble = sentMessage.locator('.msg-bubble');
+  await sentBubble.dispatchEvent('pointerdown', { button: 0, clientX: 20, clientY: 20 });
+  await page.waitForTimeout(550);
+  await sentBubble.dispatchEvent('pointerup', { button: 0, clientX: 20, clientY: 20 });
+  await page.getByRole('menuitem', { name: '撤回', exact: true }).click();
+  expect((await recalledResponse).status()).toBe(200);
+  await expect(page.getByText('来自网页的新消息')).toHaveCount(0);
+  const recalledMessage = page.getByRole('article').filter({ hasText: '消息已撤回' });
+  await expect(recalledMessage).toBeVisible();
 
   await page.setViewportSize({ width: 390, height: 844 });
   await page.emulateMedia({ reducedMotion: 'reduce' });
   expect((await page.locator('.room-header').boundingBox())!.height).toBeLessThanOrEqual(44);
-  const ownAvatarBox = await ownMessage.locator('.avatar-human').boundingBox();
-  const ownBubbleBox = await ownMessage.locator('.msg-bubble').boundingBox();
+  const ownAvatarBox = await recalledMessage.locator('.avatar-human').boundingBox();
+  const ownBubbleBox = await recalledMessage.locator('.msg-bubble').boundingBox();
   const otherAvatarBox = await otherMessage.locator('.avatar-human').boundingBox();
   const otherBubbleBox = await otherMessage.locator('.msg-bubble').boundingBox();
   expect(ownAvatarBox!.x).toBeGreaterThan(ownBubbleBox!.x + ownBubbleBox!.width);
@@ -150,7 +169,7 @@ test('logs in and keeps the room observer strictly read-only', async ({ page }) 
   expect((await blocked.json()).error.code).toBe('web_read_only');
 
   await page.getByRole('button', { name: '返回房间列表', exact: true }).click();
-  await expect(page.getByRole('button', { name: /只读验收房间/ })).not.toContainText('未读');
+  await expect(page.getByRole('button', { name: /聊天验收房间/ })).not.toContainText('未读');
 
   await page.getByRole('button', { name: '设置', exact: true }).click();
   const opacity = page.getByRole('slider', { name: '气泡透明度' });
@@ -174,9 +193,11 @@ test('logs in and keeps the room observer strictly read-only', async ({ page }) 
   await expect(page.locator('.background-preview')).not.toHaveClass(/empty/);
 
   await page.getByRole('button', { name: '← 返回', exact: true }).click();
-  await page.getByRole('button', { name: /只读验收房间/ }).click();
+  await page.getByRole('button', { name: /聊天验收房间/ }).click();
   await expect.poll(() => page.locator('.room-main').evaluate(element =>
     getComputedStyle(element).backgroundImage)).toContain('blob:');
+  expect(await page.getByRole('button', { name: '发送', exact: true }).evaluate(element =>
+    getComputedStyle(element).color)).toBe('color(srgb 0.0705882 0.670588 0.937255 / 0.1)');
   await page.reload();
   await expect.poll(() => page.locator('.room-main').evaluate(element =>
     getComputedStyle(element).backgroundImage)).toContain('blob:');
@@ -191,4 +212,27 @@ test('logs in and keeps the room observer strictly read-only', async ({ page }) 
   await expect(page.locator('.success-message')).toHaveText('聊天背景已移除');
   await page.getByRole('slider', { name: '气泡透明度' }).fill('100');
   await page.getByLabel('选择我的气泡颜色').fill('#55789c');
+
+  await page.getByRole('button', { name: '← 返回', exact: true }).click();
+  await page.getByRole('button', { name: '世界', exact: true }).click();
+  await expect(page.getByRole('heading', { name: '世界', exact: true })).toBeVisible();
+  await page.getByRole('button', { name: '分享到世界', exact: true }).click();
+  await page.getByLabel('房间简介').fill('用于端到端验证的公开协作房间。');
+  await page.getByRole('button', { name: '发布到世界', exact: true }).click();
+  const worldCard = page.getByRole('button', { name: /聊天验收房间/ }).first();
+  await expect(worldCard).toContainText('E2E 读者');
+  await worldCard.click();
+  await expect(page.getByRole('dialog')).toContainText('用于端到端验证的公开协作房间。');
+  await expect(page.getByRole('dialog').locator('code')).not.toHaveText('');
+  await expect(page.getByRole('dialog').getByRole('button', { name: '复制', exact: true })).toBeVisible();
+  await page.getByRole('button', { name: '关闭详情', exact: true }).click();
+  await page.getByRole('button', { name: '我的房间', exact: true }).click();
+
+  await page.getByRole('button', { name: /聊天验收房间/ }).click();
+  page.once('dialog', dialog => dialog.accept());
+  const deletedResponse = page.waitForResponse(response =>
+    response.request().method() === 'DELETE' && /\/v1\/rooms\/[^/]+$/.test(response.url()));
+  await page.getByRole('button', { name: '删除房间', exact: true }).click();
+  expect((await deletedResponse).status()).toBe(204);
+  await expect(page.getByRole('button', { name: /聊天验收房间/ })).toHaveCount(0);
 });

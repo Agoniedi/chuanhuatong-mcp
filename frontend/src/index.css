@@ -416,6 +416,103 @@ input[type="file"] { padding: 8px 12px; cursor: pointer; }
 .empty-state p:first-child { font-size: 16px; font-weight: 600; color: var(--text); margin-bottom: 6px; }
 
 /* =============================================================================
+   世界
+   ========================================================================== */
+.world-page {
+  width: min(960px, 100%);
+  margin: 0 auto;
+  padding: 0 24px 64px;
+}
+.world-header {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 16px;
+  padding: 18px 0 16px;
+  border-bottom: 1px solid var(--hairline);
+}
+.world-heading { display: flex; align-items: center; gap: 8px; min-width: 0; }
+.world-back-button { width: 40px; height: 40px; padding: 0; margin-left: -8px; }
+.world-heading h1 { font-size: 24px; font-weight: 700; letter-spacing: -0.02em; }
+.world-heading p { margin-top: 2px; color: var(--text-secondary); font-size: 13px; }
+.world-refresh-button { width: 38px; height: 38px; padding: 0; }
+.world-refresh-button:disabled { opacity: 0.45; cursor: wait; }
+.world-error {
+  margin-top: 12px;
+  padding: 9px 12px;
+  border-radius: var(--r-md);
+  background: var(--danger-tint);
+  color: var(--danger);
+  font-size: 12.5px;
+}
+.world-section { padding-top: 28px; }
+.world-manage-section { border-top: 1px solid var(--hairline); margin-top: 34px; }
+.world-section-heading { display: flex; align-items: baseline; justify-content: space-between; gap: 16px; margin-bottom: 14px; }
+.world-section-heading h2 { font-size: 16px; font-weight: 650; }
+.world-section-heading p { margin-top: 3px; color: var(--text-secondary); font-size: 13px; }
+.world-count { color: var(--text-muted); font-size: 12.5px; white-space: nowrap; }
+.world-grid { display: grid; grid-template-columns: repeat(3, minmax(0, 1fr)); gap: 12px; }
+.world-card {
+  min-width: 0;
+  min-height: 210px;
+  display: flex;
+  flex-direction: column;
+  align-items: flex-start;
+  padding: 18px;
+  border: 1px solid var(--hairline);
+  border-radius: var(--r-lg);
+  background: var(--surface);
+  color: var(--text);
+  text-align: left;
+  font: inherit;
+  cursor: pointer;
+  box-shadow: var(--shadow-xs);
+  transition: transform 0.12s ease, box-shadow 0.18s ease, border-color 0.18s ease;
+}
+.world-card:hover { transform: translateY(-1px); border-color: var(--hairline-strong); box-shadow: var(--shadow-md); }
+.world-card:active { transform: translateY(0); }
+.world-card-icon { display: grid; place-items: center; width: 36px; height: 36px; margin-bottom: 16px; border-radius: var(--r-md); background: var(--accent-tint); color: var(--accent-ink); }
+.world-card-icon svg { width: 21px; height: 21px; }
+.world-card-title { width: 100%; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; font-size: 16px; font-weight: 650; }
+.world-card-owner { width: 100%; margin-top: 4px; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; color: var(--text-secondary); font-size: 12.5px; }
+.world-card-summary { display: -webkit-box; width: 100%; margin-top: 14px; overflow: hidden; color: var(--text-secondary); font-size: 13.5px; line-height: 1.55; -webkit-box-orient: vertical; -webkit-line-clamp: 3; }
+.world-card-link { margin-top: auto; padding-top: 16px; color: var(--accent-ink); font-size: 12.5px; font-weight: 650; }
+.world-card-link span { display: inline-block; margin-left: 3px; transition: transform 0.12s ease; }
+.world-card:hover .world-card-link span { transform: translateX(2px); }
+.world-card-skeleton { min-height: 210px; background: linear-gradient(90deg, var(--surface-2) 25%, var(--surface-sunken) 50%, var(--surface-2) 75%); background-size: 200% 100%; cursor: default; }
+@media (prefers-reduced-motion: no-preference) { .world-card-skeleton { animation: skeleton-shift 1.4s ease-in-out infinite; } }
+.world-empty, .world-manage-empty { padding: 36px 20px; border: 1px dashed var(--hairline-strong); border-radius: var(--r-lg); color: var(--text-secondary); text-align: center; }
+.world-empty svg { width: 32px; height: 32px; margin-bottom: 8px; color: var(--text-muted); }
+.world-empty p { color: var(--text); font-weight: 650; }
+.world-empty span { display: block; margin-top: 4px; font-size: 13px; }
+.world-manage-list { display: flex; flex-direction: column; gap: 8px; }
+.world-manage-row { display: flex; align-items: center; justify-content: space-between; gap: 16px; padding: 14px 16px; border: 1px solid var(--hairline); border-radius: var(--r-md); background: var(--surface); }
+.world-manage-info { min-width: 0; display: flex; flex-direction: column; gap: 3px; }
+.world-manage-info strong { overflow: hidden; text-overflow: ellipsis; white-space: nowrap; font-size: 14px; font-weight: 650; }
+.world-manage-info span { color: var(--text-secondary); font-size: 12.5px; }
+.world-manage-actions { display: flex; align-items: center; flex-shrink: 0; gap: 6px; }
+.world-dialog-backdrop { position: fixed; inset: 0; z-index: 30; display: grid; place-items: center; padding: 20px; background: rgba(16, 18, 24, 0.28); }
+.world-dialog { width: min(440px, 100%); padding: 22px; border: 1px solid var(--hairline); border-radius: var(--r-lg); background: var(--surface); box-shadow: var(--shadow-lg); }
+.world-dialog-header { display: flex; align-items: flex-start; justify-content: space-between; gap: 14px; }
+.world-dialog-kicker { margin-bottom: 4px; color: var(--text-muted); font-size: 12.5px; }
+.world-dialog h2 { font-size: 20px; font-weight: 700; line-height: 1.3; }
+.world-dialog-close { width: 34px; height: 34px; padding: 0; flex-shrink: 0; font-size: 22px; line-height: 1; }
+.world-dialog-owner { margin-top: 14px; color: var(--text-secondary); font-size: 13px; }
+.world-dialog-loading { margin-top: 18px; padding: 24px 0; color: var(--text-secondary); font-size: 13px; text-align: center; }
+.world-dialog-summary { margin-top: 16px; padding: 13px 14px; border-radius: var(--r-md); background: var(--surface-2); color: var(--text-secondary); font-size: 14px; line-height: 1.6; white-space: pre-wrap; overflow-wrap: anywhere; }
+.world-invite-block { margin-top: 18px; }
+.world-invite-label { display: flex; justify-content: space-between; gap: 12px; margin-bottom: 7px; color: var(--text-secondary); font-size: 12.5px; font-weight: 650; }
+.world-invite-row { display: flex; align-items: center; gap: 8px; }
+.world-invite-row code { min-width: 0; flex: 1; overflow: auto; padding: 10px 11px; border-radius: var(--r-sm); background: var(--surface-sunken); color: var(--text); font-family: var(--mono); font-size: 12.5px; white-space: nowrap; }
+.world-invite-row .btn-secondary { flex-shrink: 0; padding-inline: 13px; }
+.world-invite-expiry { margin-top: 6px; color: var(--text-muted); font-size: 12px; }
+.world-dialog-action { margin-top: 20px; }
+.world-summary-label { display: block; margin-top: 20px; margin-bottom: 7px; color: var(--text-secondary); font-size: 13px; font-weight: 650; }
+.world-summary-input { width: 100%; min-height: 120px; padding: 11px 13px; resize: vertical; border: 1px solid var(--hairline-strong); border-radius: var(--r-md); background: var(--surface); color: var(--text); font: inherit; line-height: 1.55; }
+.world-summary-input:focus { border-color: var(--accent); box-shadow: 0 0 0 3px var(--accent-tint); outline: none; }
+.world-summary-footer { display: flex; justify-content: space-between; gap: 12px; margin-top: 6px; color: var(--text-muted); font-size: 12px; }
+
+/* =============================================================================
    房间页（聊天）
    ========================================================================== */
 .room-page {
@@ -449,6 +546,21 @@ input[type="file"] { padding: 8px 12px; cursor: pointer; }
   padding: 5px 12px;
   border-radius: 10px;
   line-height: 1.2;
+}
+.room-delete-button {
+  width: 34px;
+  height: 34px;
+  padding: 0;
+  display: inline-grid;
+  place-items: center;
+}
+.room-delete-button:disabled { opacity: 0.45; cursor: wait; }
+.room-action-error {
+  padding: 7px 14px;
+  background: var(--danger-tint);
+  color: var(--danger);
+  font-size: 12.5px;
+  text-align: center;
 }
 
 .room-title-group {
@@ -578,7 +690,7 @@ input[type="file"] { padding: 8px 12px; cursor: pointer; }
   align-self: center;
   margin: 10px 0 6px;
   color: var(--text-muted);
-  font-size: 11.5px;
+  font-size: 12.5px;
   font-weight: 500;
   font-variant-numeric: tabular-nums;
 }
@@ -626,6 +738,66 @@ input[type="file"] { padding: 8px 12px; cursor: pointer; }
 @keyframes rise-in { from { opacity: 0; transform: translate(-50%, 8px); } to { opacity: 1; transform: translate(-50%, 0); } }
 
 /* =============================================================================
+   消息发送
+   ========================================================================== */
+.send-bar {
+  flex: 0 0 auto;
+  padding: 10px clamp(12px, 4vw, 28px) calc(10px + env(safe-area-inset-bottom));
+  border-top: 1px solid var(--hairline);
+  background: color-mix(in srgb, var(--surface) 94%, transparent);
+  -webkit-backdrop-filter: blur(14px);
+  backdrop-filter: blur(14px);
+}
+.send-compose {
+  display: grid;
+  grid-template-columns: minmax(0, 1fr) auto;
+  align-items: end;
+  gap: 8px;
+  width: min(860px, 100%);
+  margin: 0 auto;
+}
+.send-compose textarea {
+  min-height: 40px;
+  max-height: 128px;
+  padding: 9px 13px;
+  resize: vertical;
+  line-height: 1.4;
+  border-radius: var(--r-lg);
+  background: var(--surface-2);
+}
+.send-button {
+  width: 40px;
+  height: 40px;
+  display: grid;
+  place-items: center;
+  padding: 0;
+  border: 0;
+  border-radius: var(--r-md);
+  background: transparent;
+  color: color-mix(in srgb, var(--bubble-self-top) var(--bubble-opacity), transparent);
+  cursor: pointer;
+  transition: background 0.16s ease, transform 0.08s ease, opacity 0.16s ease;
+}
+.send-button svg {
+  width: 24px;
+  height: 24px;
+  fill: currentColor;
+  stroke: currentColor;
+  stroke-width: 1.6;
+  stroke-linecap: round;
+  stroke-linejoin: round;
+}
+.send-button:hover:not(:disabled) { background: var(--surface-2); }
+.send-button:active:not(:disabled) { transform: translateY(1px); }
+.send-button:disabled { opacity: 0.35; cursor: not-allowed; }
+.send-error {
+  width: min(860px, 100%);
+  margin: 6px auto 0;
+  color: var(--danger);
+  font-size: 12.5px;
+}
+
+/* =============================================================================
    消息条（气泡簇）
    一行 = [头像列] [内容]，自己的消息左右翻转；头像挂在消息簇末尾
    ========================================================================== */
@@ -657,6 +829,7 @@ input[type="file"] { padding: 8px 12px; cursor: pointer; }
 .message-row.own .msg-avatar-slot { grid-column: 2; }
 
 .msg-content {
+  position: relative;
   grid-column: 2;
   min-width: 0;
   display: flex;
@@ -730,6 +903,49 @@ input[type="file"] { padding: 8px 12px; cursor: pointer; }
 .message-row.own.group-end .msg-bubble { border-bottom-right-radius: var(--r-bubble-tight); }
 
 .msg-text { white-space: pre-wrap; }
+.message-row .msg-bubble.recalled {
+  background: color-mix(in srgb, var(--surface-sunken) 70%, transparent);
+  color: var(--text-muted);
+  font-style: italic;
+  box-shadow: none;
+}
+.msg-bubble.can-recall {
+  -webkit-touch-callout: none;
+  touch-action: pan-y;
+  user-select: none;
+}
+.message-action-menu {
+  position: absolute;
+  z-index: 8;
+  bottom: calc(100% + 7px);
+  left: 0;
+  min-width: 88px;
+  padding: 5px;
+  border-radius: var(--r-md);
+  background: var(--surface);
+  box-shadow: var(--shadow-lg);
+}
+.message-row.own .message-action-menu { left: auto; right: 0; }
+.message-action-recall {
+  width: 100%;
+  min-height: 44px;
+  padding: 7px 14px;
+  border: 0;
+  border-radius: var(--r-sm);
+  background: transparent;
+  color: var(--danger);
+  font: inherit;
+  font-size: 12.5px;
+  font-weight: 600;
+  cursor: pointer;
+}
+.message-action-recall:hover:not(:disabled) { background: var(--danger-tint); }
+.message-action-recall:disabled { opacity: 0.55; cursor: wait; }
+.message-recall-error {
+  margin-top: 2px;
+  color: var(--danger);
+  font-size: 12.5px;
+}
 
 /* @提及：不用 mark 背景，用强调色 + 半粗 */
 .message-mention {
@@ -1131,6 +1347,16 @@ button:focus:not(:focus-visible) { outline: none; }
 
   .auth-card, .join-card { padding: 30px 22px; }
   .room-list-page { padding-inline: 14px; }
+  .world-page { padding-inline: 14px; }
+  .world-header { align-items: flex-start; }
+  .world-heading h1 { font-size: 22px; }
+  .world-grid { grid-template-columns: 1fr; }
+  .world-card { min-height: 180px; }
+  .world-card-skeleton { min-height: 180px; }
+  .world-manage-row { align-items: flex-start; flex-direction: column; }
+  .world-manage-actions { width: 100%; }
+  .world-manage-actions .btn-secondary { flex: 1; }
+  .world-manage-actions .btn-ghost { padding-inline: 10px; }
   .settings-page { padding-inline: 14px; }
   .settings-grid { grid-template-columns: 1fr; gap: 0; }
   .settings-grid .form-group + .form-group { margin-top: 0; }

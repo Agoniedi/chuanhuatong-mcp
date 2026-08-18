@@ -1,4 +1,5 @@
 import { apiRequest } from './client';
+import { newRequestId } from './request-id';
 import type { Message } from '../types';
 
 export interface MessagePage {
@@ -28,6 +29,18 @@ export function listMessagesAfter(
     limit: String(limit),
   });
   return apiRequest('GET', `/v1/rooms/${roomId}/messages?${params}`);
+}
+
+export function sendMessage(roomId: string, text: string): Promise<Message> {
+  const clientMessageId = newRequestId();
+  return apiRequest('POST', `/v1/rooms/${roomId}/messages`, {
+    clientMessageId,
+    content: { schemaVersion: 1, type: 'text', text },
+  }, { idempotencyKey: clientMessageId });
+}
+
+export function recallMessage(roomId: string, messageId: string): Promise<Message> {
+  return apiRequest('POST', `/v1/rooms/${roomId}/messages/${messageId}/recall`, {});
 }
 
 export function markRoomRead(roomId: string, readSeq: number): Promise<{

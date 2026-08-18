@@ -372,6 +372,69 @@ describe('local group chat REST loop', () => {
     assert.equal(first.body.historyVisibility, 'after_join');
   });
 
+  it('publishes an owned room to World with a reusable invite and can unpublish it', async () => {
+    const auth = { Authorization: `Bearer ${users.alice.accessToken}` };
+    const created = await json('/v1/rooms', 'POST', { title: 'World showcase room' }, {
+      ...auth,
+      'Idempotency-Key': 'world-room-create',
+    });
+    const publish = await json(`/v1/rooms/${created.body.id}/world`, 'PUT', {
+      published: true,
+      summary: '一个用于分享知识和 AI 协作的公开房间。',
+    }, { ...auth, 'Operation-Id': 'world-publish' });
+    assert.equal(publish.response.status, 200);
+    assert.equal(publish.body.room.worldPublished, true);
+    assert.equal(publish.body.world.title, 'World showcase room');
+    assert.equal(publish.body.world.ownerDisplayName, 'Alice');
+    assert.equal(publish.body.world.summary, '一个用于分享知识和 AI 协作的公开房间。');
+    assert.equal(typeof publish.body.world.inviteToken, 'string');
+
+    const visibleToBob = await request('/v1/world/rooms', {
+      headers: { Authorization: `Bearer ${users.bob.accessToken}` },
+    });
+    assert.equal(visibleToBob.response.status, 200);
+    assert.equal(visibleToBob.body.items.some(item => item.id === created.body.id), true);
+    const worldItem = visibleToBob.body.items.find(item => item.id === created.body.id);
+    assert.equal(Object.hasOwn(worldItem, 'inviteToken'), false);
+
+    const detail = await request(`/v1/world/rooms/${created.body.id}`, {
+      headers: { Authorization: `Bearer ${users.bob.accessToken}` },
+    });
+    assert.equal(detail.response.status, 200);
+    assert.equal(detail.body.title, worldItem.title);
+    assert.equal(detail.body.summary, worldItem.summary);
+    assert.equal(detail.body.inviteToken, publish.body.world.inviteToken);
+
+    const joined = await json('/v1/invites/accept', 'POST', {
+      inviteToken: detail.body.inviteToken,
+    }, {
+      Authorization: `Bearer ${users.charlie.accessToken}`,
+      'Operation-Id': 'world-invite-accept',
+    });
+    assert.equal(joined.response.status, 200);
+
+    const forbidden = await json(`/v1/rooms/${created.body.id}/world`, 'PUT', {
+      published: false,
+    }, { Authorization: `Bearer ${users.bob.accessToken}`, 'Operation-Id': 'world-unpublish-forbidden' });
+    assert.equal(forbidden.response.status, 403);
+
+    const unpublished = await json(`/v1/rooms/${created.body.id}/world`, 'PUT', {
+      published: false,
+    }, { ...auth, 'Operation-Id': 'world-unpublish' });
+    assert.equal(unpublished.response.status, 200);
+    assert.equal(unpublished.body.room.worldPublished, false);
+    assert.equal(unpublished.body.world, null);
+    const hidden = await request('/v1/world/rooms', { headers: auth });
+    assert.equal(hidden.body.items.some(item => item.id === created.body.id), false);
+    const revoked = await json('/v1/invites/accept', 'POST', {
+      inviteToken: publish.body.world.inviteToken,
+    }, {
+      Authorization: `Bearer ${users.charlie.accessToken}`,
+      'Operation-Id': 'world-invite-revoked',
+    });
+    assert.equal(revoked.response.status, 409);
+  });
+
   it('accepts a limited invite and enforces expiry, revocation, and use count', async () => {
     const room = (await request('/v1/rooms', {
       headers: { Authorization: `Bearer ${users.alice.accessToken}` },
@@ -502,6 +565,60 @@ describe('local group chat REST loop', () => {
     assert.equal(visible.body.items.length, 1);
     assert.equal(visible.body.items[0].seq, 2);
     assert.equal(visible.body.highWaterSeq, 2);
+  });
+
+  it('recalls owned messages within five minutes and rejects expired recalls', async () => {
+    let nowMs = Date.parse('2026-08-18T10:00:00.000Z');
+    const store = new MemoryGroupChatStore({ clock: () => new Date(nowMs) });
+    const session = await store.createGuestSession({
+      deviceId: 'recall-window-device',
+      displayName: 'Recall Owner',
+    });
+    const user = await store.authenticate(session.accessToken);
+    const room = await store.createRoom({
+      userId: user.userId,
+      title: 'Recall window room',
+      key: 'recall-window-room',
+      requestFingerprint: 'recall-window-room-fingerprint',
+    });
+    const recalledSource = await store.createHumanMessage({
+      user,
+      roomId: room.body.id,
+      clientMessageId: 'recall-window-source',
+      text: 'Recall this message',
+      mentions: [],
+      replyToMessageId: null,
+      key: 'recall-window-source',
+      requestFingerprint: 'recall-window-source-fingerprint',
+    });
+    nowMs += 5 * 60 * 1000;
+    const recalled = await store.recallMessage({
+      userId: user.userId,
+      roomId: room.body.id,
+      messageId: recalledSource.body.id,
+    });
+    assert.equal(recalled.content.text, '');
+    assert.equal(recalled.recalledAt, '2026-08-18T10:05:00.000Z');
+
+    const expiredSource = await store.createHumanMessage({
+      user,
+      roomId: room.body.id,
+      clientMessageId: 'recall-window-expired',
+      text: 'Too old to recall',
+      mentions: [],
+      replyToMessageId: null,
+      key: 'recall-window-expired',
+      requestFingerprint: 'recall-window-expired-fingerprint',
+    });
+    nowMs += 5 * 60 * 1000 + 1;
+    await assert.rejects(
+      store.recallMessage({
+        userId: user.userId,
+        roomId: room.body.id,
+        messageId: expiredSource.body.id,
+      }),
+      (error) => error.status === 409 && error.code === 'recall_window_expired',
+    );
   });
 
   it('loads the latest 100 messages backwards and keeps Web read state independent', async () => {
@@ -647,6 +764,53 @@ describe('local group chat REST loop', () => {
       });
       assert.equal(replay.body.id, created.body.id);
       await assert.rejects(duplicate, /Timed out waiting for message\.created/);
+
+      const aliceRecallEvent = waitForRealtimeEvent(aliceSocket, 'message.recalled');
+      const bobRecallEvent = waitForRealtimeEvent(bobSocket, 'message.recalled');
+      const forbiddenRecall = await json(
+        `/v1/rooms/${room.id}/messages/${created.body.id}/recall`,
+        'POST',
+        {},
+        { Authorization: `Bearer ${users.bob.accessToken}` },
+      );
+      assert.equal(forbiddenRecall.response.status, 403);
+      const recalled = await json(
+        `/v1/rooms/${room.id}/messages/${created.body.id}/recall`,
+        'POST',
+        {},
+        { Authorization: `Bearer ${users.alice.accessToken}` },
+      );
+      assert.equal(recalled.response.status, 200);
+      assert.equal(recalled.body.content.text, '');
+      assert.equal(typeof recalled.body.recalledAt, 'string');
+      const [recalledByAlice, recalledByBob] = await Promise.all([
+        aliceRecallEvent,
+        bobRecallEvent,
+      ]);
+      assert.equal(recalledByAlice.payload.id, created.body.id);
+      assert.equal(recalledByBob.payload.id, created.body.id);
+
+      const nonOwnerDelete = await request(`/v1/rooms/${room.id}`, {
+        method: 'DELETE',
+        headers: { Authorization: `Bearer ${users.bob.accessToken}` },
+      });
+      assert.equal(nonOwnerDelete.response.status, 403);
+      const aliceDeleteEvent = waitForRealtimeEvent(aliceSocket, 'room.deleted');
+      const bobDeleteEvent = waitForRealtimeEvent(bobSocket, 'room.deleted');
+      const deleted = await request(`/v1/rooms/${room.id}`, {
+        method: 'DELETE',
+        headers: { Authorization: `Bearer ${users.alice.accessToken}` },
+      });
+      assert.equal(deleted.response.status, 204);
+      const [deletedForAlice, deletedForBob] = await Promise.all([
+        aliceDeleteEvent,
+        bobDeleteEvent,
+      ]);
+      assert.deepEqual(deletedForAlice.payload, { roomId: room.id });
+      assert.deepEqual(deletedForBob.payload, { roomId: room.id });
+      assert.equal((await request(`/v1/rooms/${room.id}`, {
+        headers: { Authorization: `Bearer ${users.bob.accessToken}` },
+      })).response.status, 404);
     } finally {
       await Promise.all([closeRealtime(aliceSocket), closeRealtime(bobSocket)]);
     }
@@ -1515,6 +1679,24 @@ describe('local group chat REST loop', () => {
     assert.equal(published.body.message.generationRequestId, fixture.generation.id);
     assert.equal(published.body.message.triggerThroughSeq, fixture.trigger.seq);
     assert.deepEqual(publishReplay.body, published.body);
+
+    const forbiddenRecall = await json(
+      `/v1/rooms/${fixture.room.id}/messages/${published.body.message.id}/recall`,
+      'POST',
+      {},
+      { Authorization: `Bearer ${users.bob.accessToken}` },
+    );
+    assert.equal(forbiddenRecall.response.status, 403);
+    const recalledAgentMessage = await json(
+      `/v1/rooms/${fixture.room.id}/messages/${published.body.message.id}/recall`,
+      'POST',
+      {},
+      fixture.auth,
+    );
+    assert.equal(recalledAgentMessage.response.status, 200);
+    assert.equal(recalledAgentMessage.body.sender.kind, 'agent');
+    assert.equal(recalledAgentMessage.body.content.text, '');
+    assert.equal(typeof recalledAgentMessage.body.recalledAt, 'string');
 
     const duplicatePublish = await json(
       `${basePath}/publish`,

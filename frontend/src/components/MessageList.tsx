@@ -8,6 +8,7 @@ interface Props {
   hasMoreBefore: boolean;
   onLoadOlder: () => Promise<void>;
   onReachedLatest: (seq: number) => void;
+  onRecall: (message: Message) => Promise<void>;
 }
 
 // 同组：同一发言人、且与上一条相隔 < 5 分钟
@@ -95,6 +96,7 @@ export default function MessageList({
   hasMoreBefore,
   onLoadOlder,
   onReachedLatest,
+  onRecall,
 }: Props) {
   const listRef = useRef<HTMLDivElement>(null);
   const previousLengthRef = useRef(0);
@@ -219,10 +221,12 @@ export default function MessageList({
               isGroupStart={row.isGroupStart}
               isGroupEnd={row.isGroupEnd}
               justArrived={justArrivedIdRef.current === message.id}
+              currentUserId={currentUserId}
               replyTo={message.replyToMessageId
                 ? messagesById.get(message.replyToMessageId)
                 : undefined}
               onLocateReply={locateReply}
+              onRecall={onRecall}
             />
           );
         })}

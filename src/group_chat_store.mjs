@@ -12,6 +12,9 @@ const PUBLIC_REGISTRATION_PRINCIPAL_ID = 'public-registration';
 const ONE_TIME_CODE_ALPHABET = '23456789ABCDEFGHJKLMNPQRSTUVWXYZ';
 const WEB_BINDING_CODE_TTL_MS = 24 * 60 * 60 * 1000;
 const WEB_RESET_CODE_TTL_MS = 30 * 60 * 1000;
+const MESSAGE_RECALL_WINDOW_MS = 5 * 60 * 1000;
+const WORLD_INVITE_LIFETIME_MS = 30 * 24 * 60 * 60 * 1000;
+const WORLD_INVITE_MAX_USES = 100;
 const REGENERATABLE_GENERATION_STATUSES = new Set([
   'discarded',
   'failed',
@@ -72,7 +75,7 @@ function authenticatedUser(user, deviceId = user.deviceId) {
   return { ...publicUser(user), deviceId };
 }
 
-function roomSnapshot(room) {
+function roomSnapshot(room, includeWorld = false) {
   return {
     id: room.id,
     ownerUserId: room.ownerUserId,
@@ -80,9 +83,36 @@ function roomSnapshot(room) {
     lastSeq: room.lastSeq,
     revision: room.revision,
     historyVisibility: room.historyVisibility,
+    ...(includeWorld ? {
+      worldPublished: room.worldPublished ?? false,
+      worldSummary: room.worldSummary ?? '',
+    } : {}),
     createdAt: room.createdAt,
     updatedAt: room.updatedAt,
   };
+}
+
+function webRoomSnapshot(room) {
+  return roomSnapshot(room, true);
+}
+
+function worldRoomSnapshot(room, ownerDisplayName, invite, includeInvite = true) {
+  const snapshot = {
+    id: room.id,
+    title: room.title,
+    ownerUserId: room.ownerUserId,
+    ownerDisplayName,
+    summary: room.worldSummary ?? '',
+    publishedAt: room.worldPublishedAt ?? null,
+  };
+  if (includeInvite) {
+    Object.assign(snapshot, {
+      inviteToken: invite?.token ?? null,
+      inviteExpiresAt: invite?.expiresAt ?? null,
+      remainingUses: invite?.remainingUses ?? 0,
+    });
+  }
+  return snapshot;
 }
 
 function membershipSnapshot(user, membership, includeReadSeq) {
@@ -939,7 +969,7 @@ export class MemoryGroupChatStore {
         const defaultReadSeq = Math.max(0, membership.joinedSeq - 1);
         const webReadSeq = this.webRoomReads.get(`${userId}:${room.id}`) ?? defaultReadSeq;
         return {
-          ...roomSnapshot(room),
+          ...webRoomSnapshot(room),
           webReadSeq,
           unreadCount: Math.max(0, room.lastSeq - webReadSeq),
         };
@@ -967,7 +997,7 @@ export class MemoryGroupChatStore {
       .sort((left, right) =>
         left.id < right.id ? -1 : left.id > right.id ? 1 : 0)
       .slice(0, limit + 1);
-    const items = page.slice(0, limit).map(roomSnapshot);
+    const items = page.slice(0, limit).map((room) => roomSnapshot(room));
     return {
       items,
       nextRoomId: page.length > limit ? items[items.length - 1].id : null,
@@ -1057,6 +1087,11 @@ export class MemoryGroupChatStore {
       lastSeq: 0,
       revision: 1,
       historyVisibility: 'after_join',
+      worldPublished: false,
+      worldSummary: '',
+      worldInviteId: null,
+      worldInviteToken: null,
+      worldPublishedAt: null,
       createdAt,
       updatedAt: createdAt,
       members: new Map([[userId, { userId, role: 'owner', joinedSeq: 0, readSeq: 0 }]]),
@@ -1072,6 +1107,130 @@ export class MemoryGroupChatStore {
     const room = this._room(roomId);
     requireMembership(room, userId);
     return roomSnapshot(room);
+  }
+
+  async listWorldRooms() {
+    const now = this.clock();
+    return [...this.rooms.values()]
+      .filter((room) => room.worldPublished)
+      .map((room) => {
+        const invite = room.worldInviteId ? this.invites.get(room.worldInviteId) : null;
+        if (!invite || !activeInvite(invite, now)) return null;
+        return worldRoomSnapshot(
+          room,
+          this.usersById.get(room.ownerUserId)?.displayName ?? '未知房主',
+          { ...invite, token: room.worldInviteToken },
+          false,
+        );
+      })
+      .filter(Boolean)
+      .sort((left, right) => Date.parse(right.publishedAt) - Date.parse(left.publishedAt));
+  }
+
+  async getWorldRoom({ roomId }) {
+    const room = this._room(roomId);
+    const invite = room.worldInviteId ? this.invites.get(room.worldInviteId) : null;
+    if (!room.worldPublished || !invite || !activeInvite(invite, this.clock())) {
+      throw new HttpError(404, 'resource_not_found', 'World room not found');
+    }
+    return worldRoomSnapshot(
+      room,
+      this.usersById.get(room.ownerUserId)?.displayName ?? '未知房主',
+      { ...invite, token: room.worldInviteToken },
+    );
+  }
+
+  async updateWorldRoom({ userId, roomId, published, summary }) {
+    const room = this._room(roomId);
+    if (room.ownerUserId !== userId) {
+      throw new HttpError(403, 'forbidden', 'Room owner required');
+    }
+    const now = this.clock();
+    if (!published) {
+      const invite = room.worldInviteId ? this.invites.get(room.worldInviteId) : null;
+      if (invite) invite.revokedAt = now.toISOString();
+      room.worldPublished = false;
+      room.worldInviteId = null;
+      room.worldInviteToken = null;
+      room.worldPublishedAt = null;
+      room.revision += 1;
+      room.updatedAt = now.toISOString();
+      return { room: webRoomSnapshot(room), world: null };
+    }
+
+    let invite = room.worldInviteId ? this.invites.get(room.worldInviteId) : null;
+    let token = room.worldInviteToken;
+    if (!invite || !activeInvite(invite, now) || !token) {
+      token = randomBytes(16).toString('base64url');
+      invite = {
+        id: newId('invite'),
+        roomId,
+        createdByUserId: userId,
+        tokenHash: hash(token),
+        expiresAt: new Date(now.getTime() + WORLD_INVITE_LIFETIME_MS).toISOString(),
+        maxUses: WORLD_INVITE_MAX_USES,
+        remainingUses: WORLD_INVITE_MAX_USES,
+        createdAt: now.toISOString(),
+        revokedAt: null,
+      };
+      this.invites.set(invite.id, invite);
+      room.worldInviteId = invite.id;
+      room.worldInviteToken = token;
+    }
+    room.worldPublished = true;
+    room.worldSummary = summary;
+    room.worldPublishedAt ??= now.toISOString();
+    room.revision += 1;
+    room.updatedAt = now.toISOString();
+    return {
+      room: webRoomSnapshot(room),
+      world: worldRoomSnapshot(room, this.usersById.get(userId)?.displayName ?? '未知房主', {
+        ...invite,
+        token,
+      }),
+    };
+  }
+
+  async deleteRoom({ userId, roomId }) {
+    const room = this._room(roomId);
+    if (room.ownerUserId !== userId) {
+      throw new HttpError(403, 'forbidden', 'Room owner required');
+    }
+    const recipientUserIds = [...room.members.keys()];
+    const bindingIds = new Set(
+      [...this.roomAgentBindings.values()]
+        .filter((binding) => binding.roomId === roomId)
+        .map((binding) => binding.id),
+    );
+    this.rooms.delete(roomId);
+    this.messagesByRoom.delete(roomId);
+    for (const [inviteId, invite] of this.invites) {
+      if (invite.roomId === roomId) this.invites.delete(inviteId);
+    }
+    for (const [bindingKey, binding] of this.roomAgentBindings) {
+      if (binding.roomId === roomId) this.roomAgentBindings.delete(bindingKey);
+    }
+    for (const [runtimeKey, runtime] of this.agentRuntimes) {
+      if (bindingIds.has(runtime.bindingId)) this.agentRuntimes.delete(runtimeKey);
+    }
+    for (const [requestId, request] of this.generationRequests) {
+      if (request.roomId === roomId) this.generationRequests.delete(requestId);
+    }
+    for (const readKey of this.webRoomReads.keys()) {
+      if (readKey.endsWith(`:${roomId}`)) this.webRoomReads.delete(readKey);
+    }
+    this.outbox = this.outbox.filter(
+      (entry) => entry.roomId !== roomId || entry.dispatchedAt !== null,
+    );
+    this.outbox.push({
+      id: String(this.nextOutboxId++),
+      eventId: newId('evt'),
+      type: 'room.deleted',
+      roomId,
+      payload: { recipientUserIds },
+      occurredAt: this.clock().toISOString(),
+      dispatchedAt: null,
+    });
   }
 
   async getMembership({ userId, roomId }) {
@@ -2322,6 +2481,38 @@ export class MemoryGroupChatStore {
     return { status: 201, body };
   }
 
+  async recallMessage({ userId, roomId, messageId }) {
+    const room = this._room(roomId);
+    requireMembership(room, userId);
+    const message = this.messagesByRoom.get(roomId).find(
+      (candidate) => candidate.id === messageId,
+    );
+    if (!message) throw new HttpError(404, 'resource_not_found', 'Message not found');
+    if (message.sender.userId !== userId) {
+      throw new HttpError(403, 'forbidden', 'Message sender owner required');
+    }
+    if (message.recalledAt) return clone(message);
+    const now = this.clock();
+    if (now.getTime() - Date.parse(message.createdAt) > MESSAGE_RECALL_WINDOW_MS) {
+      throw new HttpError(409, 'recall_window_expired', 'Message recall window has expired');
+    }
+    message.content = { schemaVersion: 1, type: 'text', text: '' };
+    message.mentions = [];
+    message.replyToMessageId = null;
+    message.recalledAt = now.toISOString();
+    const body = clone(message);
+    this.outbox.push({
+      id: String(this.nextOutboxId++),
+      eventId: newId('evt'),
+      type: 'message.recalled',
+      roomId,
+      payload: body,
+      occurredAt: message.recalledAt,
+      dispatchedAt: null,
+    });
+    return body;
+  }
+
   async handoffToRoom({
     user,
     title,
@@ -2451,7 +2642,7 @@ function rowToUser(row) {
   };
 }
 
-function rowToRoom(row) {
+function rowToRoom(row, includeWorld = false) {
   return {
     id: row.id,
     ownerUserId: row.owner_user_id,
@@ -2459,9 +2650,32 @@ function rowToRoom(row) {
     lastSeq: safeInteger(row.last_seq, 'rooms.last_seq'),
     revision: safeInteger(row.revision, 'rooms.revision'),
     historyVisibility: row.history_visibility,
+    ...(includeWorld ? {
+      worldPublished: row.world_published ?? false,
+      worldSummary: row.world_summary ?? '',
+    } : {}),
     createdAt: iso(row.created_at),
     updatedAt: iso(row.updated_at),
   };
+}
+
+function rowToWorldRoom(row, includeInvite = true) {
+  const snapshot = {
+    id: row.id,
+    title: row.title,
+    ownerUserId: row.owner_user_id,
+    ownerDisplayName: row.owner_display_name,
+    summary: row.world_summary,
+    publishedAt: iso(row.world_published_at),
+  };
+  if (includeInvite) {
+    Object.assign(snapshot, {
+      inviteToken: row.world_invite_token,
+      inviteExpiresAt: iso(row.world_invite_expires_at),
+      remainingUses: row.world_invite_remaining_uses,
+    });
+  }
+  return snapshot;
 }
 
 function rowToMembership(row, includeReadSeq) {
@@ -2640,6 +2854,7 @@ function rowToMessage(row) {
     ...(row.trigger_through_seq !== null
       ? { triggerThroughSeq: safeInteger(row.trigger_through_seq, 'messages.trigger_through_seq') }
       : {}),
+    recalledAt: row.recalled_at ? iso(row.recalled_at) : null,
     createdAt: iso(row.created_at),
   };
 }
@@ -3577,7 +3792,7 @@ export class PostgresGroupChatStore {
       [userId],
     );
     return result.rows.map((row) => {
-      const room = rowToRoom(row);
+      const room = rowToRoom(row, true);
       const webReadSeq = safeInteger(row.web_read_seq, 'web_room_reads.read_seq');
       return {
         ...room,
@@ -3625,7 +3840,7 @@ export class PostgresGroupChatStore {
         LIMIT $3`,
       [userId, afterRoomId, limit + 1],
     );
-    const items = result.rows.slice(0, limit).map(rowToRoom);
+    const items = result.rows.slice(0, limit).map((row) => rowToRoom(row));
     return {
       items,
       nextRoomId: result.rows.length > limit ? items[items.length - 1].id : null,
@@ -3801,6 +4016,150 @@ export class PostgresGroupChatStore {
     const room = await this._room(client, roomId);
     await this._membership(client, roomId, userId);
     return rowToRoom(room);
+  }
+
+  async listWorldRooms() {
+    const result = await this.pool.query(
+      `SELECT r.*, u.display_name AS owner_display_name,
+              i.expires_at AS world_invite_expires_at,
+              i.remaining_uses AS world_invite_remaining_uses
+         FROM rooms r
+         JOIN users u ON u.id = r.owner_user_id
+         JOIN room_invites i ON i.id = r.world_invite_id
+        WHERE r.world_published = true
+          AND i.revoked_at IS NULL
+          AND i.remaining_uses > 0
+          AND i.expires_at > $1
+        ORDER BY r.world_published_at DESC, r.id`,
+      [this.clock()],
+    );
+    return result.rows.map((row) => rowToWorldRoom(row, false));
+  }
+
+  async getWorldRoom({ roomId }) {
+    const result = await this.pool.query(
+      `SELECT r.*, u.display_name AS owner_display_name,
+              i.expires_at AS world_invite_expires_at,
+              i.remaining_uses AS world_invite_remaining_uses
+         FROM rooms r
+         JOIN users u ON u.id = r.owner_user_id
+         JOIN room_invites i ON i.id = r.world_invite_id
+        WHERE r.id = $1
+          AND r.world_published = true
+          AND i.revoked_at IS NULL
+          AND i.remaining_uses > 0
+          AND i.expires_at > $2`,
+      [roomId, this.clock()],
+    );
+    if (result.rowCount === 0) {
+      throw new HttpError(404, 'resource_not_found', 'World room not found');
+    }
+    return rowToWorldRoom(result.rows[0]);
+  }
+
+  async updateWorldRoom({ userId, roomId, published, summary }) {
+    return this._transaction(async (client) => {
+      const roomResult = await client.query(
+        'SELECT * FROM rooms WHERE id = $1 FOR UPDATE',
+        [roomId],
+      );
+      if (roomResult.rowCount === 0) {
+        throw new HttpError(404, 'resource_not_found', 'Room not found');
+      }
+      const room = roomResult.rows[0];
+      if (room.owner_user_id !== userId) {
+        throw new HttpError(403, 'forbidden', 'Room owner required');
+      }
+      const now = this.clock();
+      if (!published) {
+        if (room.world_invite_id) {
+          await client.query(
+            'UPDATE room_invites SET revoked_at = $1 WHERE id = $2 AND revoked_at IS NULL',
+            [now, room.world_invite_id],
+          );
+        }
+        const updated = await client.query(
+          `UPDATE rooms
+              SET world_published = false, world_invite_id = NULL,
+                  world_invite_token = NULL, world_published_at = NULL,
+                  revision = revision + 1, updated_at = $1
+            WHERE id = $2 RETURNING *`,
+          [now, roomId],
+        );
+        return { room: rowToRoom(updated.rows[0], true), world: null };
+      }
+
+      let invite = null;
+      let token = room.world_invite_token;
+      if (room.world_invite_id) {
+        const inviteResult = await client.query(
+          'SELECT * FROM room_invites WHERE id = $1',
+          [room.world_invite_id],
+        );
+        invite = inviteResult.rows[0] ?? null;
+      }
+      if (!invite || invite.revoked_at !== null || invite.remaining_uses <= 0 ||
+          new Date(invite.expires_at).getTime() <= now.getTime() || !token) {
+        token = randomBytes(16).toString('base64url');
+        const expiresAt = new Date(now.getTime() + WORLD_INVITE_LIFETIME_MS);
+        const inserted = await client.query(
+          `INSERT INTO room_invites(
+             id, room_id, created_by_user_id, token_hash, expires_at,
+             max_uses, remaining_uses, created_at, revoked_at
+           ) VALUES ($1, $2, $3, $4, $5, $6, $6, $7, NULL)
+           RETURNING *`,
+          [newId('invite'), roomId, userId, hash(token), expiresAt, WORLD_INVITE_MAX_USES, now],
+        );
+        invite = inserted.rows[0];
+      }
+      const updated = await client.query(
+        `UPDATE rooms
+            SET world_published = true, world_summary = $1,
+                world_invite_id = $2, world_invite_token = $3,
+                world_published_at = COALESCE(world_published_at, $4),
+                revision = revision + 1, updated_at = $4
+          WHERE id = $5 RETURNING *`,
+        [summary, invite.id, token, now, roomId],
+      );
+      const owner = await client.query('SELECT display_name FROM users WHERE id = $1', [userId]);
+      return {
+        room: rowToRoom(updated.rows[0], true),
+        world: rowToWorldRoom({
+          ...updated.rows[0],
+          owner_display_name: owner.rows[0].display_name,
+          world_invite_expires_at: invite.expires_at,
+          world_invite_remaining_uses: invite.remaining_uses,
+        }),
+      };
+    });
+  }
+
+  async deleteRoom({ userId, roomId }) {
+    await this._transaction(async (client) => {
+      const room = await this._room(client, roomId, { lock: true });
+      if (room.owner_user_id !== userId) {
+        throw new HttpError(403, 'forbidden', 'Room owner required');
+      }
+      const members = await client.query(
+        'SELECT user_id FROM room_members WHERE room_id = $1',
+        [roomId],
+      );
+      const recipientUserIds = members.rows.map((row) => row.user_id);
+      await client.query(
+        'DELETE FROM outbox_events WHERE room_id = $1 AND dispatched_at IS NULL',
+        [roomId],
+      );
+      // Remove messages first because messages.generation_request_id is a non-cascading FK.
+      await client.query('DELETE FROM messages WHERE room_id = $1', [roomId]);
+      await client.query('DELETE FROM generation_requests WHERE room_id = $1', [roomId]);
+      await client.query('DELETE FROM rooms WHERE id = $1', [roomId]);
+      await client.query(
+        `INSERT INTO outbox_events(
+           event_id, event_type, room_id, payload, occurred_at, dispatched_at
+         ) VALUES ($1, 'room.deleted', $2, $3, $4, NULL)`,
+        [newId('evt'), roomId, { recipientUserIds }, this.clock()],
+      );
+    });
   }
 
   async getMembership({ userId, roomId }) {
@@ -5849,6 +6208,45 @@ export class PostgresGroupChatStore {
         [newId('evt'), roomId, message, now],
       );
       return { status: 201, body: message };
+    });
+  }
+
+  async recallMessage({ userId, roomId, messageId }) {
+    return this._transaction(async (client) => {
+      await this._room(client, roomId);
+      await this._membership(client, roomId, userId);
+      const result = await client.query(
+        'SELECT * FROM messages WHERE id = $1 AND room_id = $2 FOR UPDATE',
+        [messageId, roomId],
+      );
+      if (result.rowCount === 0) {
+        throw new HttpError(404, 'resource_not_found', 'Message not found');
+      }
+      const message = result.rows[0];
+      if (message.sender.userId !== userId) {
+        throw new HttpError(403, 'forbidden', 'Message sender owner required');
+      }
+      if (message.recalled_at) return rowToMessage(message);
+      const now = this.clock();
+      if (now.getTime() - new Date(message.created_at).getTime() > MESSAGE_RECALL_WINDOW_MS) {
+        throw new HttpError(409, 'recall_window_expired', 'Message recall window has expired');
+      }
+      const updated = await client.query(
+        `UPDATE messages
+            SET content = $1, mentions = '[]'::jsonb,
+                reply_to_message_id = NULL, recalled_at = $2
+          WHERE id = $3
+          RETURNING *`,
+        [{ schemaVersion: 1, type: 'text', text: '' }, now, messageId],
+      );
+      const body = rowToMessage(updated.rows[0]);
+      await client.query(
+        `INSERT INTO outbox_events(
+           event_id, event_type, room_id, payload, occurred_at, dispatched_at
+         ) VALUES ($1, 'message.recalled', $2, $3, $4, NULL)`,
+        [newId('evt'), roomId, body, now],
+      );
+      return body;
     });
   }
 

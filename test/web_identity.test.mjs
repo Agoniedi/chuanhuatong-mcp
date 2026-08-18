@@ -132,12 +132,21 @@ describe('MCP identity and optional Web account', () => {
         headers: { Cookie: cookie, 'Idempotency-Key': 'cookie-message-write' },
         body: JSON.stringify({
           clientMessageId: 'cookie-message-write',
-          content: { schemaVersion: 1, type: 'text', text: 'Must remain read-only' },
+          content: { schemaVersion: 1, type: 'text', text: 'Must remain writable' },
         }),
       },
     );
-    assert.equal(cookieMessageWrite.response.status, 403);
-    assert.equal(cookieMessageWrite.body.error.code, 'web_read_only');
+    assert.equal(cookieMessageWrite.response.status, 201);
+    assert.equal(cookieMessageWrite.body.sender.kind, 'human');
+    assert.equal(cookieMessageWrite.body.sender.userId, identity.userId);
+    assert.equal(cookieMessageWrite.body.content.text, 'Must remain writable');
+    const cookieRecall = await request(
+      `/v1/rooms/${bearerRoomWrite.body.id}/messages/${cookieMessageWrite.body.id}/recall`,
+      { method: 'POST', headers: { Cookie: cookie }, body: '{}' },
+    );
+    assert.equal(cookieRecall.response.status, 200);
+    assert.equal(cookieRecall.body.content.text, '');
+    assert.equal(typeof cookieRecall.body.recalledAt, 'string');
     assert.equal((await request('/v1/rooms', {
       headers: { Cookie: cookie },
     })).body.items[0].id, bearerRoomWrite.body.id);

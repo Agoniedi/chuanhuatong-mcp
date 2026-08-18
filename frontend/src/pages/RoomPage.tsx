@@ -4,8 +4,10 @@ import { useApp } from '../store/useApp';
 import { useRealtimeWS } from '../ws/useRealtimeWS';
 import MessageList from '../components/MessageList';
 import MemberPanel from '../components/MemberPanel';
-import { markRoomRead } from '../api/messages';
-import type { ProfileUpdatedEvent, User, WsEvent } from '../types';
+import SendBar from '../components/SendBar';
+import { markRoomRead, recallMessage } from '../api/messages';
+import { deleteRoom } from '../api/rooms';
+import type { MessageRecalledEvent, ProfileUpdatedEvent, RoomDeletedEvent, User, WsEvent } from '../types';
 
 export default function RoomPage() {
   const { roomId } = useParams<{ roomId: string }>();
@@ -15,6 +17,8 @@ export default function RoomPage() {
   const [hasMoreBefore, setHasMoreBefore] = useState(false);
   const [loading, setLoading] = useState(true);
   const [error, setError] = useState<string | null>(null);
+  const [roomActionError, setRoomActionError] = useState<string | null>(null);
+  const [deletingRoom, setDeletingRoom] = useState(false);
   const wasConnectedRef = useRef(false);
   const hasConnectedRef = useRef(false);
   const lastMarkedReadRef = useRef(0);
@@ -23,6 +27,17 @@ export default function RoomPage() {
   const handleWsEvent = useCallback((event: WsEvent) => {
     if (event.type === 'message.created' && event.roomId && event.payload) {
       dispatch({ type: 'APPEND_MESSAGE', roomId: event.roomId, message: event.payload });
+    } else if (event.type === 'message.recalled') {
+      const recallEvent = event as MessageRecalledEvent;
+      dispatch({
+        type: 'REPLACE_MESSAGE',
+        roomId: recallEvent.roomId,
+        message: recallEvent.payload,
+      });
+    } else if (event.type === 'room.deleted') {
+      const deletedEvent = event as RoomDeletedEvent;
+      dispatch({ type: 'REMOVE_ROOM', roomId: deletedEvent.roomId });
+      if (deletedEvent.roomId === roomId) navigate('/');
     } else if (event.type === 'profile.updated') {
       const profileEvent = event as ProfileUpdatedEvent;
       if (
@@ -33,7 +48,7 @@ export default function RoomPage() {
       }
       dispatch({ type: 'PROFILE_UPDATED' });
     }
-  }, [dispatch, state.me?.userId]);
+  }, [dispatch, navigate, roomId, state.me?.userId]);
 
   useRealtimeWS(handleWsEvent, (status) => {
     dispatch({ type: 'SET_WS_STATUS', status });
@@ -90,6 +105,26 @@ export default function RoomPage() {
       });
   }, [dispatch, roomId]);
 
+  const handleRecall = useCallback(async (message: MessageRecalledEvent['payload']) => {
+    if (!roomId) return;
+    const recalled = await recallMessage(roomId, message.id);
+    dispatch({ type: 'REPLACE_MESSAGE', roomId, message: recalled });
+  }, [dispatch, roomId]);
+
+  const handleDeleteRoom = async () => {
+    if (!roomId || !window.confirm('确定删除这个房间吗？房间及全部消息将永久删除。')) return;
+    setDeletingRoom(true);
+    setRoomActionError(null);
+    try {
+      await deleteRoom(roomId);
+      dispatch({ type: 'REMOVE_ROOM', roomId });
+      navigate('/');
+    } catch {
+      setRoomActionError('房间删除失败，请重试');
+      setDeletingRoom(false);
+    }
+  };
+
   if (!roomId) return null;
 
   const messages = state.messages[roomId] ?? [];
@@ -113,6 +148,20 @@ export default function RoomPage() {
           </div>
         </div>
         <div className="header-actions">
+          {room?.ownerUserId === state.me?.userId && (
+            <button
+              type="button"
+              onClick={() => void handleDeleteRoom()}
+              className="btn-ghost danger room-delete-button"
+              aria-label="删除房间"
+              title="删除房间"
+              disabled={deletingRoom}
+            >
+              <svg viewBox="0 0 20 20" width="18" height="18" fill="none" aria-hidden="true">
+                <path d="M4.5 6h11M8 3.5h4M6.2 6l.6 10h6.4l.6-10M8.3 9v4.5M11.7 9v4.5" stroke="currentColor" strokeWidth="1.5" strokeLinecap="round" strokeLinejoin="round" />
+              </svg>
+            </button>
+          )}
           <button
             onClick={() => setShowMembers(!showMembers)}
             className="btn-secondary"
@@ -122,6 +171,7 @@ export default function RoomPage() {
           </button>
         </div>
       </header>
+      {roomActionError && <div className="room-action-error" role="alert">{roomActionError}</div>}
       <div className="room-body">
         <div className="room-main">
           {loading && messages.length === 0 ? (
@@ -136,8 +186,13 @@ export default function RoomPage() {
               hasMoreBefore={hasMoreBefore}
               onLoadOlder={loadOlder}
               onReachedLatest={reachedLatest}
+              onRecall={handleRecall}
             />
           )}
+          <SendBar
+            roomId={roomId}
+            onSent={message => dispatch({ type: 'APPEND_MESSAGE', roomId, message })}
+          />
         </div>
         {showMembers && (
           <>

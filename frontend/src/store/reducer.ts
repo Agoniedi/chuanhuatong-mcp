@@ -21,6 +21,8 @@ export type Action =
   | { type: 'SET_ROOMS'; rooms: Room[] }
   | { type: 'MERGE_MESSAGES'; roomId: string; messages: Message[] }
   | { type: 'APPEND_MESSAGE'; roomId: string; message: Message }
+  | { type: 'REPLACE_MESSAGE'; roomId: string; message: Message }
+  | { type: 'REMOVE_ROOM'; roomId: string }
   | { type: 'SET_WS_STATUS'; status: WsStatus }
   | { type: 'SET_CURRENT_ROOM'; roomId: string | null }
   | { type: 'MARK_ROOM_READ'; roomId: string; readSeq: number }
@@ -87,6 +89,30 @@ export function reducer(state: AppState, action: Action): AppState {
             action.message.seq,
           ),
         },
+      };
+    }
+    case 'REPLACE_MESSAGE': {
+      const existing = state.messages[action.roomId] ?? [];
+      return {
+        ...state,
+        messages: {
+          ...state.messages,
+          [action.roomId]: existing.map(message =>
+            message.id === action.message.id ? action.message : message),
+        },
+      };
+    }
+    case 'REMOVE_ROOM': {
+      const messages = { ...state.messages };
+      const lastSeqs = { ...state.lastSeqs };
+      delete messages[action.roomId];
+      delete lastSeqs[action.roomId];
+      return {
+        ...state,
+        rooms: state.rooms.filter(room => room.id !== action.roomId),
+        messages,
+        lastSeqs,
+        currentRoomId: state.currentRoomId === action.roomId ? null : state.currentRoomId,
       };
     }
     case 'SET_WS_STATUS':

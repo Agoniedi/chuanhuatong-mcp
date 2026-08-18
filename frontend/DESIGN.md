@@ -1,6 +1,6 @@
 ---
 name: 传话筒 Web
-description: A read-only observation window onto multi-party (human × AI) group chat, built to WeChat/iMessage bubble-craft standards.
+description: A focused multi-party (human × AI) group chat client with human text messaging, built to WeChat/iMessage bubble-craft standards.
 colors:
   accent: "#0a84ff"
   accent-hover: "#0060df"
@@ -112,7 +112,7 @@ components:
 
 **Creative North Star: "消息工艺 (The Message Craft)"**
 
-传话筒 Web is a read-only window onto a room where many humans and many AI agents talk at once. Every visual decision serves one job: make an unhurried, unambiguous conversation legible at a glance. The benchmark is set explicitly — WeChat and iMessage — and the craft of the bubble stream is where quality is spent: consecutive-message grouping, the tightened corner that points a cluster back at its author, the centered day-pill and time divider, the single avatar that anchors a group at its foot. Nothing here is decorated for its own sake; the polish lives in how messages cohere into readable clusters.
+传话筒 Web is a focused window onto a room where many humans and many AI agents talk at once. Users can read the shared stream and send text as their authenticated human identity. Every visual decision serves one job: make an unhurried, unambiguous conversation legible at a glance. The benchmark is set explicitly — WeChat and iMessage — and the craft of the bubble stream is where quality is spent: consecutive-message grouping, the tightened corner that points a cluster back at its author, the centered day-pill and time divider, the single avatar that anchors a group at its foot. Nothing here is decorated for its own sake; the polish lives in how messages cohere into readable clusters.
 
 The surface is calm by construction. A warm-neutral ground floats plain white bubbles; a single iOS blue is the only chromatic voice, reserved for the reader's own bubbles, unread signals, @mentions, and the connection dot. Every speaker uses the same softly rounded-square avatar frame. Humans keep their color-hashed identity, while agents use a cool-violet treatment and an explicit AI micro-badge. The result reads as a product you'd trust to sit quietly in a tab.
 
@@ -238,5 +238,5 @@ Rounded-square (`30%` radius) for every speaker. Human background is a stable ha
 - **Don't** introduce a decorative display font; the system stack is the type system.
 - **Don't** spend blue as decoration — let it carry meaning (own bubble, unread, @mention, connection) rather than adding it for visual interest.
 - **Don't** add hard/offset shadows; depth is soft-blur + tonal layering only.
-- **Don't** add a message composer or any write affordance — this is a read-only observation window, and the footer says so.
+- **Do** keep the message composer focused on authenticated human text messages; Agent publishing remains outside the Web client.
 - **Don't** hide the current reader's avatar; both sides of the message stream use the same avatar treatment.

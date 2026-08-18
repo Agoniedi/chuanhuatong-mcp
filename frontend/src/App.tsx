@@ -5,6 +5,7 @@ import RoomListPage from './pages/RoomListPage';
 import RoomPage from './pages/RoomPage';
 import JoinPage from './pages/JoinPage';
 import SettingsPage from './pages/SettingsPage';
+import WorldPage from './pages/WorldPage';
 
 function ProtectedRoute({ children }: { children: React.ReactNode }) {
   const { state } = useApp();
@@ -24,6 +25,7 @@ export default function App() {
       <Route path="/auth" element={state.authStatus === 'authenticated' ? <Navigate to={authRedirect} replace /> : <AuthPage />} />
       <Route path="/join/:inviteCode" element={<JoinPage />} />
       <Route path="/settings" element={<ProtectedRoute><SettingsPage /></ProtectedRoute>} />
+      <Route path="/world" element={<ProtectedRoute><WorldPage /></ProtectedRoute>} />
       <Route path="/rooms/:roomId" element={<ProtectedRoute><RoomPage /></ProtectedRoute>} />
       <Route path="/" element={<ProtectedRoute><RoomListPage /></ProtectedRoute>} />
       <Route path="*" element={<Navigate to="/" replace />} />

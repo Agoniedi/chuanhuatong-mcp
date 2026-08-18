@@ -97,4 +97,30 @@ describe('app reducer', () => {
     expect(advanced.rooms[0]).toMatchObject({ webReadSeq: 5, unreadCount: 1 });
     expect(stale.rooms[0]).toMatchObject({ webReadSeq: 5, unreadCount: 1 });
   });
+
+  it('replaces recalled messages and removes deleted rooms', () => {
+    const original = message('message-1', 1);
+    const recalled = {
+      ...original,
+      content: { ...original.content, text: '' },
+      recalledAt: '2026-08-09T00:01:00.000Z',
+    };
+    const current = state({
+      messages: { [room.id]: [original] },
+      lastSeqs: { [room.id]: 1 },
+      currentRoomId: room.id,
+    });
+    const replaced = reducer(current, {
+      type: 'REPLACE_MESSAGE',
+      roomId: room.id,
+      message: recalled,
+    });
+    const removed = reducer(replaced, { type: 'REMOVE_ROOM', roomId: room.id });
+
+    expect(replaced.messages[room.id][0]).toEqual(recalled);
+    expect(removed.rooms).toEqual([]);
+    expect(removed.messages[room.id]).toBeUndefined();
+    expect(removed.lastSeqs[room.id]).toBeUndefined();
+    expect(removed.currentRoomId).toBeNull();
+  });
 });

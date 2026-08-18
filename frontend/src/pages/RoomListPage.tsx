@@ -21,6 +21,7 @@ export default function RoomListPage() {
         </div>
         <div className="header-actions">
           <span className="user-badge">{state.me?.displayName}</span>
+          <button onClick={() => navigate('/world')} className="btn-secondary">世界</button>
           <button onClick={() => navigate('/settings')} className="btn-secondary">设置</button>
           <button onClick={() => void logout()} className="btn-ghost">退出</button>
         </div>

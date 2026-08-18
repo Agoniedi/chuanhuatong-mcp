@@ -13,10 +13,27 @@ export interface Room {
   lastSeq: number;
   revision: number;
   historyVisibility: string;
+  worldPublished?: boolean;
+  worldSummary?: string;
   createdAt: string;
   updatedAt: string;
   webReadSeq: number;
   unreadCount: number;
+}
+
+export interface WorldRoom {
+  id: string;
+  title: string;
+  ownerUserId: string;
+  ownerDisplayName: string;
+  summary: string;
+  publishedAt: string;
+}
+
+export interface WorldRoomDetail extends WorldRoom {
+  inviteToken: string;
+  inviteExpiresAt: string;
+  remainingUses: number;
 }
 
 export interface MessageContent {
@@ -49,6 +66,7 @@ export interface Message {
   replyToMessageId: string | null;
   generationRequestId?: string;
   triggerThroughSeq?: number;
+  recalledAt?: string | null;
   createdAt: string;
 }
 
@@ -120,6 +138,18 @@ export interface MessageCreatedEvent extends WsEvent {
   type: 'message.created';
   roomId: string;
   payload: Message;
+}
+
+export interface MessageRecalledEvent extends WsEvent {
+  type: 'message.recalled';
+  roomId: string;
+  payload: Message;
+}
+
+export interface RoomDeletedEvent extends WsEvent {
+  type: 'room.deleted';
+  roomId: string;
+  payload: { roomId: string };
 }
 
 export interface ProfileUpdatedEvent extends WsEvent {
