@@ -4,6 +4,9 @@ import Avatar from './Avatar';
 interface Props {
   message: Message;
   isOwn: boolean;
+  isGroupStart: boolean;
+  isGroupEnd: boolean;
+  justArrived: boolean;
   replyTo?: Message;
   onLocateReply: (messageId: string) => void;
 }
@@ -16,20 +19,31 @@ function highlightedText(text: string) {
   );
 }
 
-export default function MessageItem({ message, isOwn, replyTo, onLocateReply }: Props) {
+export default function MessageItem({
+  message,
+  isOwn,
+  isGroupStart,
+  isGroupEnd,
+  justArrived,
+  replyTo,
+  onLocateReply,
+}: Props) {
   const isAgent = message.sender.kind === 'agent';
-  const time = new Date(message.createdAt).toLocaleTimeString('zh-CN', {
-    hour: '2-digit',
-    minute: '2-digit',
-  });
+
+  const rowClass = [
+    'message-row',
+    isOwn ? 'own' : 'other',
+    isGroupStart ? 'group-start' : '',
+    isGroupEnd ? 'group-end' : '',
+    justArrived ? 'just-arrived' : '',
+  ]
+    .filter(Boolean)
+    .join(' ');
 
   return (
-    <article
-      className={`message-item ${isOwn ? 'message-own' : ''} ${isAgent ? 'message-agent' : ''}`}
-      data-message-id={message.id}
-    >
-      <div className="message-sender">
-        {!isOwn && (
+    <article className={rowClass} data-message-id={message.id}>
+      <div className="msg-avatar-slot">
+        {isGroupEnd && (
           <Avatar
             name={message.sender.displayNameSnapshot}
             resourceId={message.sender.avatarResourceIdSnapshot}
@@ -37,25 +51,32 @@ export default function MessageItem({ message, isOwn, replyTo, onLocateReply }: 
             size="small"
           />
         )}
-        <span className="sender-name">
-          {isAgent && <span className="agent-badge">AI</span>}
-          {message.sender.displayNameSnapshot}
-        </span>
-        <time className="message-time" dateTime={message.createdAt}>{time}</time>
       </div>
-      <div className="message-bubble">
-        {message.replyToMessageId && (
-          <button
-            type="button"
-            className="reply-summary"
-            disabled={!replyTo}
-            onClick={() => onLocateReply(message.replyToMessageId!)}
-          >
-            <span>{replyTo?.sender.displayNameSnapshot ?? '较早消息'}</span>
-            <span>{replyTo?.content.text ?? '原消息尚未加载'}</span>
-          </button>
+      <div className="msg-content">
+        {!isOwn && isGroupStart && (
+          <div className="msg-name">
+            <span className="name-text">{message.sender.displayNameSnapshot}</span>
+            {isAgent && <span className="agent-badge">AI</span>}
+          </div>
         )}
-        <div className="message-text">{highlightedText(message.content.text)}</div>
+        <div className="msg-bubble">
+          {message.replyToMessageId && (
+            <button
+              type="button"
+              className="reply-summary"
+              disabled={!replyTo}
+              onClick={() => onLocateReply(message.replyToMessageId!)}
+            >
+              <span className="reply-quote-name">
+                {replyTo?.sender.displayNameSnapshot ?? '较早消息'}
+              </span>
+              <span className="reply-quote-text">
+                {replyTo?.content.text ?? '原消息尚未加载'}
+              </span>
+            </button>
+          )}
+          <div className="msg-text">{highlightedText(message.content.text)}</div>
+        </div>
       </div>
     </article>
   );

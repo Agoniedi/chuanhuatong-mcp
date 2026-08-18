@@ -11,6 +11,15 @@ import {
   uploadAvatar,
 } from '../api/profiles';
 import Avatar from '../components/Avatar';
+import {
+  applyBubbleColor,
+  applyBubbleOpacity,
+  clearChatBackground,
+  hasChatBackground,
+  readBubbleColor,
+  readBubbleOpacity,
+  saveChatBackground,
+} from '../appearance';
 import { useApp } from '../store/useApp';
 import type { AgentProfile, DeviceInfo, McpDeviceCreation } from '../types';
 
@@ -109,6 +118,10 @@ export default function SettingsPage() {
   const [passwordSaving, setPasswordSaving] = useState(false);
   const [error, setError] = useState<string | null>(null);
   const [notice, setNotice] = useState<string | null>(null);
+  const [bubbleOpacity, setBubbleOpacity] = useState(readBubbleOpacity);
+  const [bubbleColor, setBubbleColor] = useState(readBubbleColor);
+  const [backgroundPresent, setBackgroundPresent] = useState(false);
+  const [appearanceSaving, setAppearanceSaving] = useState(false);
 
   useEffect(() => {
     Promise.all([listAgentProfiles(), listDevices()])
@@ -117,6 +130,10 @@ export default function SettingsPage() {
         setDevices(deviceItems);
       })
       .catch(error => setError(messageFrom(error, '设置加载失败')));
+  }, []);
+
+  useEffect(() => {
+    void hasChatBackground().then(setBackgroundPresent);
   }, []);
 
   const saveProfile = async (event: React.FormEvent) => {
@@ -185,6 +202,50 @@ export default function SettingsPage() {
     }
   };
 
+  const changeBubbleOpacity = (value: number) => {
+    applyBubbleOpacity(value);
+    setBubbleOpacity(value);
+  };
+
+  const changeBubbleColor = (value: string) => {
+    applyBubbleColor(value);
+    setBubbleColor(value);
+  };
+
+  const changeChatBackground = async (event: React.ChangeEvent<HTMLInputElement>) => {
+    const input = event.currentTarget;
+    const file = input.files?.[0];
+    if (!file) return;
+    setAppearanceSaving(true);
+    setError(null);
+    setNotice(null);
+    try {
+      await saveChatBackground(file);
+      setBackgroundPresent(true);
+      setNotice('聊天背景已更新');
+    } catch (error) {
+      setError(messageFrom(error, '聊天背景更新失败'));
+    } finally {
+      input.value = '';
+      setAppearanceSaving(false);
+    }
+  };
+
+  const removeChatBackground = async () => {
+    setAppearanceSaving(true);
+    setError(null);
+    setNotice(null);
+    try {
+      await clearChatBackground();
+      setBackgroundPresent(false);
+      setNotice('聊天背景已移除');
+    } catch (error) {
+      setError(messageFrom(error, '聊天背景移除失败'));
+    } finally {
+      setAppearanceSaving(false);
+    }
+  };
+
   return (
     <main className="settings-page">
       <header className="settings-header">
@@ -197,6 +258,64 @@ export default function SettingsPage() {
 
       {error && <div className="error-message" role="alert">{error}</div>}
       {notice && <div className="success-message" role="status">{notice}</div>}
+
+      <section className="settings-section">
+        <h2>聊天外观</h2>
+        <div className="appearance-controls">
+          <div className="appearance-background-row">
+            <div
+              className={`background-preview ${backgroundPresent ? '' : 'empty'}`}
+              aria-hidden="true"
+            />
+            <div className="appearance-file">
+              <label htmlFor="chat-background">聊天背景图</label>
+              <input
+                id="chat-background"
+                type="file"
+                accept="image/jpeg,image/png,image/webp"
+                disabled={appearanceSaving}
+                onChange={event => void changeChatBackground(event)}
+              />
+            </div>
+            <button
+              type="button"
+              className="btn-ghost"
+              disabled={!backgroundPresent || appearanceSaving}
+              onClick={() => void removeChatBackground()}
+            >
+              移除背景
+            </button>
+          </div>
+          <div className="appearance-opacity">
+            <div className="appearance-opacity-label">
+              <label htmlFor="bubble-opacity">气泡透明度</label>
+              <output htmlFor="bubble-opacity">{bubbleOpacity}%</output>
+            </div>
+            <input
+              id="bubble-opacity"
+              type="range"
+              min="10"
+              max="100"
+              step="1"
+              value={bubbleOpacity}
+              onChange={event => changeBubbleOpacity(Number(event.target.value))}
+            />
+          </div>
+          <div className="appearance-color">
+            <label htmlFor="bubble-color">我的气泡颜色</label>
+            <div className="appearance-color-row">
+              <input
+                id="bubble-color"
+                type="color"
+                value={bubbleColor}
+                onChange={event => changeBubbleColor(event.target.value)}
+                aria-label="选择我的气泡颜色"
+              />
+              <output htmlFor="bubble-color">{bubbleColor.toUpperCase()}</output>
+            </div>
+          </div>
+        </div>
+      </section>
 
       <section className="settings-section">
         <h2>我的资料</h2>

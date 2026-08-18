@@ -78,7 +78,6 @@ export default function AuthPage() {
   return (
     <main className="auth-page">
       <section className="auth-card" aria-labelledby="auth-title">
-        <div className="brand-mark" aria-hidden="true">传</div>
         <h1 id="auth-title">传话筒</h1>
         <p className="auth-subtitle">网页端用于安静地查看群聊</p>
 

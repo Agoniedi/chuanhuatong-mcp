@@ -101,11 +101,23 @@ export default function RoomPage() {
   return (
     <div className="room-page">
       <header className="room-header">
-        <button onClick={() => navigate('/')} className="btn-ghost">← 返回</button>
-        <h2>{room?.title ?? '加载中...'}</h2>
+        <button onClick={() => navigate('/')} className="btn-ghost" aria-label="返回房间列表">
+          <svg viewBox="0 0 20 20" width="18" height="18" fill="none" aria-hidden="true">
+            <path d="M12.5 5l-5 5 5 5" stroke="currentColor" strokeWidth="1.8" strokeLinecap="round" strokeLinejoin="round" />
+          </svg>
+        </button>
+        <div className="room-title-group">
+          <h2>{room?.title ?? '加载中...'}</h2>
+          <div className="room-subline">
+            <span className={`ws-status ${state.wsStatus}`}>{wsLabel}</span>
+          </div>
+        </div>
         <div className="header-actions">
-          <span className={`ws-status ${state.wsStatus}`}>{wsLabel}</span>
-          <button onClick={() => setShowMembers(!showMembers)} className="btn-secondary">
+          <button
+            onClick={() => setShowMembers(!showMembers)}
+            className="btn-secondary"
+            aria-pressed={showMembers}
+          >
             {showMembers ? '隐藏成员' : '成员'}
           </button>
         </div>
@@ -128,7 +140,14 @@ export default function RoomPage() {
           )}
         </div>
         {showMembers && (
-          <MemberPanel roomId={roomId} profileVersion={state.profileVersion} />
+          <>
+            <div
+              className="panel-scrim"
+              onClick={() => setShowMembers(false)}
+              aria-hidden="true"
+            />
+            <MemberPanel roomId={roomId} profileVersion={state.profileVersion} />
+          </>
         )}
       </div>
     </div>
