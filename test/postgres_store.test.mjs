@@ -408,16 +408,15 @@ describe('PostgreSQL group chat storage', () => {
         assert.equal(profileUpdate.body.userId, profileSession.user.userId);
         assert.equal(profileUpdate.body.displayName, 'Postgres Profile After');
         assert.equal(profileUpdate.body.profileRevision, 2);
-        await assert.rejects(
-          store.updateMyProfile({
-            ...profileUpdateRequest,
-            expectedProfileRevision: 2,
-            displayName: 'Ｐｏｓｔｇｒｅｓ Ａｌｉｃｅ',
-            key: 'postgres-profile-update-duplicate',
-            requestFingerprint: 'postgres-profile-update-duplicate-fingerprint',
-          }),
-          (error) => error.status === 409 && error.code === 'conflict',
-        );
+        const duplicateDisplayNameUpdate = await store.updateMyProfile({
+          ...profileUpdateRequest,
+          expectedProfileRevision: 2,
+          displayName: 'Ｐｏｓｔｇｒｅｓ Ａｌｉｃｅ',
+          key: 'postgres-profile-update-duplicate',
+          requestFingerprint: 'postgres-profile-update-duplicate-fingerprint',
+        });
+        assert.equal(duplicateDisplayNameUpdate.body.profileRevision, 3);
+        assert.equal(duplicateDisplayNameUpdate.body.displayName, 'Ｐｏｓｔｇｒｅｓ Ａｌｉｃｅ');
         const roomRequest = {
           userId: session.user.userId,
           title: 'Persistent room',
@@ -487,7 +486,15 @@ describe('PostgreSQL group chat storage', () => {
           key: 'persistent-message',
           requestFingerprint: 'message-fingerprint',
         });
-        assert.equal((await store.listPendingOutboxEvents()).length, 1);
+        const initialPending = await store.listPendingOutboxEvents();
+        assert.equal(
+          initialPending.filter((entry) => entry.event.type === 'message.created').length,
+          1,
+        );
+        assert.equal(
+          initialPending.filter((entry) => entry.event.type === 'profile.updated').length,
+          3,
+        );
         const authenticated = await store.authenticate(session.accessToken);
         const runtimeResult = await store.putMyAgentRuntime({
           user: authenticated,
@@ -553,7 +560,15 @@ describe('PostgreSQL group chat storage', () => {
         const published = await store.publishGenerationRequest(publishRequest);
         assert.equal(published.body.generationRequest.status, 'published');
         assert.equal(published.body.message.sender.kind, 'agent');
-        assert.equal((await store.listPendingOutboxEvents()).length, 2);
+        const publishedPending = await store.listPendingOutboxEvents();
+        assert.equal(
+          publishedPending.filter((entry) => entry.event.type === 'message.created').length,
+          2,
+        );
+        assert.equal(
+          publishedPending.filter((entry) => entry.event.type === 'profile.updated').length,
+          3,
+        );
         const disposable = await store.createManualGenerationRequest({
           user: authenticated,
           roomId: roomResult.body.id,
@@ -639,8 +654,8 @@ describe('PostgreSQL group chat storage', () => {
         const restoredUser = await store.authenticate(session.accessToken);
         const restoredProfileUser = await store.authenticate(profileSession.accessToken);
         assert.equal(restoredUser.userId, session.user.userId);
-        assert.equal(restoredProfileUser.displayName, 'Postgres Profile After');
-        assert.equal(restoredProfileUser.profileRevision, 2);
+        assert.equal(restoredProfileUser.displayName, 'Ｐｏｓｔｇｒｅｓ Ａｌｉｃｅ');
+        assert.equal(restoredProfileUser.profileRevision, 3);
         assert.deepEqual(
           (await store.listRooms(restoredUser.userId)).map((room) => room.id),
           [roomResult.body.id],
@@ -702,7 +717,10 @@ describe('PostgreSQL group chat storage', () => {
           afterSeq: 0,
           limit: 100,
         });
-        assert.deepEqual(messages.items, [messageResult.body, published.body.message]);
+        assert.deepEqual(messages.items, [
+          { ...messageResult.body, recalledAt: null },
+          { ...published.body.message, recalledAt: null },
+        ]);
         assert.ok(messages.items.every((message) => message.seq <= messages.highWaterSeq));
         assert.ok(concurrentMessage.body.seq > messages.highWaterSeq);
         assert.deepEqual(
@@ -737,7 +755,14 @@ describe('PostgreSQL group chat storage', () => {
         });
         assert.deepEqual(replay, messageResult);
         const pending = await store.listPendingOutboxEvents();
-        assert.equal(pending.length, 2);
+        assert.equal(
+          pending.filter((entry) => entry.event.type === 'message.created').length,
+          3,
+        );
+        assert.equal(
+          pending.filter((entry) => entry.event.type === 'profile.updated').length,
+          3,
+        );
         for (const entry of pending) {
           await store.markOutboxDispatched(entry.outboxId);
         }
@@ -1215,8 +1240,11 @@ describe('PostgreSQL group chat storage', () => {
           'one',
         );
         await createAndPublish('agent-trigger', firstPublished.body.message.id);
+        for (let index = 2; index < 20; index += 1) {
+          await createAndPublish(`limit-${index}`, trigger.body.id);
+        }
         await assert.rejects(
-          createAndPublish('two', trigger.body.id),
+          createAndPublish('limit-overflow', trigger.body.id),
           (error) => error.code === 'agent_loop_limit_reached',
         );
         const reset = await store.createHumanMessage({

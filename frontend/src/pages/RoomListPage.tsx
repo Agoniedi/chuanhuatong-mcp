@@ -1,6 +1,8 @@
 import { useEffect } from 'react';
 import { useNavigate } from 'react-router-dom';
 import { useApp } from '../store/useApp';
+import Avatar from '../components/Avatar';
+import TopLevelNav from '../components/TopLevelNav';
 
 export default function RoomListPage() {
   const { state, refreshRooms, logout } = useApp();
@@ -21,9 +23,17 @@ export default function RoomListPage() {
         </div>
         <div className="header-actions">
           <span className="user-badge">{state.me?.displayName}</span>
-          <button onClick={() => navigate('/world')} className="btn-secondary">世界</button>
-          <button onClick={() => navigate('/settings')} className="btn-secondary">设置</button>
-          <button onClick={() => void logout()} className="btn-ghost">退出</button>
+          <button
+            type="button"
+            onClick={() => void logout()}
+            className="btn-ghost room-logout-button"
+            aria-label="退出登录"
+            title="退出登录"
+          >
+            <svg viewBox="0 0 24 24" width="18" height="18" fill="none" aria-hidden="true">
+              <path d="M10 5H6.5A1.5 1.5 0 0 0 5 6.5v11A1.5 1.5 0 0 0 6.5 19H10M14 8l4 4-4 4M18 12H9" stroke="currentColor" strokeWidth="1.6" strokeLinecap="round" strokeLinejoin="round" />
+            </svg>
+          </button>
         </div>
       </header>
 
@@ -41,9 +51,12 @@ export default function RoomListPage() {
               className="room-card"
               onClick={() => navigate(`/rooms/${room.id}`)}
             >
-              <span className="room-card-title">{room.title}</span>
-              <span className="room-card-meta">
-                {room.ownerUserId === state.me?.userId ? '我创建的房间' : '已加入的房间'}
+              <Avatar name={room.title} resourceId={null} size="large" />
+              <span className="room-card-copy">
+                <span className="room-card-title">{room.title}</span>
+                <span className="room-card-meta">
+                  {room.ownerUserId === state.me?.userId ? '我创建的房间' : '已加入的房间'}
+                </span>
               </span>
               {room.unreadCount > 0 && (
                 <span className="unread-badge" aria-label={`${room.unreadCount} 条未读消息`}>
@@ -54,6 +67,7 @@ export default function RoomListPage() {
           ))
         )}
       </section>
+      <TopLevelNav />
     </main>
   );
 }

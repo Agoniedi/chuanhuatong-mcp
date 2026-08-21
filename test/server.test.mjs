@@ -1218,6 +1218,23 @@ describe('local group chat REST loop', () => {
     assert.deepEqual(updateReplay.body, updated.body);
     assert.equal(stale.response.status, 409);
     assert.equal(stale.body.error.code, 'request_version_conflict');
+
+    const forbiddenDelete = await request(`/v1/agent-profiles/${created.body.id}`, {
+      method: 'DELETE',
+      headers: { Authorization: `Bearer ${users.bob.accessToken}` },
+    });
+    assert.equal(forbiddenDelete.response.status, 403);
+
+    const deleted = await request(`/v1/agent-profiles/${created.body.id}`, {
+      method: 'DELETE',
+      headers: { Authorization: `Bearer ${users.alice.accessToken}` },
+    });
+    assert.equal(deleted.response.status, 204);
+
+    const afterDelete = await request(`/v1/agent-profiles/${created.body.id}`, {
+      headers: { Authorization: `Bearer ${users.alice.accessToken}` },
+    });
+    assert.equal(afterDelete.response.status, 404);
   });
 
   it('separates authoritative room bindings from member-visible snapshots', async () => {

@@ -20,7 +20,8 @@ services:
 
   server:
     build:
-      context: ./server
+      # The production Dockerfile and the new frontend live at repository root.
+      context: ..
     restart: unless-stopped
     depends_on:
       postgres:

@@ -1,6 +1,6 @@
 import { apiRequest } from './client';
 import { newRequestId } from './request-id';
-import type { Room, WorldRoom, WorldRoomDetail } from '../types';
+import type { InvitePreview, Room, WorldRoom, WorldRoomDetail } from '../types';
 
 export async function listRooms(): Promise<Room[]> {
   const result = await apiRequest<{ items: Room[] }>('GET', '/v1/rooms');
@@ -22,6 +22,16 @@ export async function listWorldRooms(): Promise<WorldRoom[]> {
 
 export function getWorldRoom(roomId: string): Promise<WorldRoomDetail> {
   return apiRequest('GET', `/v1/world/rooms/${roomId}`);
+}
+
+export function acceptInvite(inviteToken: string): Promise<Room> {
+  return apiRequest('POST', '/v1/invites/accept', { inviteToken }, {
+    operationId: newRequestId(),
+  });
+}
+
+export function previewInvite(inviteToken: string): Promise<InvitePreview> {
+  return apiRequest('GET', `/v1/invites/preview?token=${encodeURIComponent(inviteToken)}`);
 }
 
 export function updateWorldRoom(roomId: string, published: boolean, summary = ''): Promise<{

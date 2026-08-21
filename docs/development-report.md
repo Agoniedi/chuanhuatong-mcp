@@ -1,9 +1,9 @@
 # 传话筒 MCP 项目开发报告
 
-> 版本：v1.2
-> 日期：2026-08-06
-> 状态：Phase 1–4 完成，可交付审查
-> 下一阶段：Phase 5 安全加固 + 部署
+> 版本：v1.3
+> 日期：2026-08-21
+> 状态：Phase 1–4 与 Web 前端视觉重设计完成，可交付审查
+> 当前阶段：实现与验证记录已对齐，等待变更审查与提交
 > 审查与修订记录：`docs/web-frontend-review-and-remediation-report-2026-08-06.md`
 
 ---
@@ -51,8 +51,8 @@
 
 | 决策 | 选择 | 理由 |
 |------|------|------|
-| 鉴权方式 | Bearer Token（ct_ 前缀） | 无密码，Token 即身份，适合内部/临时使用 |
-| WebSocket 认证 | URL query `?token=` | 浏览器 WS 不支持自定义 Header |
+| 鉴权方式 | Web HttpOnly Session + MCP Bearer Token（ct_ 前缀） | Web 账号与 MCP 身份绑定，设备凭据独立 |
+| WebSocket 认证 | Web 同源 Session Cookie；兼容 Bearer Header / `?token=` | 浏览器无需把 Session 暴露给脚本，非浏览器客户端仍可连接 |
 | 实时推送 | 250ms outbox 轮询 | 简单可靠，无需维护 WS 状态 |
 | 消息排序 | `seq` 单调递增 | 唯一可靠排序键，不依赖时间戳 |
 | 前端状态管理 | React Context + useReducer | 零外部依赖，匹配项目规模 |
@@ -97,8 +97,11 @@
 
 | 端点 | 方法 | 用途 |
 |------|------|------|
-| `/v1/auth/register` | POST | Web 用户注册（要求 `Idempotency-Key`） |
-| `/v1/me` | GET | 当前用户信息 |
+| `/v1/auth/register` | POST | 绑定已有 MCP 身份并创建 Web 账号 |
+| `/v1/auth/login` | POST | 用户名密码登录并建立 HttpOnly Session |
+| `/v1/auth/logout` | POST | 注销当前 Web Session |
+| `/v1/auth/reset-password` | POST | 使用 MCP 签发的重置码设置新密码 |
+| `/v1/me` | GET/PATCH | 当前用户信息/修改资料 |
 | `/v1/rooms` | GET/POST | 房间列表/创建 |
 | `/v1/rooms/:id` | GET | 房间详情 |
 | `/v1/rooms/:id/messages` | GET/POST | 消息分页/发送 |
@@ -114,6 +117,9 @@
 | `/v1/agent-profiles/:id` | GET/PUT | 查看/修改 Agent 配置 |
 | `/v1/invites/accept` | POST | 接受邀请 |
 | `/v1/invites/preview` | GET | 邀请预览 |
+| `/v1/world/rooms` | GET | 查看已公开到世界的房间 |
+| `/v1/rooms/:id/world` | PUT | 房主发布、编辑或取消世界展示 |
+| `/v1/me/devices` | GET/POST | MCP 设备列表/创建设备 Token |
 
 ### 3.4 Agent 生命周期
 
@@ -138,15 +144,15 @@
 
 | 文件 | 行数 | 职责 |
 |------|------|------|
-| 页面组件（4 个） | 338 | AuthPage / RoomListPage / RoomPage / JoinPage |
-| UI 组件（5 个） | 307 | MessageList / MessageItem / SendBar / MemberPanel / InviteModal |
+| 页面组件（6 个） | — | AuthPage / RoomListPage / RoomPage / JoinPage / WorldPage / SettingsPage |
+| UI 组件（含导航与头像） | — | MessageList / MessageItem / SendBar / MemberPanel / Avatar / TopLevelNav |
 | 状态管理 | 169 | AppContext（Context + useReducer） |
 | API 层（7 个） | 145 | client / auth / rooms / messages / members / invites / agent-bindings |
 | WebSocket | 74 | useRealtimeWS hook（指数退避重连） |
 | 类型定义 | 101 | types.ts |
 | 入口与路由 | 43 | main.tsx / App.tsx |
-| **CSS** | **802** | 完整亮色/暗色主题 |
-| **前端合计** | **1,979** | |
+| **CSS** | — | 完整亮色/暗色主题与响应式聊天布局 |
+| **前端合计** | — | 行数随视觉迭代变化，以源码为准 |
 
 ### 4.2 技术选型
 
@@ -164,30 +170,36 @@
 
 | 路径 | 页面 | 说明 |
 |------|------|------|
-| `/auth` | AuthPage | 注册页，输入显示名获取 Token |
-| `/` | RoomListPage | 房间列表 + 创建/入口 |
+| `/auth` | AuthPage | 登录、绑定账号、密码重置 |
+| `/` | RoomListPage | 房间列表与顶层导航 |
 | `/rooms/:roomId` | RoomPage | 聊天界面 |
 | `/join/:inviteCode` | JoinPage | 邀请深链接 |
+| `/world` | WorldPage | 浏览并加入公开房间 |
+| `/settings` | SettingsPage | 资料、外观、密码与 MCP 设备管理 |
 
 ### 4.4 页面展示
 
-**AuthPage**：居中卡片，标题"传话筒"，输入显示名后注册，Token 存 localStorage。
+**AuthPage**：居中卡片，提供用户名密码登录、MCP 绑定码注册和密码重置。
 
-**RoomListPage**：顶部显示用户名 + 新建/退出按钮，房间卡片列表，每 10s 自动刷新。
+**RoomListPage**：统一顶层导航、房间卡片列表和空状态；创建房间仍由 MCP 完成。
 
 **RoomPage**：
-- 顶部：返回按钮 + 房间名 + WS 连接状态 + 邀请按钮 + 成员按钮
+- 顶部：返回按钮 + 房间名 + WS 连接状态 + 成员按钮
 - 中间：消息流，按 seq 排序，自动滚动到底部
 - 底部：输入框 + 发送按钮
 - 右侧（可展开）：成员面板
 
-**JoinPage**：邀请预览（房间名/邀请人/剩余次数/过期时间）+ 加入按钮
+**JoinPage**：邀请预览（房间名/邀请人/剩余次数/过期时间）+ 加入按钮。
+
+**WorldPage**：展示公开房间，并复用邀请接受流程加入房间。
+
+**SettingsPage**：修改资料、外观和密码，并管理 MCP 设备凭据。
 
 ### 4.5 Agent 可见性（Phase 3）
 
-- **MessageItem**：Agent 消息显示 🤖 头像 + `AI` 标签，紫色气泡底色
+- **MessageItem**：Agent 消息显示独立头像和 `AI` 标签
 - **MemberPanel**：分"成员"和"Agent"两区，Agent 显示参与模式（自动/手动/停用）状态标签
-- 人类消息：蓝色气泡（自己）/ 白色气泡（他人），首字母头像
+- 人类消息区分自己与他人；自己的气泡颜色和透明度可在设置页调整
 
 ### 4.6 WebSocket 重连策略
 
@@ -211,12 +223,10 @@
 | **Phase 3 Agent 可见性** | Agent 消息样式 + 成员面板分区 + 后端 AgentBinding 补充字段 | ~200 行 |
 | **Phase 4 长轮询** | `group_poll_messages` 工具（60s 超时，2s 轮询间隔） | ~40 行后端 + ~60 行测试 |
 
-### 未开始
+### 后续候选（不属于当前产品契约）
 
 | 阶段 | 内容 | 优先级 |
 |------|------|--------|
-| **Phase 5 加固** | Token 撤销轮换 · 审计日志 · 滥用防护 · OAuth 2.1 | 高（公开分发前） |
-| **部署** | 后端同源托管前端静态文件 · Docker Compose · 部署文档 | 高 |
 | **讨论模式** | Agent 多轮对话（见 `docs/discussion-mode-design.md`） | 中 |
 | **常驻 Agent 进程** | 独立服务轮询 + 调用 LLM API | 低（需 API Key） |
 
@@ -228,11 +238,12 @@
 
 | 测试文件 | 行数 | 测试数 |
 |----------|------|--------|
-| `test/mcp/group_chat_mcp.test.mjs` | 1,887 | 30 个 |
-| `test/server.test.mjs` | 1,488 | 18 个 |
-| `test/postgres_store.test.mjs` | 1,024 | 7 个 |
-| `test/admin_credentials.test.mjs` | 235 | 7 个 |
-| **合计** | **4,634** | **62 项：56 通过，6 跳过，0 失败** |
+| `test/mcp/group_chat_mcp.test.mjs` | 1,882 | 32 个 |
+| `test/server.test.mjs` | 1,773 | 25 个 |
+| `test/postgres_store.test.mjs` | 1,340 | 8 个（默认跳过其中 7 个数据库集成用例） |
+| `test/admin_credentials.test.mjs` | 220 | 7 个 |
+| `test/web_identity.test.mjs` | 207 | 1 个 |
+| **合计** | — | 后端 73 项全部通过（含 7 项 PostgreSQL）；前端单测 13 项通过；Playwright E2E 1 项通过 |
 
 ### 覆盖范围
 
@@ -251,26 +262,27 @@
 
 ### 测试模式
 
-默认测试无需 PostgreSQL。未设置 `TEST_DATABASE_URL` 时，6 个 PostgreSQL 集成用例跳过（`# SKIP`）；这不等同于 PostgreSQL 路径已在本机完成验证。
+默认测试无需 PostgreSQL；本次使用 Compose 独立 PostgreSQL 17 容器设置 `TEST_DATABASE_URL`，7 个数据库集成用例已全部执行并通过。生产形态容器还完成了迁移、同源 SPA 首页/路由回退，以及创建房间、写读消息、删除房间烟测。
 
 ---
 
 ## 7. 关键设计决策
 
-### D1：Token 即身份（无密码）
+### D1：Web 账号与 MCP 身份绑定
 
-- 用户 Token 存 localStorage，清除即丢失账号
-- 适合内部/临时使用，Phase 5 加固时升级为 OAuth
+- MCP 先签发一次性绑定码，Web 使用用户名和密码完成绑定
+- Web 登录使用同源 HttpOnly Cookie Session；MCP 设备继续使用独立 Bearer Token
 
 ### D2：前后端部署现状
 
 - 当前开发环境由 Vite 单独托管前端，并代理 REST 与 WebSocket 到 `localhost:18787`
-- `frontend/dist/` 的后端同源托管尚未实现，仍属于部署阶段工作
+- 服务端已支持将 `frontend/dist/` 同源托管，并为 SPA 路由回退到 `index.html`
+- 根目录 `compose.yaml` 已验证 PostgreSQL 17、迁移和生产形态同源服务
 
-### D3：WebSocket 用 `?token=` 传认证
+### D3：WebSocket 认证
 
-- 浏览器 WebSocket API 不支持自定义 Header
-- 服务器端同时支持 Header 和 query 参数
+- 浏览器通过同源 HttpOnly Session Cookie 认证，无需在前端脚本中读取 Token
+- 服务器端同时兼容 Bearer Header 和 query 参数，供其他客户端使用
 
 ### D4：全局单 WS 连接
 
@@ -294,27 +306,30 @@
 | `MCP_ALLOWED_ORIGINS` | — | MCP 跨域来源 |
 | `CORS_ALLOW_ORIGIN` | `*` | REST API 跨域来源 |
 | `PORT` | `18787` | 服务端口 |
-| `HOST` | `0.0.0.0` | 监听地址 |
+| `SERVER_HOST` | `127.0.0.1` | 监听地址 |
 
 ---
 
 ## 9. 启动方式
 
-```bash
+```powershell
 # 开发模式（内存存储 + 开发认证 + Web 注册）
-PUBLIC_REGISTRATION=1 node src/server.mjs --memory --dev-auth
+$env:PUBLIC_REGISTRATION = '1'
+npm.cmd run start:memory
 
 # 生产模式（PostgreSQL）
-DATABASE_URL=postgres://... node src/server.mjs
+$env:DATABASE_URL = 'postgres://...'
+npm.cmd run start
 
 # 前端开发
-cd frontend && npm run dev
+Set-Location frontend
+npm.cmd run dev
 
 # 运行测试
-npm test
+npm.cmd test
 
 # 前端构建
-cd frontend && npm run build
+npm.cmd run build --prefix frontend
 ```
 
 ---
@@ -335,20 +350,19 @@ a250199 Add credential administration CLI (2026-07-31)
 
 ### 技术债务
 - 内存模式（`InMemoryGroupChatStore`）与 PG 模式（`PostgresGroupChatStore`）代码重复，约 80% 相似
-- 前端 `AppContext.tsx` 中 `loadMessages` 使用动态 `import()`，构建有 `INEFFECTIVE_DYNAMIC_IMPORT` 警告
-- 无前端单元测试（Vitest + @testing-library/react 未配置）
+- 前端已有 Vitest + Testing Library 覆盖状态 reducer、WebSocket hook、消息列表和顶层导航；仍缺少完整页面级 E2E 覆盖
 
 ### 安全
-- 无 Token 撤销机制
 - 无审计日志
-- 无消息编辑/删除
-- 公开注册无身份验证，仅有 IP 限流；反向代理部署需显式配置 `TRUST_PROXY=1`
+- MCP 设备 Token 支持逐设备撤销，但没有自动轮换
+- 无消息编辑；本人消息支持 5 分钟内撤回，房主支持删除房间
+- Web 账号绑定要求 MCP 签发的一次性绑定码，并受 IP 限流；反向代理部署需显式配置 `TRUST_PROXY=1`
 
 ### 功能
 - 无 Agent "生成中"状态指示（前端轮询或 WS 推送）
 - 无消息搜索
 - 无文件/图片上传
-- 无消息已读状态
+- Web 已读位置通过独立 `web_read_seq` 维护
 - 无用户在线状态
 
 ---

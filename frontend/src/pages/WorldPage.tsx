@@ -3,6 +3,7 @@ import { useNavigate } from 'react-router-dom';
 import { getWorldRoom, listWorldRooms, updateWorldRoom } from '../api/rooms';
 import { useApp } from '../store/useApp';
 import type { Room, WorldRoom, WorldRoomDetail } from '../types';
+import TopLevelNav from '../components/TopLevelNav';
 
 function formatDate(iso: string) {
   return new Intl.DateTimeFormat('zh-CN', {
@@ -165,7 +166,6 @@ export default function WorldPage() {
               <path d="M16 9a6 6 0 0 0-10.7-3.7L4 6.8M4 4v2.8h2.8M4 11a6 6 0 0 0 10.7 3.7l1.3-1.5M16 16v-2.8h-2.8" stroke="currentColor" strokeWidth="1.5" strokeLinecap="round" strokeLinejoin="round" />
             </svg>
           </button>
-          <button type="button" className="btn-secondary" onClick={() => navigate('/')}>我的房间</button>
         </div>
       </header>
 
@@ -295,6 +295,7 @@ export default function WorldPage() {
           </section>
         </div>
       )}
+      <TopLevelNav />
     </main>
   );
 }

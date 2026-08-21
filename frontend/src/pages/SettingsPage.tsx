@@ -1,5 +1,4 @@
 import { useEffect, useState } from 'react';
-import { useNavigate } from 'react-router-dom';
 import { changePassword } from '../api/auth';
 import {
   createMcpDevice,
@@ -22,6 +21,7 @@ import {
 } from '../appearance';
 import { useApp } from '../store/useApp';
 import type { AgentProfile, DeviceInfo, McpDeviceCreation } from '../types';
+import TopLevelNav from '../components/TopLevelNav';
 
 function messageFrom(error: unknown, fallback: string) {
   return error instanceof Error ? error.message : fallback;
@@ -68,17 +68,17 @@ function AgentEditor({
   };
 
   return (
-    <form className="settings-item" onSubmit={save}>
-      <div className="settings-item-heading">
+    <form className="settings-item agent-editor" onSubmit={save}>
+      <div className="settings-item-heading agent-editor-heading">
         <Avatar
           name={profile.displayName}
           resourceId={profile.avatarResourceId}
           isAgent
           size="large"
         />
-        <div>
+        <div className="agent-editor-title">
           <h3>{profile.displayName}</h3>
-          <span className="agent-label">AI 资料</span>
+          <span className="agent-label">AI 资料 · MCP 消息身份</span>
         </div>
       </div>
       <div className="settings-grid">
@@ -96,13 +96,15 @@ function AgentEditor({
         <textarea id={`agent-bio-${profile.id}`} value={shortBio} onChange={event => setShortBio(event.target.value)} maxLength={500} rows={2} />
       </div>
       {error && <p className="error-text">{error}</p>}
-      <button type="submit" className="btn-secondary" disabled={saving}>{saving ? '保存中...' : '保存 AI 资料'}</button>
+      <div className="agent-editor-footer">
+        <span>资料更新后会同步到后续 Agent 消息</span>
+        <button type="submit" className="btn-primary" disabled={saving}>{saving ? '保存中...' : '保存 AI 资料'}</button>
+      </div>
     </form>
   );
 }
 
 export default function SettingsPage() {
-  const navigate = useNavigate();
   const { state, dispatch } = useApp();
   const [displayName, setDisplayName] = useState(state.me?.displayName ?? '');
   const [avatar, setAvatar] = useState<File | null>(null);
@@ -122,6 +124,7 @@ export default function SettingsPage() {
   const [bubbleColor, setBubbleColor] = useState(readBubbleColor);
   const [backgroundPresent, setBackgroundPresent] = useState(false);
   const [appearanceSaving, setAppearanceSaving] = useState(false);
+  const [copiedCredential, setCopiedCredential] = useState<string | null>(null);
 
   useEffect(() => {
     Promise.all([listAgentProfiles(), listDevices()])
@@ -184,6 +187,16 @@ export default function SettingsPage() {
       setDevices(await listDevices());
     } catch (error) {
       setError(messageFrom(error, '设备停用失败'));
+    }
+  };
+
+  const copyCredential = async (key: string, value: string) => {
+    try {
+      await navigator.clipboard.writeText(value);
+      setCopiedCredential(key);
+      window.setTimeout(() => setCopiedCredential(current => current === key ? null : current), 1600);
+    } catch {
+      setCopiedCredential(null);
     }
   };
 
@@ -252,7 +265,6 @@ export default function SettingsPage() {
   return (
     <main className="settings-page">
       <header className="settings-header">
-        <button type="button" className="btn-ghost" onClick={() => navigate('/')}>← 返回</button>
         <div>
           <h1>个人设置</h1>
           <p>管理公开资料和自己的设备</p>
@@ -343,9 +355,18 @@ export default function SettingsPage() {
       </section>
 
       <section className="settings-section">
-        <h2>我的 AI</h2>
+        <div className="settings-section-heading">
+          <div>
+            <h2>我的 AI</h2>
+            <p>管理 MCP 消息使用的 Agent 资料</p>
+          </div>
+          <span className="settings-section-count">{profiles.length} 个资料</span>
+        </div>
         {profiles.length === 0 ? (
-          <p className="hint">还没有 AI 资料。首次通过 MCP 发布 AI 消息时会自动创建。</p>
+          <div className="agent-empty">
+            <strong>还没有 AI 资料</strong>
+            <span>首次通过 MCP 发布 AI 消息时会自动创建对应资料。</span>
+          </div>
         ) : profiles.map(profile => (
           <AgentEditor
             key={profile.id}
@@ -356,11 +377,22 @@ export default function SettingsPage() {
       </section>
 
       <section className="settings-section">
-        <h2>MCP 设备</h2>
+        <div className="settings-section-heading">
+          <div>
+            <h2>MCP 设备</h2>
+            <p>连接到传话筒的 AI 客户端</p>
+          </div>
+          <span className="settings-section-count">
+            {devices.filter(device => device.kind === 'mcp' && device.active).length} 个可用
+          </span>
+        </div>
         <div className="device-list">
-          {devices.filter(device => device.kind === 'mcp').map(device => (
+          {devices.filter(device => device.kind === 'mcp').length === 0 ? (
+            <div className="device-empty">还没有连接的 MCP 设备</div>
+          ) : devices.filter(device => device.kind === 'mcp').map(device => (
             <div className="device-row" key={device.deviceId}>
-              <div>
+              <span className={`device-status ${device.active ? 'active' : 'inactive'}`} aria-hidden="true" />
+              <div className="device-row-copy">
                 <strong>{device.label}</strong>
                 <span>{device.active ? '可用' : '已停用'}</span>
               </div>
@@ -369,21 +401,39 @@ export default function SettingsPage() {
           ))}
         </div>
         <form onSubmit={createDevice} className="device-create-form">
-          <div className="form-group">
-            <label htmlFor="device-label">新设备名称</label>
+          <div className="form-group device-label-field">
+            <label htmlFor="device-label">添加设备</label>
             <input id="device-label" value={deviceLabel} onChange={event => setDeviceLabel(event.target.value)} maxLength={80} required />
           </div>
-          <button type="submit" className="btn-secondary" disabled={deviceCreating}>{deviceCreating ? '创建中...' : '创建设备 Token'}</button>
+          <button type="submit" className="btn-primary" disabled={deviceCreating}>{deviceCreating ? '创建中...' : '创建 Token'}</button>
         </form>
         {createdDevice && (
           <div className="credential-box">
-            <strong>请立即保存，关闭后不会再次显示</strong>
+            <div className="credential-heading">
+              <strong>设备已创建</strong>
+              <span>请立即保存，关闭后不会再次显示</span>
+            </div>
             <label>服务器地址</label>
-            <code>{mcpServerAddress(createdDevice.mcpUrl)}</code>
+            <div className="credential-copy-row">
+              <code>{mcpServerAddress(createdDevice.mcpUrl)}</code>
+              <button type="button" className="btn-ghost" onClick={() => void copyCredential('server', mcpServerAddress(createdDevice.mcpUrl))}>
+                {copiedCredential === 'server' ? '已复制' : '复制'}
+              </button>
+            </div>
             <label>请求头名称</label>
-            <code>Authorization</code>
+            <div className="credential-copy-row">
+              <code>Authorization</code>
+              <button type="button" className="btn-ghost" onClick={() => void copyCredential('header-name', 'Authorization')}>
+                {copiedCredential === 'header-name' ? '已复制' : '复制'}
+              </button>
+            </div>
             <label>请求头值</label>
-            <code>{createdDevice.authorizationHeader}</code>
+            <div className="credential-copy-row">
+              <code>{createdDevice.authorizationHeader}</code>
+              <button type="button" className="btn-ghost" onClick={() => void copyCredential('header-value', createdDevice.authorizationHeader)}>
+                {copiedCredential === 'header-value' ? '已复制' : '复制'}
+              </button>
+            </div>
             <div className="credential-guide">
               <strong>Kelivo 配置方法</strong>
               <ol>
@@ -419,6 +469,7 @@ export default function SettingsPage() {
           <button type="submit" className="btn-secondary" disabled={passwordSaving}>{passwordSaving ? '修改中...' : '修改密码'}</button>
         </form>
       </section>
+      <TopLevelNav />
     </main>
   );
 }

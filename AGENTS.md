@@ -13,122 +13,91 @@ npm.cmd run check                        # 语法检查
 npm.cmd test                             # 内存模式测试（MCP + REST）
 ```
 
-## 前端开发（2026-08-05 新增）
+## 前端开发
 
-```bash
-# 终端 1：后端（内存模式，开启 Web 注册）
-$env:PUBLIC_REGISTRATION='1'; node src/server.mjs --memory --dev-auth
+```powershell
+# 终端 1：后端（内存模式 + 开发认证）
+npm.cmd run start:memory
 
 # 终端 2：前端开发服务器
-cd frontend && npm run dev    # http://localhost:5173
+Set-Location frontend
+npm.cmd run dev                # http://localhost:5173
 ```
 
-前端构建产物：`frontend/dist/`（可通过 3 行代码挂载到后端同源托管）。
+前端构建产物位于 `frontend/dist/`。该目录存在时，后端会同源托管静态资源，并将
+SPA 路由回退到 `index.html`。
 
 ---
 
-## 交接文档（2026-08-05）
+## 当前实现（2026-08-21）
 
-> 以下内容是当次会话的完成情况总结，供下一位开发者/下一个会话继续工作。
+### 后端与认证
 
-### 已完成工作
+- Web 账号通过 MCP 签发的一次性绑定码创建，登录使用用户名、密码和同源
+  HttpOnly Session。
+- MCP 设备使用独立 Bearer Token；设备凭据可创建、列出和撤销。
+- 浏览器前端的 WebSocket 使用同源 Session Cookie；服务端同时兼容 Bearer Header
+  和 `?token=`，供非浏览器客户端使用。
+- PostgreSQL 是生产模式唯一事实源；内存模式只用于测试和本地临时联调。
+- `frontend/dist/` 已由后端同源托管，包含 SPA 路由回退。
+- 根目录 `compose.yaml` 可启动 PostgreSQL 17 与生产形态服务。
 
-#### Phase 1：Web 后端认证 + 前端 MVP（✅ 全部完成）
+### Web 前端
 
-**后端新增（3 个文件）：**
+- Vite 8 + React 19 + TypeScript + react-router-dom 7。
+- 6 个页面：AuthPage、RoomListPage、RoomPage、JoinPage、WorldPage、SettingsPage。
+- 全局状态使用 React Context + useReducer；一个 WebSocket 连接覆盖全部房间。
+- 消息按 `seq` 升序，REST 初始加载和 WS 推送按 `message.id` 去重。
+- 支持亮色、暗色和系统主题，以及用户气泡颜色与透明度设置。
+- 前端只调用 REST `/v1/*` 和 WebSocket，不直接调用 `/mcp`。
 
-| 文件 | 改动 |
-|------|------|
-| `src/server.mjs` | 新增 `POST /v1/auth/register`（含 IP 速率限制）+ `GET /v1/me`；WebSocket 支持 `?token=` 查询参数 |
-| `src/group_chat_store.mjs` | MemoryStore + PostgresStore 均实现 `createUserRegistration`、`getMe` |
-| `.env.example` | 新增 `PUBLIC_REGISTRATION=0`、`TRUST_PROXY=0` |
+### 已完成阶段
 
-**前端新建（`frontend/` 目录，24 个源文件）：**
+- Phase 1：Web 账号、REST/WS 后端与 React 前端。
+- Phase 2：邀请预览与确认加入。
+- Phase 3：Agent 消息和成员可见性。
+- Phase 4：最长 60 秒的 `group_poll_messages`。
+- Web 前端视觉重设计：顶层导航、世界、设置、移动端布局、消息撤回与房间管理。
 
-- Vite + React 19 + TypeScript + react-router-dom 7
-- 全局状态：React Context + useReducer（`AppContext.tsx`）
-- WebSocket Hook：指数退避重连（1s→30s，±20% 抖动），消息去重
-- 4 个页面：AuthPage / RoomListPage / RoomPage / JoinPage
-- 5 个组件：MessageList / MessageItem / SendBar / MemberPanel / InviteModal
-- 完整 CSS（亮色/暗色模式）
+### 验证基线
 
-#### Phase 2：邀请预览（✅ 全部完成）
-
-- `GET /v1/invites/preview?token=X`：返回 `roomTitle`、`inviterDisplayName`、`expiresAt`、`remainingUses`
-- 前端 JoinPage 展示预览卡片，用户确认后再加入
-
-#### Phase 3：Agent 可见性（✅ 全部完成）
-
-- Agent 消息样式和 `AI` 标签
-- 成员面板区分人类与 Agent，并显示自动/手动/停用状态
-
-#### Phase 4：`group_poll_messages`（✅ 全部完成）
-
-- 已实现最长 60 秒的长轮询 MCP 工具及回归测试
-
-#### 验证结果
-
-- `npm test`：62 项，56 pass, 0 fail, 6 skip（跳过项需要 `TEST_DATABASE_URL`）
-- 前端 `npm run build`：构建成功，TS 无错误
-- 后端 E2E 测试：全流程通过（注册 → 建房 → 邀请 → 预览 → 接受 → 验证剩余次数）
-
----
+- `npm.cmd test`：73 项，默认内存模式 66 pass、0 fail、7 skip；配置独立
+  `TEST_DATABASE_URL` 后 73 pass、0 fail、0 skip。
+- `npm.cmd run check`：通过。
+- `npm.cmd test --prefix frontend`：5 个测试文件、13 项测试通过。
+- `npm.cmd run lint --prefix frontend`：通过。
+- `npm.cmd run test:e2e --prefix frontend`：Playwright E2E 通过。
+- PostgreSQL 17 Compose 烟测：迁移 001-010、同源 SPA 回退、建房、消息写读和删房均通过。
 
 ### 未提交变更
 
 工作区仍包含此前功能开发与本轮审查修订产生的未提交内容。提交前以
 `git status --short` 和实际差异为准，按功能范围选择文件；不要包含来源不明的归档文件。
 
----
-
-### 后端新增 API 清单
+### Web API 摘要
 
 | 端点 | 方法 | 认证 | 速率限制 | 请求/说明 |
 |------|------|------|---------|-----------|
-| `/v1/auth/register` | POST | 否 | 每 IP 每小时 10 次 | 要求 `Idempotency-Key`；`{ displayName }` → `{ token, userId, displayName, handle }` |
-| `/v1/me` | GET | Bearer | 无 | → `{ userId, handle, displayName, avatarResourceId, profileRevision }` |
-| `/v1/invites/preview?token=X` | GET | Bearer | 无 | → `{ roomTitle, inviterDisplayName, expiresAt, remainingUses }` |
+| `/v1/auth/register` | POST | 绑定码 | 每 IP 每小时 10 次 | 绑定已有 MCP 身份并创建 Web 账号 |
+| `/v1/auth/login` | POST | 否 | 无 | 用户名密码登录并建立 HttpOnly Session |
+| `/v1/auth/logout` | POST | Session | 无 | 注销当前 Web Session |
+| `/v1/auth/reset-password` | POST | 重置码 | 无 | 使用 MCP 签发的重置码设置新密码 |
+| `/v1/me` | GET/PATCH | Session | 无 | 获取或修改当前用户资料 |
+| `/v1/invites/preview?token=X` | GET | Session | 无 | 邀请预览 |
 
-环境变量：`PUBLIC_REGISTRATION=0`（设为 1 开启 Web 注册，默认关闭）；`TRUST_PROXY=0`（设为 1 后才信任 `X-Forwarded-For`）。
-
----
-
-### 待完成工作（Phase 5+）
-
-#### Phase 5：公开分发前加固
-
-- OAuth 2.1、Token 撤销与轮换
-- 完善审计日志与滥用防护
-- 数据导出与隐私说明
-
-#### 其他待办
-
-- **静态文件同源托管**：在 `src/server.mjs` 末尾添加 3-5 行托管 `frontend/dist/`（详见 `docs/web-frontend-architecture.md` 附录 A）
-- **前端测试**：Vitest + @testing-library/react 测试 `useRealtimeWS` hook 和消息去重 reducer
-- **InviteModal 优化**：统一使用 `apiRequest` 封装替代 `fetch` 直接调用
-
----
-
-### 关键架构决策
-
-1. **Token 即身份**：Web 用户 token 存 localStorage，清除即丢失账号，无找回机制
-2. **WebSocket 认证**：浏览器原生 WS 不支持自定义 Header，改用 `?token=` 查询参数
-3. **全局单 WS 连接**：一个 WebSocket 连接覆盖所有房间，不按房间建立多连接
-4. **消息排序**：按 `seq` 升序（不按 `created_at`，避免时钟偏差）
-5. **去重**：按 `message.id` 去重（WS 推送与 REST 初始加载可能重叠）
-6. **前端不调用 MCP**：前端永远不直接调用 `/mcp` 端点
-
----
+`PUBLIC_REGISTRATION=0` 默认关闭 Web 账号绑定；`TRUST_PROXY=0` 默认不信任
+`X-Forwarded-For`。只在受控反向代理后启用 `TRUST_PROXY=1`。
 
 ### 关键文件索引
 
 | 文件 | 行数 | 说明 |
 |------|------|------|
-| `src/server.mjs` | ~1384 | HTTP 服务器，所有路由处理 |
-| `src/group_chat_store.mjs` | ~4946 | 数据存储层（MemoryStore + PostgresStore） |
-| `frontend/src/store/AppContext.tsx` | ~169 | 全局状态管理 |
-| `frontend/src/ws/useRealtimeWS.ts` | ~74 | WebSocket 连接管理 |
-| `docs/web-frontend-architecture.md` | ~760 | 完整架构设计文档 |
+| `src/server.mjs` | ~1821 | HTTP、REST、静态托管与 WebSocket |
+| `src/group_chat_store.mjs` | ~6112 | MemoryStore + PostgresStore |
+| `frontend/src/store/AppContext.tsx` | ~99 | 全局状态协调 |
+| `frontend/src/store/reducer.ts` | — | 状态 reducer 与消息去重 |
+| `frontend/src/ws/useRealtimeWS.ts` | ~60 | WebSocket 连接管理 |
+| `docs/development-report.md` | — | 当前实现与验证报告 |
 
 ---
 

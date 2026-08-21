@@ -33,6 +33,12 @@ test.beforeAll(async () => {
     key: 'e2e-room',
     requestFingerprint: 'e2e-room-fingerprint',
   });
+  const published = await store.updateWorldRoom({
+    userId: owner.userId,
+    roomId: room.body.id,
+    published: true,
+    summary: '用于验证世界页布局',
+  });
   const guestSession = await store.createGuestSession({
     deviceId: 'e2e-guest-device',
     displayName: '外部成员',
@@ -41,7 +47,7 @@ test.beforeAll(async () => {
   const invite = await store.createInvite({
     userId: owner.userId,
     roomId: room.body.id,
-    expectedRoomRevision: room.body.revision,
+    expectedRoomRevision: published.room.revision,
     expiresAt: new Date(Date.now() + 60_000).toISOString(),
     maxUses: 1,
     key: 'e2e-invite',
@@ -92,74 +98,48 @@ test.afterAll(async () => {
   await server.shutdown();
 });
 
-test('logs in, sends a message, and keeps room administration restricted', async ({ page }) => {
+test('uses the redesigned shell for real room data and chat actions', async ({ page }) => {
   await page.goto(`${baseUrl}/auth`);
-  await expect(page.locator('.brand-mark')).toHaveCount(0);
   await page.getByLabel('用户名', { exact: true }).fill('e2e_reader');
   await page.getByLabel('密码', { exact: true }).fill('secret6');
-  await page.getByRole('button', { name: '登录', exact: true }).last().click();
+  await page.getByRole('button', { name: '登录', exact: true }).click();
 
-  const room = page.getByRole('button', { name: /聊天验收房间/ });
-  await expect(room).toContainText('2');
-  const markedRead = page.waitForResponse(response =>
-    response.request().method() === 'PUT' && response.url().endsWith('/read'));
-  await room.click();
-  await markedRead;
+  await expect(page.getByLabel('搜索公开房间', { exact: true })).toBeVisible();
+  await expect(page.getByText('我的房间', { exact: true })).toHaveCount(0);
+  await page.getByText('聊天验收房间', { exact: true }).click();
+  await expect(page.getByText('邀请码', { exact: true })).toBeVisible();
+  const sheetZIndex = Number(await page.getByTestId('world-room-sheet').evaluate(element => getComputedStyle(element).zIndex));
+  await expect(page.getByTestId('bottom-nav')).toHaveCount(0);
+  expect(sheetZIndex).toBeGreaterThan(0);
+  await page.getByTestId('world-room-sheet').click({ position: { x: 5, y: 5 } });
+  await expect(page.getByTestId('bottom-nav')).toBeVisible();
 
-  await expect(page.getByText('来自其他成员的消息')).toBeVisible();
-  await expect(page.getByText('来自当前用户的消息')).toBeVisible();
-  const otherMessage = page.getByRole('article').filter({ hasText: '来自其他成员的消息' });
-  const ownMessage = page.getByRole('article').filter({ hasText: '来自当前用户的消息' });
-  await expect(otherMessage).toHaveClass(/other/);
-  await expect(ownMessage).toHaveClass(/own/);
-  await expect(otherMessage.locator('.avatar-human')).toBeVisible();
-  await expect(ownMessage.locator('.avatar-human')).toBeVisible();
-  expect(await otherMessage.locator('.avatar-human').evaluate(element =>
-    getComputedStyle(element).borderRadius)).toBe('30%');
-  expect(await ownMessage.locator('.avatar-human').evaluate(element =>
-    getComputedStyle(element).borderRadius)).toBe('30%');
-  expect(await page.locator('html').evaluate(element =>
-    getComputedStyle(element).getPropertyValue('--bubble-self-top').trim())).toBe('#55789c');
-  const messageInput = page.getByRole('textbox', { name: '消息' });
-  await expect(messageInput).toBeVisible();
-  await expect(page.getByRole('button', { name: '发送', exact: true })).toBeDisabled();
-  await messageInput.fill('来自网页的新消息');
-  const sentResponse = page.waitForResponse(response =>
+  await page.getByText('房间', { exact: true }).click();
+  await expect(page.getByText('聊天验收房间', { exact: true })).toBeVisible();
+  await page.getByRole('button', { name: '分享到世界', exact: true }).click();
+  await expect(page.getByRole('checkbox', { name: /聊天验收房间/ })).toBeChecked();
+  await page.getByRole('button', { name: '保存分享设置', exact: true }).click();
+  await page.getByText('聊天验收房间', { exact: true }).click();
+  await expect(page.getByText('来自其他成员的消息', { exact: true })).toBeVisible();
+  await expect(page.getByText('来自当前用户的消息', { exact: true })).toBeVisible();
+
+  const input = page.getByRole('textbox', { name: '消息' });
+  await input.fill('来自新版网页的新消息');
+  const sent = page.waitForResponse(response =>
     response.request().method() === 'POST' && response.url().endsWith('/messages'));
-  await messageInput.press('Enter');
-  expect((await sentResponse).status()).toBe(201);
-  const sentMessage = page.getByRole('article').filter({ hasText: '来自网页的新消息' });
-  await expect(sentMessage).toBeVisible();
-  await expect(messageInput).toHaveValue('');
-  const recalledResponse = page.waitForResponse(response =>
-    response.request().method() === 'POST' && response.url().endsWith('/recall'));
-  const sentBubble = sentMessage.locator('.msg-bubble');
-  await sentBubble.dispatchEvent('pointerdown', { button: 0, clientX: 20, clientY: 20 });
-  await page.waitForTimeout(550);
-  await sentBubble.dispatchEvent('pointerup', { button: 0, clientX: 20, clientY: 20 });
-  await page.getByRole('menuitem', { name: '撤回', exact: true }).click();
-  expect((await recalledResponse).status()).toBe(200);
-  await expect(page.getByText('来自网页的新消息')).toHaveCount(0);
-  const recalledMessage = page.getByRole('article').filter({ hasText: '消息已撤回' });
-  await expect(recalledMessage).toBeVisible();
+  await page.getByRole('button', { name: '发送', exact: true }).click();
+  expect((await sent).status()).toBe(201);
+  await expect(page.getByText('来自新版网页的新消息', { exact: true })).toBeVisible();
 
-  await page.setViewportSize({ width: 390, height: 844 });
-  await page.emulateMedia({ reducedMotion: 'reduce' });
-  expect((await page.locator('.room-header').boundingBox())!.height).toBeLessThanOrEqual(44);
-  const ownAvatarBox = await recalledMessage.locator('.avatar-human').boundingBox();
-  const ownBubbleBox = await recalledMessage.locator('.msg-bubble').boundingBox();
-  const otherAvatarBox = await otherMessage.locator('.avatar-human').boundingBox();
-  const otherBubbleBox = await otherMessage.locator('.msg-bubble').boundingBox();
-  expect(ownAvatarBox!.x).toBeGreaterThan(ownBubbleBox!.x + ownBubbleBox!.width);
-  expect(otherAvatarBox!.x + otherAvatarBox!.width).toBeLessThan(otherBubbleBox!.x);
-  expect(await page.evaluate(() => document.documentElement.scrollWidth <= innerWidth)).toBe(true);
-  await page.getByRole('button', { name: '成员', exact: true }).click();
-  await expect(page.getByLabel('房间成员')).toBeVisible();
-  expect(await page.getByLabel('房间成员').evaluate(element =>
-    getComputedStyle(element).animationName)).toBe('none');
-  expect(await page.locator('.panel-scrim').evaluate(element =>
-    getComputedStyle(element).animationName)).toBe('none');
-  await page.locator('.panel-scrim').click({ position: { x: 1, y: 1 } });
+  const recall = page.waitForResponse(response =>
+    response.request().method() === 'POST' && response.url().endsWith('/recall'));
+  await page.getByRole('button', { name: '撤回', exact: true }).last().click();
+  expect((await recall).status()).toBe(200);
+  await expect(page.getByText('这条消息已撤回', { exact: true })).toBeVisible();
+
+  await page.getByRole('button', { name: '查看成员', exact: true }).click();
+  await expect(page.getByText(/成员 \(/)).toBeVisible();
+  await page.getByRole('button', { name: '关闭成员', exact: true }).click();
 
   const blocked = await page.context().request.post(`${baseUrl}/v1/rooms`, {
     data: { title: 'Cookie must not create this room' },
@@ -169,87 +149,57 @@ test('logs in, sends a message, and keeps room administration restricted', async
   expect((await blocked.json()).error.code).toBe('web_read_only');
 
   await page.getByRole('button', { name: '返回房间列表', exact: true }).click();
-  await expect(page.getByRole('button', { name: /聊天验收房间/ })).not.toContainText('未读');
+  await page.getByText('我', { exact: true }).click();
+  await expect(page.getByText('E2E 读者', { exact: true })).toBeVisible();
+  await expect(page.getByText('1 个', { exact: true })).toBeVisible();
+  await page.getByText('MCP 设备', { exact: true }).click();
+  await expect(page.getByLabel('设备名称', { exact: true })).toHaveCount(0);
+  await page.getByRole('button', { name: '创建新设备令牌', exact: true }).click();
+  const deviceLabel = page.getByLabel('设备名称', { exact: true });
+  await expect(deviceLabel).toBeVisible();
+  expect((await deviceLabel.boundingBox())!.height).toBeGreaterThanOrEqual(44);
+  await page.getByRole('button', { name: '取消', exact: true }).click();
+  await expect(deviceLabel).toHaveCount(0);
+  await page.getByRole('button', { name: '返回', exact: true }).click();
+  await page.getByText('个人资料', { exact: true }).click();
+  await expect(page.getByRole('button', { name: '保存', exact: true })).toBeVisible();
+  await page.locator('#profile-avatar-upload').setInputFiles(
+    resolve(process.cwd(), 'src/assets/hero.png'),
+  );
+  const profileSaved = page.waitForResponse(response =>
+    response.request().method() === 'PATCH' && response.url().endsWith('/v1/me'));
+  await page.getByRole('button', { name: '保存', exact: true }).click();
+  expect((await profileSaved).status()).toBe(200);
+  await expect(page.getByText('已保存', { exact: true })).toBeVisible();
+  await page.getByRole('button', { name: '返回', exact: true }).click();
+  const customAvatar = page.getByTestId('me-avatar').locator('img');
+  await expect(customAvatar).toBeVisible();
+  await expect(customAvatar).toHaveAttribute('src', /\/v1\/profile-resources\//);
+});
 
-  await page.getByRole('button', { name: '设置', exact: true }).click();
-  const opacity = page.getByRole('slider', { name: '气泡透明度' });
-  await opacity.fill('10');
-  await expect(page.locator('output[for="bubble-opacity"]')).toHaveText('10%');
-  expect(await page.locator('html').evaluate(element =>
-    element.style.getPropertyValue('--bubble-opacity'))).toBe('10%');
-  await page.getByLabel('选择我的气泡颜色').fill('#12abef');
-  expect(await page.locator('html').evaluate(element =>
-    element.style.getPropertyValue('--bubble-self-top'))).toBe('#12abef');
+test('keeps the redesigned shell usable on a narrow mobile viewport', async ({ page }) => {
+  await page.setViewportSize({ width: 390, height: 844 });
+  await page.goto(`${baseUrl}/auth`);
+  await page.getByLabel('用户名', { exact: true }).fill('e2e_reader');
+  await page.getByLabel('密码', { exact: true }).fill('secret6');
+  await page.getByRole('button', { name: '登录', exact: true }).click();
 
-  const e2eDevice = page.locator('.device-row').filter({ hasText: 'E2E MCP device' });
-  let deviceRevocationRequested = false;
-  page.on('request', request => {
-    if (request.method() === 'DELETE' && /\/v1\/me\/devices\/[^/]+$/.test(request.url())) {
-      deviceRevocationRequested = true;
-    }
-  });
-  page.once('dialog', dialog => dialog.dismiss());
-  await e2eDevice.getByRole('button', { name: '停用', exact: true }).click();
-  await page.waitForTimeout(100);
-  expect(deviceRevocationRequested).toBe(false);
-  page.once('dialog', dialog => dialog.accept());
-  const revokedDevice = page.waitForResponse(response =>
-    response.request().method() === 'DELETE' && /\/v1\/me\/devices\/[^/]+$/.test(response.url()));
-  await e2eDevice.getByRole('button', { name: '停用', exact: true }).click();
-  expect((await revokedDevice).status()).toBe(204);
+  const titleBox = await page.getByRole('heading', { name: '传话筒', exact: true }).boundingBox();
+  const navBox = await page.getByTestId('bottom-nav').boundingBox();
+  expect(titleBox).not.toBeNull();
+  expect(navBox).not.toBeNull();
+  expect(titleBox!.y).toBeLessThanOrEqual(24);
+  expect(844 - navBox!.y - navBox!.height).toBeLessThanOrEqual(12);
 
-  await page.getByLabel('聊天背景图').setInputFiles({
-    name: 'background.png',
-    mimeType: 'image/png',
-    buffer: Buffer.from(
-      'iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAQAAAC1HAwCAAAAC0lEQVR42mNk+A8AAQUBAScY42YAAAAASUVORK5CYII=',
-      'base64',
-    ),
-  });
-  await expect(page.locator('.success-message')).toHaveText('聊天背景已更新');
-  await expect(page.locator('.background-preview')).not.toHaveClass(/empty/);
+  await page.getByRole('button', { name: '房间', exact: true }).click();
+  await expect(page.getByText('聊天验收房间', { exact: true })).toBeVisible();
+  expect(await page.evaluate(() => document.documentElement.scrollWidth <= document.documentElement.clientWidth)).toBeTruthy();
+  await page.waitForTimeout(300);
+  await page.screenshot({ path: resolve(process.cwd(), '../output/playwright/mobile-room-list.png') });
 
-  await page.getByRole('button', { name: '← 返回', exact: true }).click();
-  await page.getByRole('button', { name: /聊天验收房间/ }).click();
-  await expect.poll(() => page.locator('.room-main').evaluate(element =>
-    getComputedStyle(element).backgroundImage)).toContain('blob:');
-  expect(await page.getByRole('button', { name: '发送', exact: true }).evaluate(element =>
-    getComputedStyle(element).color)).toBe('color(srgb 0.0705882 0.670588 0.937255 / 0.1)');
-  await page.reload();
-  await expect.poll(() => page.locator('.room-main').evaluate(element =>
-    getComputedStyle(element).backgroundImage)).toContain('blob:');
-  expect(await page.locator('html').evaluate(element =>
-    element.style.getPropertyValue('--bubble-opacity'))).toBe('10%');
-  expect(await page.locator('html').evaluate(element =>
-    element.style.getPropertyValue('--bubble-self-top'))).toBe('#12abef');
-
-  await page.getByRole('button', { name: '返回房间列表', exact: true }).click();
-  await page.getByRole('button', { name: '设置', exact: true }).click();
-  await page.getByRole('button', { name: '移除背景', exact: true }).click();
-  await expect(page.locator('.success-message')).toHaveText('聊天背景已移除');
-  await page.getByRole('slider', { name: '气泡透明度' }).fill('100');
-  await page.getByLabel('选择我的气泡颜色').fill('#55789c');
-
-  await page.getByRole('button', { name: '← 返回', exact: true }).click();
-  await page.getByRole('button', { name: '世界', exact: true }).click();
-  await expect(page.getByRole('heading', { name: '世界', exact: true })).toBeVisible();
-  await page.getByRole('button', { name: '分享到世界', exact: true }).click();
-  await page.getByLabel('房间简介').fill('用于端到端验证的公开协作房间。');
-  await page.getByRole('button', { name: '发布到世界', exact: true }).click();
-  const worldCard = page.getByRole('button', { name: /聊天验收房间/ }).first();
-  await expect(worldCard).toContainText('E2E 读者');
-  await worldCard.click();
-  await expect(page.getByRole('dialog')).toContainText('用于端到端验证的公开协作房间。');
-  await expect(page.getByRole('dialog').locator('code')).not.toHaveText('');
-  await expect(page.getByRole('dialog').getByRole('button', { name: '复制', exact: true })).toBeVisible();
-  await page.getByRole('button', { name: '关闭详情', exact: true }).click();
-  await page.getByRole('button', { name: '我的房间', exact: true }).click();
-
-  await page.getByRole('button', { name: /聊天验收房间/ }).click();
-  page.once('dialog', dialog => dialog.accept());
-  const deletedResponse = page.waitForResponse(response =>
-    response.request().method() === 'DELETE' && /\/v1\/rooms\/[^/]+$/.test(response.url()));
-  await page.getByRole('button', { name: '删除房间', exact: true }).click();
-  expect((await deletedResponse).status()).toBe(204);
-  await expect(page.getByRole('button', { name: /聊天验收房间/ })).toHaveCount(0);
+  await page.getByText('聊天验收房间', { exact: true }).click();
+  await expect(page.getByRole('textbox', { name: '消息' })).toBeVisible();
+  await expect(page.getByRole('button', { name: '发送', exact: true })).toBeVisible();
+  await page.waitForTimeout(300);
+  await page.screenshot({ path: resolve(process.cwd(), '../output/playwright/mobile-chat.png') });
 });

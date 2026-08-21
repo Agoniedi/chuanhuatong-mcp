@@ -226,6 +226,8 @@ Set `TEST_DATABASE_URL` to a dedicated PostgreSQL database to run the real
 PostgreSQL store tests. Each test creates and drops a unique schema inside that
 database and is skipped explicitly when the variable is absent.
 
-`GET /v1/realtime` requires `Authorization: Bearer <access-token>`. Query-string
-tokens are rejected. Clients refresh rooms and message history after every
-`connection.ready`, so WebSocket delivery remains at-least-once and recoverable.
+`GET /v1/realtime` accepts the same-origin Web session cookie, an
+`Authorization: Bearer <access-token>` header, or a `?token=` query parameter.
+The browser frontend uses the HttpOnly session cookie. Clients refresh rooms and
+message history after every `connection.ready`, so WebSocket delivery remains
+at-least-once and recoverable.

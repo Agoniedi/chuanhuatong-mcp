@@ -1076,6 +1076,18 @@ export class MemoryGroupChatStore {
     return { status: 200, body };
   }
 
+  async deleteAgentProfile({ userId, agentProfileId }) {
+    const profile = this._agentProfile(agentProfileId);
+    if (profile.ownerUserId !== userId) {
+      throw new HttpError(403, 'forbidden', 'Agent profile owner required');
+    }
+    for (const [bindingKey, binding] of this.roomAgentBindings) {
+      if (binding.agentProfileId === agentProfileId) this.roomAgentBindings.delete(bindingKey);
+    }
+    this.agentProfiles.delete(agentProfileId);
+    return { status: 204 };
+  }
+
   async createRoom({ userId, title, key, requestFingerprint }) {
     const replay = this._replay(userId, 'createRoom', key, requestFingerprint);
     if (replay.response) return replay.response;
@@ -3936,6 +3948,27 @@ export class PostgresGroupChatStore {
       });
       await this._enqueueProfileUpdated(client, 'agent', userId, body);
       return { status: 200, body };
+    });
+  }
+
+  async deleteAgentProfile({ userId, agentProfileId }) {
+    return this._transaction(async (client) => {
+      const profile = await client.query(
+        'SELECT owner_user_id FROM agent_profiles WHERE id = $1 FOR UPDATE',
+        [agentProfileId],
+      );
+      if (profile.rowCount === 0) {
+        throw new HttpError(404, 'resource_not_found', 'Agent profile not found');
+      }
+      if (profile.rows[0].owner_user_id !== userId) {
+        throw new HttpError(403, 'forbidden', 'Agent profile owner required');
+      }
+      await client.query(
+        'DELETE FROM room_agent_bindings WHERE agent_profile_id = $1',
+        [agentProfileId],
+      );
+      await client.query('DELETE FROM agent_profiles WHERE id = $1', [agentProfileId]);
+      return { status: 204 };
     });
   }
 

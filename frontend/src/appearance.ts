@@ -1,5 +1,5 @@
 export const DEFAULT_BUBBLE_OPACITY = 100;
-export const DEFAULT_BUBBLE_COLOR = '#55789c';
+export const DEFAULT_BUBBLE_COLOR = '#8a6b4f';
 
 const OPACITY_KEY = 'chuanhuatong_bubble_opacity';
 const COLOR_KEY = 'chuanhuatong_bubble_color';
@@ -95,6 +95,11 @@ export async function initializeAppearance() {
 
 export async function hasChatBackground(): Promise<boolean> {
   return (await readBackground()) !== null;
+}
+
+export async function readChatBackgroundUrl(): Promise<string | null> {
+  if (!activeBackgroundUrl) displayBackground(await readBackground());
+  return activeBackgroundUrl;
 }
 
 export async function saveChatBackground(file: File) {

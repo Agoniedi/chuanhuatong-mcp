@@ -409,7 +409,9 @@ function isAllowedWebMutation(method, path) {
   if (method === 'DELETE' && /^\/v1\/rooms\/[^/]+$/.test(path)) return true;
   if (method === 'PUT' && /^\/v1\/rooms\/[^/]+\/world$/.test(path)) return true;
   if (method === 'PATCH' && path === '/v1/me') return true;
-  if (method === 'PATCH' && /^\/v1\/agent-profiles\/[^/]+$/.test(path)) return true;
+  if (['PATCH', 'DELETE'].includes(method) && /^\/v1\/agent-profiles\/[^/]+$/.test(path)) {
+    return true;
+  }
   if (method === 'DELETE' && /^\/v1\/me\/devices\/[^/]+$/.test(path)) return true;
   return method === 'PUT' && /^\/v1\/rooms\/[^/]+\/read$/.test(path);
 }
@@ -1075,6 +1077,14 @@ async function handleRequest(
         requestFingerprint: fingerprint(request.method, path, body),
       });
       write(result.status, result.body);
+      return;
+    }
+    if (request.method === 'DELETE') {
+      const result = await store.deleteAgentProfile({
+        userId: user.userId,
+        agentProfileId,
+      });
+      write(result.status);
       return;
     }
   }

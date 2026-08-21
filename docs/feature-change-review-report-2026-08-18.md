@@ -162,7 +162,7 @@ git diff --check                 无差异错误
 
 ## 6. 交叉审查重点与剩余风险
 
-1. **PostgreSQL 未在本环境实测**：当前未配置 `TEST_DATABASE_URL`，7 个 PostgreSQL 测试跳过。部署前必须先运行 `npm.cmd run db:migrate`，再使用真实 PostgreSQL 测试迁移和世界功能。
+1. **PostgreSQL 真实路径已验证**：本次使用 Compose 独立 PostgreSQL 17 容器设置 `TEST_DATABASE_URL`，7 个 PostgreSQL 测试全部通过；生产形态容器已应用 001–010 全部迁移，并完成创建房间、写读消息和删除房间烟测。
 2. **世界发布接口的 `Operation-Id`**：路由要求该请求头，但当前发布/取消分享逻辑没有像部分既有写操作一样保存完整重放结果；重复点击不会重复生成有效邀请码，但可能重复增加房间 revision，建议审查是否需要补齐幂等语义。
 3. **删除房间不可逆**：删除操作使用浏览器确认框，没有回收站或撤销机制；这符合当前“删除房间”需求，但生产使用前应确认数据保留策略。
 4. **级联删除依赖数据库迁移**：房间成员、邀请、Agent 绑定等清理依赖既有外键的 `ON DELETE CASCADE`；新迁移已补充 `world_invite_id` 外键，但仍应在真实 PostgreSQL 上执行删除回归测试。

@@ -3,3 +3,8 @@ node_modules/
 coverage/
 npm-debug.log*
 *.log
+.playwright-cli/
+output/
+Redesign Group Chat UI/
+figma-make-local/
+*.tar.gz

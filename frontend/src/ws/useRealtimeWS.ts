@@ -10,6 +10,7 @@ const MAX_RETRY_MS = 30000;
 export function useRealtimeWS(
   onEvent: WsEventHandler,
   onStatusChange: (status: WsStatus) => void,
+  enabled = true,
 ) {
   const wsRef = useRef<WebSocket | null>(null);
   const retryCountRef = useRef(0);
@@ -58,6 +59,10 @@ export function useRealtimeWS(
   }, []);
 
   useEffect(() => {
+    if (!enabled) {
+      onStatusChangeRef.current('closed');
+      return;
+    }
     connect();
     return () => {
       if (retryTimerRef.current) clearTimeout(retryTimerRef.current);
@@ -66,5 +71,5 @@ export function useRealtimeWS(
         wsRef.current.close();
       }
     };
-  }, [connect]);
+  }, [connect, enabled]);
 }

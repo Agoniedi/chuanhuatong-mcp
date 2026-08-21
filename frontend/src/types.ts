@@ -19,6 +19,7 @@ export interface Room {
   updatedAt: string;
   webReadSeq: number;
   unreadCount: number;
+  memberCount?: number;
 }
 
 export interface WorldRoom {
@@ -28,11 +29,19 @@ export interface WorldRoom {
   ownerDisplayName: string;
   summary: string;
   publishedAt: string;
+  memberCount?: number;
 }
 
 export interface WorldRoomDetail extends WorldRoom {
   inviteToken: string;
   inviteExpiresAt: string;
+  remainingUses: number;
+}
+
+export interface InvitePreview {
+  roomTitle: string;
+  inviterDisplayName: string;
+  expiresAt: string;
   remainingUses: number;
 }
 

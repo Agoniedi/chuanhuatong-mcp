@@ -166,8 +166,14 @@ export default function RoomPage() {
             onClick={() => setShowMembers(!showMembers)}
             className="btn-secondary"
             aria-pressed={showMembers}
+            aria-label={showMembers ? '隐藏成员' : '查看成员'}
+            title={showMembers ? '隐藏成员' : '查看成员'}
           >
-            {showMembers ? '隐藏成员' : '成员'}
+            <svg viewBox="0 0 24 20" width="20" height="18" fill="none" aria-hidden="true">
+              <circle cx="8" cy="6" r="3" stroke="currentColor" strokeWidth="1.5" />
+              <circle cx="16" cy="6" r="3" stroke="currentColor" strokeWidth="1.5" />
+              <path d="M2 18c0-3.3 2.7-6 6-6M10 18c0-2.8 2.7-5 6-5s6 2.2 6 5" stroke="currentColor" strokeWidth="1.5" strokeLinecap="round" />
+            </svg>
           </button>
         </div>
       </header>

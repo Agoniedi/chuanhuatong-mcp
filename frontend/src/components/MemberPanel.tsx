@@ -9,6 +9,12 @@ interface Props {
   profileVersion: number;
 }
 
+function modeLabel(mode: AgentBinding['participationMode']) {
+  if (mode === 'automatic') return '自动';
+  if (mode === 'manual') return '手动';
+  return '停用';
+}
+
 export default function MemberPanel({ roomId, profileVersion }: Props) {
   const [members, setMembers] = useState<Member[]>([]);
   const [agentBindings, setAgentBindings] = useState<AgentBinding[]>([]);
@@ -65,6 +71,9 @@ export default function MemberPanel({ roomId, profileVersion }: Props) {
                         />
                         <span className="member-agent-name">{agent.displayName}</span>
                         <span className="agent-badge agent-badge-inline">AI</span>
+                        <span className={`agent-mode-badge ${agent.participationMode}`}>
+                          {modeLabel(agent.participationMode)}
+                        </span>
                       </li>
                     ))}
                   </ul>

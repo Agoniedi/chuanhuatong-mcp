@@ -52,6 +52,10 @@ export function updateAgentProfile(
   });
 }
 
+export function deleteAgentProfile(profileId: string): Promise<void> {
+  return apiRequest('DELETE', `/v1/agent-profiles/${encodeURIComponent(profileId)}`);
+}
+
 export async function listDevices(): Promise<DeviceInfo[]> {
   const result = await apiRequest<{ items: DeviceInfo[] }>('GET', '/v1/me/devices');
   return result.items;

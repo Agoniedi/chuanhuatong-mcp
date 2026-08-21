@@ -157,6 +157,45 @@ describe('MCP identity and optional Web account', () => {
     });
     assert.equal(markedRead.response.status, 200);
 
+    const cookieAgent = await request('/v1/agent-profiles', {
+      method: 'POST',
+      headers: { Cookie: cookie, 'Idempotency-Key': 'cookie-agent-create' },
+      body: JSON.stringify({
+        displayName: '网页 AI',
+        shortBio: '用于验证网页删除权限',
+      }),
+    });
+    assert.equal(cookieAgent.response.status, 201);
+    const boundAgent = await request(`/v1/rooms/${bearerRoomWrite.body.id}/my-agent`, {
+      method: 'PUT',
+      headers: {
+        Authorization: `Bearer ${identity.token}`,
+        'Operation-Id': 'cookie-agent-binding',
+      },
+      body: JSON.stringify({
+        agentProfileId: cookieAgent.body.id,
+        participationMode: 'manual',
+        publishMode: 'reviewRequired',
+        triggerScope: 'mentionsOnly',
+        preferredRuntimeDeviceId: null,
+        generationLimitPer24h: 20,
+        expectedPolicyRevision: null,
+      }),
+    });
+    assert.equal(boundAgent.response.status, 201);
+
+    const cookieAgentDelete = await request(`/v1/agent-profiles/${cookieAgent.body.id}`, {
+      method: 'DELETE',
+      headers: { Cookie: cookie },
+    });
+    assert.equal(cookieAgentDelete.response.status, 204);
+    const bindingsAfterDelete = await request(
+      `/v1/rooms/${bearerRoomWrite.body.id}/agent-bindings`,
+      { headers: { Authorization: `Bearer ${identity.token}` } },
+    );
+    assert.equal(bindingsAfterDelete.response.status, 200);
+    assert.equal(bindingsAfterDelete.body.items.length, 0);
+
     const badLogin = await request('/v1/auth/login', {
       method: 'POST',
       body: JSON.stringify({ username: 'READER_01', password: 'wrong66' }),

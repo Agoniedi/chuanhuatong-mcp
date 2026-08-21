@@ -1,8 +1,8 @@
 # 传话筒 MCP · Web 前端 + 多客户端架构技术开发文档
 
-> 版本：v1.1
-> 日期：2026-08-06
-> 状态：架构设计基线（已补充当前实施与测试状态）
+> 版本：v1.2
+> 日期：2026-08-21
+> 状态：架构基线与当前实现对照（前端视觉重设计已完成）
 > 前置文档：`docs/auto-poll-design.md`、`docs/discussion-mode-design.md`、`docs/implementation-roadmap.md`
 
 ---
@@ -18,12 +18,12 @@
 | WebSocket `message.created` 推送 | ✅ 已有 | outbox_events 表 250ms 轮询，含 Agent 消息 |
 | 邀请码发放 + 接受 | ✅ 已有 | REST + MCP 双路 |
 | Agent 自动响应基础设施 | ✅ 已有 | generation_requests + lease 全流程 |
-| **Web 用户注册 / 鉴权** | ❌ 缺失 | 需新增 `POST /v1/auth/register` |
-| **`GET /v1/me`** | ❌ 缺失 | 需新增 |
-| **邀请预览（加入前看房间名）** | ❌ 缺失 | Phase 2 需要 |
-| **前端代码** | ❌ 完全空白 | 需新建 `frontend/` 目录 |
+| **Web 用户注册 / 鉴权** | ✅ 已有 | `POST /v1/auth/register` + HttpOnly Cookie Session |
+| **`GET /v1/me`** | ✅ 已有 | 返回当前用户与资料版本 |
+| **邀请预览（加入前看房间名）** | ✅ 已有 | `GET /v1/invites/preview` |
+| **前端代码** | ✅ 已有 | `frontend/` 为 Vite + React + TypeScript 应用 |
 
-**底线结论**：后端不需要重构，增加 2 个端点即可支撑 Phase 1 MVP 上线。
+**当前结论**：Phase 1–4 已完成，当前开发重点是部署、公开分发前的安全加固和页面级 E2E 覆盖。
 
 ---
 
@@ -94,9 +94,9 @@ MCP Agent 发消息：
 
 ## 4. 新增 API 规范
 
-### 4.1 `POST /v1/auth/register`（Phase 1 必须）
+### 4.1 `POST /v1/auth/register`（已实现）
 
-Web 用户的入口。无需密码，无需邮箱，Token 即身份（存 localStorage）。
+Web 用户使用已有 MCP 身份签发的一次性绑定码创建账号，并建立同源 HttpOnly Cookie Session。
 
 **请求**
 
@@ -105,7 +105,11 @@ POST /v1/auth/register
 Content-Type: application/json
 
 {
-  "displayName": "张三"   // 1–80 字符
+  "username": "zhangsan",
+  "displayName": "张三",
+  "password": "...",
+  "passwordConfirmation": "...",
+  "bindingCode": "XXXX-XXXX"
 }
 ```
 
@@ -113,21 +117,19 @@ Content-Type: application/json
 
 ```json
 {
-  "token": "ct_...",
   "userId": "usr_...",
   "displayName": "张三",
-  "handle": "@usr_xxxx"
+  "handle": "@zhangsan"
 }
 ```
 
 **实现要点**
 
-- 在现有 `users` 和 `sessions` 表中创建记录（与 admin CLI 同逻辑，约 30 行）
-- 独立速率限制：每 IP 每小时 ≤ 10 次，防止滥用
-- 环境变量 `PUBLIC_REGISTRATION=1` 开启（默认关闭，保持现有安全边界）
-- Token 格式与现有 Bearer Token 完全一致，其他所有 `/v1/*` 端点无需改动
+- 校验 MCP 签发的一次性绑定码、用户名、密码和显示名
+- 注册成功后通过 `Set-Cookie` 建立 Web Session
+- 后续 REST 请求使用同源 Cookie；MCP 设备仍使用 Bearer Token
 
-**风险说明**：Token 丢失（清除 localStorage）即等同账号丢失，无找回机制。详见第 14 节决策 D1。
+**安全说明**：密码重置码由 MCP 身份签发，Web Session 使用 HttpOnly Cookie。
 
 ---
 
@@ -137,7 +139,7 @@ Content-Type: application/json
 
 ```http
 GET /v1/me
-Authorization: Bearer <token>
+Cookie: chuanhuatong_web=...
 ```
 
 **响应 200**
@@ -204,7 +206,7 @@ Authorization: Bearer <token>
 
 ```
 WebSocket /v1/realtime
-Header: Authorization: Bearer <token>
+Cookie: chuanhuatong_web=...
 ```
 
 连接成功后服务器立即推送 `connection.ready`：
@@ -280,7 +282,7 @@ Header: Authorization: Bearer <token>
 | `group_publish_agent_reply` | 写 | 发布 AI 回复（主要发布工具）|
 | `group_set_display_name` | 写 | 修改用户显示名 |
 
-**Phase 2 计划新增（来自 `docs/auto-poll-design.md`，设计阶段）：**
+**Phase 4 已实现（来自 `docs/auto-poll-design.md`）：**
 
 | 工具名 | 用途 |
 |--------|------|
@@ -333,8 +335,8 @@ frontend/
     ├── App.tsx             # 路由根，未登录重定向 /auth
     ├── types.ts            # 共享类型（Message, Room, User）
     ├── api/
-    │   ├── client.ts       # fetch 封装（自动注入 Bearer token，统一错误处理）
-    │   ├── auth.ts         # register(), me()
+    │   ├── client.ts       # fetch 封装（same-origin credentials，统一错误处理）
+    │   ├── auth.ts         # login(), register(), resetPassword(), me()
     │   ├── rooms.ts        # listRooms(), getRoom(), createRoom()
     │   ├── messages.ts     # listMessages(), sendMessage()
     │   └── invites.ts      # createInvite(), acceptInvite(), previewInvite()
@@ -343,7 +345,7 @@ frontend/
     ├── store/
     │   └── AppContext.tsx   # 全局状态：token, me, rooms, messages map
     ├── pages/
-    │   ├── AuthPage.tsx    # 注册（输入显示名 → 获取 token）
+    │   ├── AuthPage.tsx    # 登录、绑定账号、密码重置
     │   ├── RoomListPage.tsx  # 房间列表 + 加入/创建入口
     │   ├── RoomPage.tsx    # 消息流 + 发送框 + 成员侧栏
     │   └── JoinPage.tsx    # /join/:inviteCode 深链接处理
@@ -360,7 +362,7 @@ frontend/
 | 路径 | 页面 | 说明 |
 |------|------|------|
 | `/` | `RoomListPage` | 未登录时重定向到 `/auth` |
-| `/auth` | `AuthPage` | 输入显示名，获取并存储 token |
+| `/auth` | `AuthPage` | 登录、绑定账号、密码重置 |
 | `/rooms/:roomId` | `RoomPage` | 房间消息视图 |
 | `/join/:inviteCode` | `JoinPage` | 邀请深链接，成功后跳转到房间 |
 
@@ -371,7 +373,7 @@ frontend/
 ```typescript
 // AppContext 全局状态结构
 interface AppState {
-  token: string | null;                         // localStorage 持久化
+  session: 'unknown' | 'authenticated' | 'anonymous';
   me: User | null;
   rooms: Room[];
   messages: Record<string, Message[]>;          // roomId → 按 seq 排序的消息列表
@@ -407,7 +409,7 @@ case 'APPEND_MESSAGE': {
   2. 重连成功 → GET /v1/rooms/:id/messages?afterSeq=<lastSeq> 补全缺失
 
 发消息（幂等）：
-  1. 生成 clientMessageId = crypto.randomUUID()，存 sessionStorage
+  1. 生成 clientMessageId，存 sessionStorage
   2. POST /v1/rooms/:id/messages（含 Idempotency-Key: clientMessageId）
   3. 网络失败 → 用同一 clientMessageId 重试，服务器按 (roomId, clientMessageId) 去重
 ```
@@ -542,7 +544,9 @@ sessionStorage.removeItem(`pending-${roomId}`);
 
 ---
 
-## 12. 分阶段实施计划
+## 12. 分阶段实施计划（历史规划）
+
+> 本节记录最初的实施顺序。Phase 1–4 已完成，当前状态请以本文第 1 节和 `docs/development-report.md` 为准。
 
 ### Phase 1：最小可用 Web 聊天（MVP）
 
@@ -621,7 +625,7 @@ sessionStorage.removeItem(`pending-${roomId}`);
 |------|---------|
 | P1-1 | 新用户调用 `POST /v1/auth/register` 成功，返回有效 Bearer token |
 | P1-2 | 用有效 token 调用 `GET /v1/me` 返回正确用户信息 |
-| P1-3 | 浏览器打开 Web 前端，输入显示名后可看到房间列表 |
+| P1-3 | 浏览器打开 Web 前端，使用用户名和密码登录后可看到房间列表 |
 | P1-4 | 在 Web 前端发送消息，可在另一个浏览器 Tab 实时看到（延迟 ≤ 1s）|
 | P1-5 | MCP 客户端（Codex/Claude）发送消息，Web 前端实时显示（延迟 ≤ 1s）|
 | P1-6 | Web 前端发送消息，MCP 客户端通过 `group_read_messages` 可读到 |
@@ -641,33 +645,27 @@ sessionStorage.removeItem(`pending-${roomId}`);
 | 类型 | 工具 | 范围 |
 |------|------|------|
 | 后端单元/集成测试 | 现有 `npm test`（内存模式）| 已覆盖 `POST /v1/auth/register`、`GET /v1/me`、邀请预览与注册限流 |
-| 前端组件测试 | Vitest + @testing-library/react | 尚未配置；`useRealtimeWS` hook、消息去重 reducer 待补 |
-| 手动 E2E | 两个浏览器 Tab + Codex CLI | 跨客户端消息互通 |
+| 前端组件测试 | Vitest + @testing-library/react | 已覆盖 `useRealtimeWS`、消息列表、状态 reducer、顶层导航；页面级 E2E 仍需扩展 |
+| 浏览器 E2E | Playwright | 登录、聊天、撤回、移动端布局、设置、世界发布和删除房间 |
 | 压力测试（可选）| `wrk` / `k6` | `GET /v1/rooms/:id/messages` 分页性能 |
 
 ---
 
-## 14. 待确认的关键产品决策
+## 14. 历史产品决策记录
 
-以下 5 个决策直接影响实现方案，需要在开始编码前确认。
+以下决策记录最初的实现取舍，当前不再是阻塞项。
 
-### D1：Web 用户身份持久化方式
+### D1：Web 用户身份持久化方式（已落地）
 
-**问题**：token 存 localStorage，清除缓存即丢失账号，无找回机制，是否可接受？
+**历史问题**：早期方案曾考虑把 Token 直接存入 `localStorage`，当前已不再采用。
 
-| 选项 | 实现成本 | 用户体验 |
-|------|---------|---------|
-| **A. Token 即身份（推荐）** | 极低（~30 行）| 清缓存即丢账号，适合内部/临时使用 |
-| B. 用户名 + 密码 | 中（~100 行）| 可找回，适合长期公开使用 |
-| C. 邮箱验证 | 高（需邮件服务）| 最完整，超出当前产品边界 |
-
-**建议**：Phase 1 选 A，Phase 5 加固时升级为 B 或接入 OAuth。
+**当前实现**：采用用户名 + 密码和同源 HttpOnly Cookie Session；MCP 设备仍使用独立 Bearer Token。
 
 ---
 
-### D2：前端部署方式
+### D2：前端部署方式（已落地）
 
-**问题**：前端构建产物如何托管？
+**当前实现**：开发时由 Vite 托管，生产构建由 `src/server.mjs` 同源托管并支持 SPA 回退。
 
 | 选项 | 实现 | 适合场景 |
 |------|------|---------|
@@ -676,9 +674,9 @@ sessionStorage.removeItem(`pending-${roomId}`);
 
 ---
 
-### D3：谁创建第一个邀请
+### D3：谁创建第一个邀请（历史问题）
 
-**问题**：Phase 1 中，Web 新用户注册后没有任何房间，无法自助加入。谁给他们第一个邀请？
+**历史问题**：Phase 1 中，Web 新用户注册后没有任何房间，无法自助加入。谁给他们第一个邀请？
 
 | 选项 | 说明 |
 |------|------|
@@ -701,17 +699,23 @@ sessionStorage.removeItem(`pending-${roomId}`);
 
 ---
 
-### D5：是否实现 group_poll_messages（Phase 4）
+### D5：是否实现 group_poll_messages（已落地）
 
-**问题**：`docs/auto-poll-design.md` 设计了 60s 长轮询工具，当前处于设计阶段，是否纳入本次交付范围？
+**历史问题**：`docs/auto-poll-design.md` 设计的 60s 长轮询工具是否纳入交付范围。
 
-改动量小（~40 行），独立性强，建议与 Phase 1 一起实现，但不阻塞 Phase 1 上线。
+该工具已在 Phase 4 实现并有回归测试。
 
 ---
 
-## 附录 A：静态文件托管候选方案（尚未实现）
+## 附录 A：静态文件同源托管（已实现）
 
-在 `src/server.mjs` 的路由处理中，在所有 `/v1/*` 和 `/mcp` 路由之后，加入：
+`src/server.mjs` 已在所有 `/v1/*` 和 `/mcp` 路由之后调用 `serveFrontend()`：
+
+- 生产构建存在时，静态资源按 MIME 类型返回；
+- 不存在的前端路径回退到 `index.html`，支持 SPA 路由；
+- 服务端测试覆盖同源首页和 SPA 路由。
+
+历史候选伪代码如下，仅作记录：
 
 ```javascript
 // 伪代码，适配现有路由风格
