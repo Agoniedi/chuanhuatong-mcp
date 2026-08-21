@@ -16,10 +16,22 @@ only. Production mode disables it until durable device credentials and recovery
 are implemented. Never expose a development-auth instance to the public
 internet.
 
+## 许可证
+
+本仓库采用 [PolyForm Noncommercial 1.0.0](./LICENSE)。你可以使用、复制、修改和
+再发布，但仅限非商业用途。若要用于收费产品、商业 SaaS、商业托管服务或其他以商业
+获利为主要目的的场景，需要另行获得书面授权。
+
+商业授权联系：`2578765255@qq.com`。
+
 ## Local PostgreSQL stack
 
-The repository does not currently include a Docker Compose manifest. Point the
-server at an existing PostgreSQL 15+ database:
+The repository includes `compose.yaml` for a local PostgreSQL 17 + server stack.
+If you already have PostgreSQL 15+ running, point the server at that database:
+
+```powershell
+docker compose up --build
+```
 
 ```powershell
 $env:DATABASE_URL = 'postgresql://chuanhuatong:password@127.0.0.1:5432/chuanhuatong'
