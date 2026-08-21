@@ -1,6 +1,6 @@
 # 传话筒 MCP Server
 
-传话筒（`chuanhuatong-mcp`）是一个独立的多人群聊 MCP Server，包含标准 MCP、
+传话筒MCP是一个独立的多人群聊 MCP Server，包含标准 MCP、
 REST 和 WebSocket 后端。PostgreSQL is
 the durable source of truth. Human-message creation commits the message, room
 sequence, idempotency result, and `message.created` outbox event in one database
