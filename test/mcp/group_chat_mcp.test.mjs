@@ -238,27 +238,40 @@ describe('stateless Group Chat MCP read loop', () => {
       [
         'group_activate_agent',
         'group_create_invite',
+        'group_create_mcp_device_token',
         'group_create_room',
+        'group_create_web_binding_code',
+        'group_create_web_password_reset_code',
         'group_deactivate_agent',
         'group_get_room_context',
+        'group_handoff_to_room',
         'group_heartbeat_agent',
         'group_join_room',
         'group_list_rooms',
+        'group_poll_messages',
         'group_publish_agent_reply',
         'group_read_messages',
         'group_send_message',
+        'group_send_message_and_agent_reply',
+        'group_set_display_name',
         'group_wait_for_messages',
       ],
     );
     const writeTools = [
       'group_activate_agent',
       'group_create_invite',
+      'group_create_mcp_device_token',
       'group_create_room',
+      'group_create_web_binding_code',
+      'group_create_web_password_reset_code',
       'group_deactivate_agent',
+      'group_handoff_to_room',
       'group_heartbeat_agent',
       'group_join_room',
       'group_publish_agent_reply',
       'group_send_message',
+      'group_send_message_and_agent_reply',
+      'group_set_display_name',
     ];
     for (const tool of result.body.result.tools.filter(
       (candidate) => !writeTools.includes(candidate.name))) {
@@ -292,6 +305,11 @@ describe('stateless Group Chat MCP read loop', () => {
     );
     assert.match(humanSendTool.description, /human identity/i);
     assert.match(humanSendTool.description, /not.*agent/i);
+    const displayNameTool = result.body.result.tools.find(
+      (tool) => tool.name === 'group_set_display_name',
+    );
+    assert.match(displayNameTool.description, /explicitly requests/i);
+    assert.match(displayNameTool.description, /existing message snapshots do not change/i);
     const readTool = result.body.result.tools.find(
       (tool) => tool.name === 'group_read_messages',
     );
@@ -305,6 +323,7 @@ describe('stateless Group Chat MCP read loop', () => {
     );
     assert.match(activateTool.description, /first-time setup/i);
     assert.match(activateTool.description, /do not call before each reply/i);
+    assert.equal(activateTool.inputSchema.properties.triggerScope.default, 'allMessages');
     const agentReplyTool = result.body.result.tools.find(
       (tool) => tool.name === 'group_publish_agent_reply',
     );
@@ -312,8 +331,22 @@ describe('stateless Group Chat MCP read loop', () => {
     assert.match(agentReplyTool.description, /first reply.*publicProfile/i);
     assert.match(agentReplyTool.description, /not group_send_message/i);
     assert.match(agentReplyTool.description, /stop the current assistant turn/i);
+    assert.deepEqual(agentReplyTool.inputSchema.properties.triggerScope.enum, [
+      'mentionsOnly',
+      'allHumanMessages',
+      'allMessages',
+    ]);
     assert.deepEqual(
       agentReplyTool.outputSchema.properties.nextAction.const,
+      'stop_current_turn',
+    );
+    const atomicReplyTool = result.body.result.tools.find(
+      (tool) => tool.name === 'group_send_message_and_agent_reply',
+    );
+    assert.match(atomicReplyTool.description, /both messages succeed or neither/i);
+    assert.match(atomicReplyTool.description, /stop the current assistant turn/i);
+    assert.deepEqual(
+      atomicReplyTool.outputSchema.properties.nextAction.const,
       'stop_current_turn',
     );
   });
@@ -333,15 +366,22 @@ describe('stateless Group Chat MCP read loop', () => {
         [
           'group_activate_agent',
           'group_create_invite',
+          'group_create_mcp_device_token',
           'group_create_room',
+          'group_create_web_binding_code',
+          'group_create_web_password_reset_code',
           'group_deactivate_agent',
           'group_get_room_context',
+          'group_handoff_to_room',
           'group_heartbeat_agent',
           'group_join_room',
           'group_list_rooms',
+          'group_poll_messages',
           'group_publish_agent_reply',
           'group_read_messages',
           'group_send_message',
+          'group_send_message_and_agent_reply',
+          'group_set_display_name',
           'group_wait_for_messages',
         ],
       );
@@ -465,6 +505,128 @@ describe('stateless Group Chat MCP read loop', () => {
     );
   });
 
+  it('atomically creates a room, seeds handoff context, and returns a joinable invite', async () => {
+    const args = {
+      clientRequestId: 'mcp-handoff-alice',
+      title: '方案讨论',
+      contextSummary: '我们在规划传话筒的拉群协作交接功能。',
+      decisions: ['新增 group_handoff_to_room 原子工具'],
+      openQuestions: ['邀请码默认过期时间是否合适'],
+    };
+    const created = await callTool('group_handoff_to_room', args, {
+      accessToken: users.alice.accessToken,
+    });
+    const replayed = await callTool('group_handoff_to_room', args, {
+      accessToken: users.alice.accessToken,
+    });
+    const replayedWithExplicitDefaults = await callTool('group_handoff_to_room', {
+      ...args,
+      inviteOptions: {
+        expiresInSeconds: 7 * 24 * 60 * 60,
+        maxUses: 10,
+      },
+    }, { accessToken: users.alice.accessToken });
+    const result = created.body.result.structuredContent;
+
+    assert.equal(created.body.result.isError, undefined);
+    assert.deepEqual(replayed.body.result.structuredContent, result);
+    assert.deepEqual(replayedWithExplicitDefaults.body.result.structuredContent, result);
+
+    const room = result.room;
+    assert.equal(room.ownerUserId, users.alice.user.userId);
+    assert.equal(room.title, '方案讨论');
+    assert.equal(room.lastSeq, 1);
+    assert.equal(room.historyVisibility, 'from_start');
+
+    const message = result.message;
+    assert.equal(message.roomId, room.id);
+    assert.equal(message.seq, 1);
+    assert.equal(message.senderType, 'human');
+    assert.equal(message.senderDisplayName, users.alice.user.displayName);
+    assert.ok(message.content.text.includes('# 背景'));
+    assert.ok(message.content.text.includes(args.contextSummary));
+    assert.ok(message.content.text.includes('# 已确认结论'));
+    assert.ok(message.content.text.includes('- 新增 group_handoff_to_room 原子工具'));
+    assert.ok(message.content.text.includes('# 待讨论事项'));
+
+    const invite = result.invite;
+    assert.equal(invite.roomId, room.id);
+    assert.equal(invite.maxUses, 10);
+    assert.equal(invite.remainingUses, 10);
+    assert.ok(typeof invite.inviteCode === 'string' && invite.inviteCode.length >= 22);
+
+    const conflict = await callTool('group_handoff_to_room', {
+      ...args,
+      contextSummary: '不同的背景',
+    }, { accessToken: users.alice.accessToken });
+    assert.equal(conflict.body.result.isError, true);
+    assert.equal(
+      JSON.parse(conflict.body.result.content[0].text).error.code,
+      'idempotency_conflict',
+    );
+
+    const joined = await callTool('group_join_room', {
+      clientRequestId: 'mcp-handoff-join-bob',
+      inviteCode: invite.inviteCode,
+    }, { accessToken: users.bob.accessToken });
+    assert.equal(joined.body.result.isError, undefined);
+    assert.equal(
+      joined.body.result.structuredContent.room.historyVisibility,
+      'from_start',
+    );
+    const membership = joined.body.result.structuredContent.membership;
+    assert.equal(membership.readSeq, 0);
+    const roomContext = await callTool('group_get_room_context', { roomId: room.id }, {
+      accessToken: users.bob.accessToken,
+    });
+    assert.equal(roomContext.body.result.isError, undefined);
+    assert.equal(roomContext.body.result.structuredContent.members.length, 2);
+    const messages = await callTool('group_read_messages', {
+      roomId: room.id,
+      afterSeq: membership.readSeq,
+      limit: 5,
+    }, { accessToken: users.bob.accessToken });
+    const items = messages.body.result.structuredContent.messages;
+    assert.equal(items.length, 1);
+    assert.equal(items[0].content.text, message.content.text);
+  });
+
+  it('keeps the derived handoff message ID valid for a maximum-length request ID', async () => {
+    const created = await callTool('group_handoff_to_room', {
+      clientRequestId: 'x'.repeat(128),
+      title: 'Boundary handoff',
+      contextSummary: 'Boundary context',
+    }, { accessToken: users.alice.accessToken });
+
+    assert.equal(created.body.result.isError, undefined);
+    assert.ok(
+      created.body.result.structuredContent.message.clientMessageId.length <= 128,
+    );
+  });
+
+  it('rejects invalid handoff inputs and unknown fields', async () => {
+    const base = {
+      title: 'Handoff',
+      contextSummary: 'Background',
+    };
+    for (const args of [
+      { ...base, clientRequestId: 'handoff-blank-title', title: '   ' },
+      { ...base, clientRequestId: 'handoff-long-summary', contextSummary: 'x'.repeat(32769) },
+      {
+        ...base,
+        clientRequestId: 'handoff-overlong-assembly',
+        contextSummary: 'y'.repeat(32000),
+        decisions: ['z'.repeat(2000)],
+      },
+      { ...base, clientRequestId: 'handoff-unknown-field', extra: true },
+    ]) {
+      const result = await callTool('group_handoff_to_room', args, {
+        accessToken: users.alice.accessToken,
+      });
+      assert.equal(result.body.result.isError, true);
+    }
+  });
+
   it('rejects invalid self-service room inputs and unknown fields', async () => {
     for (const [name, args] of [
       ['group_create_room', { clientRequestId: 'blank-room', title: '   ' }],
@@ -538,6 +700,106 @@ describe('stateless Group Chat MCP read loop', () => {
     assert.equal(empty.body.result.structuredContent.nextSeq, 3);
   });
 
+  it('returns recalled messages through every MCP read tool', async () => {
+    const room = (await callTool('group_create_room', {
+      clientRequestId: 'mcp-recalled-message-room',
+      title: 'MCP recalled message room',
+    })).body.result.structuredContent;
+    const sent = await callTool('group_send_message', {
+      roomId: room.id,
+      clientMessageId: 'mcp-recalled-message-source',
+      text: 'This message will be recalled.',
+    });
+    const message = sent.body.result.structuredContent;
+    const recalled = await json(
+      `/v1/rooms/${room.id}/messages/${message.id}/recall`,
+      'POST',
+      {},
+      { Authorization: `Bearer ${users.alice.accessToken}` },
+    );
+    assert.equal(recalled.response.status, 200);
+
+    for (const [toolName, args] of [
+      ['group_read_messages', { roomId: room.id, afterSeq: 0, limit: 10 }],
+      ['group_wait_for_messages', { roomId: room.id, afterSeq: 0, timeoutMs: 0 }],
+      ['group_poll_messages', { roomId: room.id, afterSeq: 0, timeoutMs: 0 }],
+    ]) {
+      const result = await callTool(toolName, args);
+      assert.equal(result.body.result.isError, undefined);
+      const recalledMessage = result.body.result.structuredContent.messages[0];
+      assert.equal(recalledMessage.id, message.id);
+      assert.equal(recalledMessage.content.text, '');
+      assert.equal(typeof recalledMessage.recalledAt, 'string');
+    }
+  });
+
+  it('changes the authenticated human display name through MCP', async () => {
+    const session = await json('/__dev/guest-session', 'POST', {
+      deviceId: 'mcp-device-profile-update',
+      displayName: 'MCP Profile Before',
+    });
+    const accessToken = session.body.accessToken;
+    const room = await callTool('group_create_room', {
+      clientRequestId: 'mcp-profile-update-room',
+      title: 'MCP Profile Update Room',
+    }, { accessToken });
+    const roomId = room.body.result.structuredContent.id;
+    const oldMessage = await callTool('group_send_message', {
+      roomId,
+      clientMessageId: 'mcp-profile-message-before',
+      text: 'Before rename',
+    }, { accessToken });
+    const args = {
+      clientRequestId: 'mcp-profile-update-name',
+      displayName: 'MCP Profile After',
+    };
+    const updated = await callTool('group_set_display_name', args, { accessToken });
+    const replay = await callTool('group_set_display_name', args, { accessToken });
+    const changedReplay = await callTool('group_set_display_name', {
+      ...args,
+      displayName: 'Different Replay Name',
+    }, { accessToken });
+    const duplicate = await callTool('group_set_display_name', {
+      clientRequestId: 'mcp-profile-update-duplicate',
+      displayName: 'ＭＣＰ Ｂｏｂ',
+    }, { accessToken });
+    const blank = await callTool('group_set_display_name', {
+      clientRequestId: 'mcp-profile-update-blank',
+      displayName: '   ',
+    }, { accessToken });
+    const newMessage = await callTool('group_send_message', {
+      roomId,
+      clientMessageId: 'mcp-profile-message-after',
+      text: 'After rename',
+    }, { accessToken });
+    const profile = updated.body.result.structuredContent;
+
+    assert.equal(updated.body.result.isError, undefined);
+    assert.equal(profile.userId, session.body.user.userId);
+    assert.equal(profile.displayName, 'MCP Profile After');
+    assert.equal(profile.profileRevision, session.body.user.profileRevision + 1);
+    assert.deepEqual(replay.body.result.structuredContent, profile);
+    assert.equal(changedReplay.body.result.isError, true);
+    assert.equal(
+      JSON.parse(changedReplay.body.result.content[0].text).error.code,
+      'idempotency_conflict',
+    );
+    assert.equal(duplicate.body.result.isError, undefined);
+    assert.equal(
+      duplicate.body.result.structuredContent.displayName,
+      'ＭＣＰ Ｂｏｂ',
+    );
+    assert.equal(blank.body.result.isError, true);
+    assert.equal(
+      oldMessage.body.result.structuredContent.senderDisplayName,
+      'MCP Profile Before',
+    );
+    assert.equal(
+      newMessage.body.result.structuredContent.senderDisplayName,
+      'ＭＣＰ Ｂｏｂ',
+    );
+  });
+
   it('sends one human message idempotently and rejects forged or invalid sends', async () => {
     const args = {
       roomId: contextRoom.id,
@@ -596,6 +858,18 @@ describe('stateless Group Chat MCP read loop', () => {
       text: '',
     });
     assert.equal(blank.body.result.isError, true);
+
+    const invalidAgentMention = await callTool('group_send_message', {
+      roomId: contextRoom.id,
+      clientMessageId: 'mcp-invalid-agent-mention',
+      text: 'Do not accept an unknown agent mention',
+      mentions: [{ kind: 'agent', targetId: 'missing-agent-profile' }],
+    });
+    assert.equal(invalidAgentMention.body.result.isError, true);
+    assert.equal(
+      JSON.parse(invalidAgentMention.body.result.content[0].text).error.code,
+      'invalid_request',
+    );
 
     const forbidden = await callTool('group_send_message', {
       roomId: contextRoom.id,
@@ -697,6 +971,85 @@ describe('stateless Group Chat MCP read loop', () => {
       JSON.parse(nonMember.body.result.content[0].text).error.code,
       'forbidden',
     );
+  });
+
+  it('publishes a human message and agent reply atomically', async () => {
+    const room = (await createRoom(
+      'MCP Atomic Reply Room',
+      'mcp-atomic-reply-room',
+    )).body;
+    const trigger = await callTool('group_send_message', {
+      roomId: room.id,
+      clientMessageId: 'mcp-atomic-trigger',
+      text: 'Start the atomic reply test.',
+    });
+    assert.equal(trigger.body.result.isError, undefined);
+
+    const args = {
+      roomId: room.id,
+      humanClientMessageId: 'mcp-atomic-human',
+      humanText: 'Post this human text exactly.',
+      triggerBatchId: 'mcp-atomic-batch',
+      triggerMessageIds: [trigger.body.result.structuredContent.id],
+      agentClientMessageId: 'mcp-atomic-agent',
+      agentText: 'Then publish this agent reply.',
+      publicProfile: {
+        displayName: 'Atomic Agent',
+        avatarResourceId: null,
+        shortBio: 'Used by the atomic publication test.',
+      },
+    };
+    const first = await callTool('group_send_message_and_agent_reply', args);
+    const replay = await callTool('group_send_message_and_agent_reply', args);
+
+    assert.equal(first.body.result.isError, undefined);
+    assert.deepEqual(replay.body.result.structuredContent, first.body.result.structuredContent);
+    assert.equal(first.body.result.structuredContent.nextAction, 'stop_current_turn');
+    assert.equal(first.body.result.structuredContent.humanMessage.sender.kind, 'human');
+    assert.equal(first.body.result.structuredContent.agentMessage.sender.kind, 'agent');
+    assert.equal(
+      first.body.result.structuredContent.agentMessage.seq,
+      first.body.result.structuredContent.humanMessage.seq + 1,
+    );
+
+    const listed = await callTool('group_read_messages', {
+      roomId: room.id,
+      afterSeq: 0,
+      limit: 20,
+    });
+    const messages = listed.body.result.structuredContent.messages;
+    assert.equal(
+      messages.filter((message) => message.clientMessageId === args.humanClientMessageId).length,
+      1,
+    );
+    assert.equal(
+      messages.filter((message) => message.clientMessageId === args.agentClientMessageId).length,
+      1,
+    );
+
+    const failed = await callTool('group_send_message_and_agent_reply', {
+      ...args,
+      humanClientMessageId: 'mcp-atomic-failed-human',
+      humanText: 'This human message must not become visible.',
+      triggerBatchId: 'mcp-atomic-failed-batch',
+      triggerMessageIds: [first.body.result.structuredContent.agentMessage.id],
+      agentClientMessageId: 'mcp-atomic-failed-agent',
+      agentText: 'This agent reply is invalid.',
+      publicProfile: undefined,
+      agentMentions: [{ kind: 'agent', targetId: 'missing-agent-profile' }],
+    });
+    assert.equal(failed.body.result.isError, true);
+    assert.equal(
+      JSON.parse(failed.body.result.content[0].text).error.code,
+      'invalid_request',
+    );
+
+    const afterFailure = await callTool('group_read_messages', {
+      roomId: room.id,
+      afterSeq: first.body.result.structuredContent.agentMessage.seq,
+      limit: 20,
+    });
+    assert.deepEqual(afterFailure.body.result.structuredContent.messages, []);
   });
 
   it('configures an agent profile inside the first publish call', async () => {
@@ -1038,6 +1391,59 @@ describe('stateless Group Chat MCP read loop', () => {
     );
   });
 
+  it('returns new messages immediately with group_poll_messages', async () => {
+    const result = await callTool('group_poll_messages', {
+      roomId: contextRoom.id,
+      afterSeq: 0,
+      timeoutMs: 2000,
+    });
+    assert.equal(result.body.result.isError, undefined);
+    const content = result.body.result.structuredContent;
+    assert.ok(content.messages.length > 0);
+    assert.ok(content.nextSeq > 0);
+    assert.ok(content.highWaterSeq > 0);
+  });
+
+  it('returns empty when no new messages and 0ms timeout with group_poll_messages', async () => {
+    const current = await callTool('group_read_messages', {
+      roomId: contextRoom.id,
+      afterSeq: 0,
+      limit: 200,
+    });
+    const highWater = current.body.result.structuredContent.highWaterSeq;
+    const result = await callTool('group_poll_messages', {
+      roomId: contextRoom.id,
+      afterSeq: highWater,
+      timeoutMs: 0,
+    });
+    assert.equal(result.body.result.isError, undefined);
+    const content = result.body.result.structuredContent;
+    assert.deepEqual(content.messages, []);
+    assert.equal(content.nextSeq, highWater);
+  });
+
+  it('rejects timeoutMs exceeding 60000 with group_poll_messages', async () => {
+    const result = await callTool('group_poll_messages', {
+      roomId: contextRoom.id,
+      afterSeq: 0,
+      timeoutMs: 60001,
+    });
+    assert.equal(result.body.result.isError, true);
+  });
+
+  it('rejects non-member access with group_poll_messages', async () => {
+    const result = await callTool('group_poll_messages', {
+      roomId: contextRoom.id,
+      afterSeq: 0,
+      timeoutMs: 0,
+    }, { accessToken: users.charlie.accessToken });
+    assert.equal(result.body.result.isError, true);
+    assert.equal(
+      JSON.parse(result.body.result.content[0].text).error.code,
+      'forbidden',
+    );
+  });
+
   it('activates, fences, transfers, heartbeats, and deactivates one agent lease', async () => {
     const lifecycleRoom = (await createRoom(
       'MCP Lifecycle Room',
@@ -1057,6 +1463,7 @@ describe('stateless Group Chat MCP read loop', () => {
         avatarResourceId: null,
         shortBio: 'Public lifecycle profile',
       },
+      triggerScope: 'allHumanMessages',
       runtimeCapabilitiesVersion: 1,
       localConfigRevision: 7,
     };
@@ -1249,22 +1656,21 @@ describe('stateless Group Chat MCP read loop', () => {
     }
   });
 
-  it('rejects self-triggered agent replies under the MCP default trigger scope', async () => {
-    const room = (await createRoom('MCP Human Trigger Room', 'mcp-human-trigger-room')).body;
+  it('allows agent-triggered replies by default and preserves strict human-only mode', async () => {
+    const room = (await createRoom('MCP Agent Trigger Room', 'mcp-agent-trigger-room')).body;
     const activated = await callTool('group_activate_agent', {
       roomId: room.id,
       publicProfile: {
-        displayName: 'Human Trigger Agent',
+        displayName: 'Agent Trigger Agent',
         avatarResourceId: null,
-        shortBio: 'Responds only to human messages.',
+        shortBio: 'Can participate in multi-agent discussion.',
       },
       runtimeCapabilitiesVersion: 1,
       localConfigRevision: 1,
     });
     assert.equal(activated.body.result.isError, undefined);
     const binding = store.roomAgentBindings.get(`${room.id}:${users.alice.user.userId}`);
-    assert.equal(binding.triggerScope, 'allHumanMessages');
-    binding.triggerScope = 'allMessages';
+    assert.equal(binding.triggerScope, 'allMessages');
 
     const human = await callTool('group_send_message', {
       roomId: room.id,
@@ -1280,18 +1686,48 @@ describe('stateless Group Chat MCP read loop', () => {
     });
     assert.equal(firstReply.body.result.isError, undefined);
 
-    const selfTriggered = await callTool('group_publish_agent_reply', {
+    const agentTriggered = await callTool('group_publish_agent_reply', {
       roomId: room.id,
       triggerBatchId: 'mcp-self-trigger-batch',
       triggerMessageIds: [firstReply.body.result.structuredContent.message.id],
       clientMessageId: 'mcp-self-trigger-reply',
-      text: 'This recursive reply must be rejected.',
+      text: 'Continue the discussion from the previous agent message.',
     });
-    assert.equal(selfTriggered.body.result.isError, true);
+    assert.equal(agentTriggered.body.result.isError, undefined);
+
+    const followUp = await callTool('group_publish_agent_reply', {
+      roomId: room.id,
+      triggerBatchId: 'mcp-duplicate-agent-trigger-batch',
+      triggerMessageIds: [firstReply.body.result.structuredContent.message.id],
+      clientMessageId: 'mcp-duplicate-agent-trigger-reply',
+      text: 'A later turn can add a follow-up to the same message.',
+    });
+    assert.equal(followUp.body.result.isError, undefined);
+
+    const strictHumanOnly = await callTool('group_publish_agent_reply', {
+      roomId: room.id,
+      triggerBatchId: 'mcp-strict-human-trigger-batch',
+      triggerMessageIds: [agentTriggered.body.result.structuredContent.message.id],
+      clientMessageId: 'mcp-strict-human-trigger-reply',
+      text: 'Strict mode must still reject this agent trigger.',
+      triggerScope: 'allHumanMessages',
+    });
+    assert.equal(strictHumanOnly.body.result.isError, true);
     assert.equal(
-      JSON.parse(selfTriggered.body.result.content[0].text).error.code,
+      JSON.parse(strictHumanOnly.body.result.content[0].text).error.code,
       'trigger_not_eligible',
     );
+
+    const switchedBackToAgentTriggers = await callTool('group_publish_agent_reply', {
+      roomId: room.id,
+      triggerBatchId: 'mcp-explicit-agent-trigger-batch',
+      triggerMessageIds: [agentTriggered.body.result.structuredContent.message.id],
+      clientMessageId: 'mcp-explicit-agent-trigger-reply',
+      text: 'An explicit allMessages policy change allows this agent trigger.',
+      triggerScope: 'allMessages',
+    });
+    assert.equal(switchedBackToAgentTriggers.body.result.isError, undefined);
+    assert.equal(binding.triggerScope, 'allMessages');
   });
 
   it('enforces per-agent, dynamic room, absolute AI loop limits, and human resets', async () => {
@@ -1303,6 +1739,7 @@ describe('stateless Group Chat MCP read loop', () => {
         avatarResourceId: null,
         shortBio: 'Loop limit test profile',
       },
+      triggerScope: 'allHumanMessages',
       runtimeCapabilitiesVersion: 1,
       localConfigRevision: 1,
     });
@@ -1494,20 +1931,34 @@ describe('stateless Group Chat MCP read loop', () => {
     assert.equal(invalidVersion.response.status, 400);
   });
 
-  it('returns 405 for authenticated GET and DELETE requests', async () => {
-    for (const method of ['GET', 'DELETE']) {
-      const result = await request('/mcp', {
-        method,
+  it('opens a query-authenticated GET stream and rejects DELETE requests', async () => {
+    const controller = new AbortController();
+    const stream = await fetch(
+      `${baseUrl}/mcp?token=${encodeURIComponent(users.alice.accessToken)}`,
+      {
         headers: {
-          Authorization: `Bearer ${users.alice.accessToken}`,
-          Accept: MCP_ACCEPT,
+          Accept: 'text/event-stream',
           'MCP-Protocol-Version': MCP_PROTOCOL_VERSION,
         },
-      });
-      assert.equal(result.response.status, 405);
-      assert.equal(result.response.headers.get('allow'), 'POST');
-      assert.equal(result.response.headers.get('mcp-session-id'), null);
-    }
+        signal: controller.signal,
+      },
+    );
+    assert.equal(stream.status, 200);
+    assert.equal(stream.headers.get('content-type'), 'text/event-stream');
+    assert.equal(stream.headers.get('mcp-session-id'), null);
+    controller.abort();
+
+    const result = await request('/mcp', {
+      method: 'DELETE',
+      headers: {
+        Authorization: `Bearer ${users.alice.accessToken}`,
+        Accept: MCP_ACCEPT,
+        'MCP-Protocol-Version': MCP_PROTOCOL_VERSION,
+      },
+    });
+    assert.equal(result.response.status, 405);
+    assert.equal(result.response.headers.get('allow'), 'GET, POST');
+    assert.equal(result.response.headers.get('mcp-session-id'), null);
   });
 
   it('rate limits authenticated MCP POST requests', async () => {

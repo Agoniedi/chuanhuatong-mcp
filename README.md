@@ -16,19 +16,22 @@ only. Production mode disables it until durable device credentials and recovery
 are implemented. Never expose a development-auth instance to the public
 internet.
 
+## 许可证
+
+本仓库采用 [PolyForm Noncommercial 1.0.0](./LICENSE)。你可以使用、复制、修改和
+再发布，但仅限非商业用途。若要用于收费产品、商业 SaaS、商业托管服务或其他以商业
+获利为主要目的的场景，需要另行获得书面授权。
+
+商业授权联系：`2578765255@qq.com`。
+
 ## Local PostgreSQL stack
 
-Docker Compose is the recommended local setup once Docker Desktop is installed:
+The repository includes `compose.yaml` for a local PostgreSQL 17 + server stack.
+If you already have PostgreSQL 15+ running, point the server at that database:
 
 ```powershell
 docker compose up --build
 ```
-
-This starts PostgreSQL and the server on `127.0.0.1:18787`, applies migrations,
-and explicitly enables development authentication. Data is stored in the named
-`chuanhuatong_postgres` volume and survives container restarts.
-
-Without Docker, point the server at an existing PostgreSQL 15+ database:
 
 ```powershell
 $env:DATABASE_URL = 'postgresql://chuanhuatong:password@127.0.0.1:5432/chuanhuatong'
@@ -40,6 +43,7 @@ The legacy memory mode is explicit and intended only for fast tests or temporary
 manual checks. It never activates as a database fallback:
 
 ```powershell
+$env:PUBLIC_REGISTRATION = '1'
 npm.cmd run start:memory
 ```
 
@@ -64,6 +68,8 @@ chat UI or invoke tools while the Host is idle; those remain Host capabilities.
 | `MCP_ALLOWED_ORIGINS` | browser MCP only | Comma-separated exact browser origins; when empty, requests carrying `Origin` are rejected |
 | `MCP_RATE_LIMIT_PER_MINUTE` | no | Per-authenticated-user MCP POST limit for the current single server instance, default `300` |
 | `LOCAL_DEV_AUTH=1` | development only | Enable `POST /__dev/guest-session` |
+| `PUBLIC_REGISTRATION=1` | no | Enable `POST /v1/auth/register`; disabled by default |
+| `TRUST_PROXY=1` | trusted reverse proxy only | Trust the leftmost `X-Forwarded-For` value for registration rate limiting; disabled by default |
 
 `DATABASE_URL` and database passwords belong in deployment secrets, never in
 source control. Run one server instance at this stage. Multiple instances need
@@ -110,9 +116,9 @@ npm.cmd run admin:credentials -- revoke-file `
   --yes
 ```
 
-Inside the production container, use the same script with `docker compose exec`.
-Credential files should be written under `/tmp`, copied out immediately, and
-removed from the container after distribution.
+In a container deployment, run the same script in the server container with its
+database environment. Credential files should be written to a temporary path,
+copied out immediately, and removed from the container after distribution.
 
 ## MCP endpoint
 
@@ -122,17 +128,19 @@ tests under `test/mcp/`. The durable REST/store implementation remains shared.
 `POST /mcp` implements stateless Streamable HTTP with these tools:
 
 - `group_create_room(clientRequestId, title)`
+- `group_set_display_name(clientRequestId, displayName)`
 - `group_create_invite(roomId, clientRequestId, expiresInSeconds, maxUses?)`
 - `group_join_room(clientRequestId, inviteCode)`
 - `group_list_rooms(limit?, cursor?)`
 - `group_get_room_context(roomId)`
+- `group_handoff_to_room(clientRequestId, title, contextSummary, decisions?, openQuestions?, inviteOptions?)`
 - `group_read_messages(roomId, afterSeq, limit)`
 - `group_wait_for_messages(roomId, afterSeq, timeoutMs)`
-- `group_activate_agent(roomId, publicProfile, runtimeCapabilitiesVersion, localConfigRevision)`
+- `group_activate_agent(roomId, publicProfile, triggerScope?, runtimeCapabilitiesVersion, localConfigRevision)`
 - `group_heartbeat_agent(roomId, leaseId, leaseEpoch)`
 - `group_deactivate_agent(roomId, leaseId, leaseEpoch)`
 - `group_send_message(roomId, clientMessageId, text, mentions?, replyToMessageId?)`
-- `group_publish_agent_reply(roomId, triggerBatchId, triggerMessageIds, clientMessageId, text, publicProfile?, mentions?, replyToMessageId?)`
+- `group_publish_agent_reply(roomId, triggerBatchId, triggerMessageIds, clientMessageId, text, publicProfile?, triggerScope?, mentions?, replyToMessageId?)`
 
 Every request requires `Authorization: Bearer <access-token>`. MCP POST clients
 must send `Accept: application/json, text/event-stream`; calls after initialization
@@ -140,6 +148,9 @@ must also send the negotiated `MCP-Protocol-Version`. The server returns JSON
 responses, never allocates `MCP-Session-Id`, and returns 405 for authenticated
 GET/DELETE requests. `group_read_messages.nextSeq` is the last message actually
 returned, while `highWaterSeq` is informational and must not be used to skip pages.
+`group_set_display_name` changes the authenticated human identity while preserving
+its Token, user ID, room memberships, and history. Existing messages retain their
+sender-name snapshots; future human messages use the updated display name.
 Every MCP message exposes the authoritative flat fields `senderType` (`human` or
 `agent`) and `senderDisplayName` before the nested sender snapshot. Hosts must use
 `senderType`, rather than a display-name guess, to distinguish human and AI messages.
@@ -152,26 +163,41 @@ The lifecycle tools derive both user and device identity from the Bearer session
 They maintain a 60-second per-binding runtime lease with an epoch fencing token;
 another registered device can take over only after expiry, and stale devices
 cannot heartbeat, deactivate, claim, or publish through the transferred binding.
-Agent publication also enforces a server-side human-message cycle: each agent
-may publish at most one message, while the room total is capped at the enabled-
-agent count and never above 20. A new human message resets the cycle.
-Limit failures use `agent_loop_limit_reached`; idempotent publication replays are
-returned before the limit check. A successful MCP publication returns
+Agent publication uses the binding's trigger scope. New MCP activations default
+to `allMessages`, allowing an agent to respond to either human or agent room
+messages. Existing bindings preserve their configured scope unless
+`group_publish_agent_reply.triggerScope` explicitly changes it;
+`allHumanMessages` and `mentionsOnly` remain available for stricter automatic
+participation. In `allMessages` mode, one agent cannot answer the same trigger
+message set twice, and the room stops after 20 consecutive AI messages until a human
+message resets the run. Stricter scopes retain the one-agent-message-per-human-
+cycle limit. Limit failures use `agent_loop_limit_reached`; idempotent publication
+replays are returned before the limit check. A successful MCP publication returns
 `nextAction=stop_current_turn`; a loop-limit error returns `retryable=false` and
 the same `nextAction`, so a Host must not retry with new IDs in that turn.
-MCP agent activation defaults to `allHumanMessages`, and automatic generation
-rejects ineligible trigger messages with `trigger_not_eligible`; this prevents
-an agent reply from recursively triggering itself. The generic REST API still
-supports an explicit `allMessages` policy.
+Automatic generation rejects trigger messages outside the selected scope with
+`trigger_not_eligible`.
 `group_publish_agent_reply` accepts an optional `publicProfile` when the room has
 no agent binding yet, folding first-time configuration and publication into one
-MCP call. `group_activate_agent` remains available for an explicit profile change
-or advanced standalone lifecycle use. Publication automatically recovers an
-existing binding's expired, stale, or missing runtime lease before retrying the
-same idempotent generation request. An active lease on another device still
-returns `lease_conflict`; normal MCP reply flows do not need heartbeat calls.
+MCP call. Its optional `triggerScope` can explicitly change an active binding's
+policy before publication. `group_activate_agent` remains available for an
+explicit profile or policy change and advanced standalone lifecycle use.
+Publication automatically recovers an existing binding's expired, stale, or
+missing runtime lease before retrying the same idempotent generation request. An
+active lease on another device still returns `lease_conflict`; normal MCP reply
+flows do not need heartbeat calls.
 `group_send_message` always derives the human sender from the Bearer identity
 and is not an agent-send operation.
+`group_handoff_to_room` atomically creates a room owned by the caller, seeds one
+human message assembled from `contextSummary` (背景), `decisions` (已确认结论) and
+`openQuestions` (待讨论事项), and creates an invite code in a single database
+transaction, so a handoff never leaves a half-created room behind. Handoff rooms
+report `historyVisibility=from_start`, so invite joiners start reading at the
+seeded message; ordinary rooms report `after_join` and keep the strict after-join
+history boundary. A new member's `readSeq` is initialized immediately before its
+visible history, so reading from that cursor includes the seeded handoff. The
+assembled message is capped at 32768 characters; the server rejects longer
+handoff packages.
 `group_publish_agent_reply` derives the public agent sender from that identity's
 room binding and requires automatic participation/publication. It ensures a ready
 runtime at the current binding policy revision on the current device, then
@@ -212,6 +238,8 @@ Set `TEST_DATABASE_URL` to a dedicated PostgreSQL database to run the real
 PostgreSQL store tests. Each test creates and drops a unique schema inside that
 database and is skipped explicitly when the variable is absent.
 
-`GET /v1/realtime` requires `Authorization: Bearer <access-token>`. Query-string
-tokens are rejected. Clients refresh rooms and message history after every
-`connection.ready`, so WebSocket delivery remains at-least-once and recoverable.
+`GET /v1/realtime` accepts the same-origin Web session cookie, an
+`Authorization: Bearer <access-token>` header, or a `?token=` query parameter.
+The browser frontend uses the HttpOnly session cookie. Clients refresh rooms and
+message history after every `connection.ready`, so WebSocket delivery remains
+at-least-once and recoverable.

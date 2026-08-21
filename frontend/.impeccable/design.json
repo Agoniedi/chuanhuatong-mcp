@@ -1,0 +1,158 @@
+{
+  "schemaVersion": 2,
+  "generatedAt": "2026-08-11T00:40:00.000Z",
+  "title": "Design System: 传话筒 Web",
+  "extensions": {
+    "colorMeta": {
+      "accent": { "role": "primary", "displayName": "iOS Signal Blue", "canonical": "#0a84ff", "tonalRamp": ["#062a54", "#0a3f7d", "#0a54a8", "#0a6ad6", "#0a84ff", "#3a9dff", "#7cc0ff", "#d6ebff"] },
+      "accent-ink": { "role": "primary", "displayName": "Readable Blue Ink", "canonical": "#0a6ad6", "tonalRamp": ["#052247", "#073567", "#084b93", "#0a6ad6", "#2a8cf0", "#59acff", "#9ccaff", "#e0efff"] },
+      "accent-tint": { "role": "primary", "displayName": "Blue Wash", "canonical": "#eaf3ff", "tonalRamp": ["#0a3f7d", "#0a6ad6", "#3a9dff", "#7cc0ff", "#a8d4ff", "#cae3ff", "#eaf3ff", "#f6faff"] },
+      "agent-ink": { "role": "tertiary", "displayName": "AI Violet", "canonical": "#6d4bd0", "tonalRamp": ["#241638", "#33205a", "#472e7d", "#5a3ba6", "#6d4bd0", "#8f70e0", "#b39cf5", "#e6ddfb"] },
+      "agent-bg": { "role": "tertiary", "displayName": "AI Violet Wash", "canonical": "#f0eefb", "tonalRamp": ["#33205a", "#5a3ba6", "#8f70e0", "#b39cf5", "#d0c3f7", "#e6ddfb", "#f0eefb", "#f9f7fe"] },
+      "app-bg": { "role": "neutral", "displayName": "Warm Ground", "canonical": "#ebecef", "tonalRamp": ["#0c0d10", "#17181d", "#24262e", "#494d57", "#9096a1", "#d3d6dc", "#ebecef", "#f7f8fa"] },
+      "surface": { "role": "neutral", "displayName": "Surface White", "canonical": "#ffffff", "tonalRamp": ["#101114", "#24262e", "#494d57", "#9096a1", "#d3d6dc", "#e4e6ea", "#f5f6f8", "#ffffff"] },
+      "text": { "role": "neutral", "displayName": "Ink", "canonical": "#101114", "tonalRamp": ["#101114", "#24262e", "#3a3e47", "#5b606b", "#9096a1", "#c3c7cf", "#e3e5e9", "#f7f8fa"] },
+      "text-secondary": { "role": "neutral", "displayName": "Slate", "canonical": "#5b606b", "tonalRamp": ["#17181d", "#24262e", "#3a3e47", "#5b606b", "#9096a1", "#c3c7cf", "#e3e5e9", "#f5f6f8"] },
+      "text-muted": { "role": "neutral", "displayName": "Mist", "canonical": "#9096a1", "tonalRamp": ["#24262e", "#3a3e47", "#5b606b", "#767c87", "#9096a1", "#c3c7cf", "#e3e5e9", "#f5f6f8"] },
+      "success": { "role": "neutral", "displayName": "Success Green", "canonical": "#2fa66b", "tonalRamp": ["#0d3a24", "#155234", "#1d7049", "#268f5d", "#2fa66b", "#4cc38a", "#8adcb4", "#e9f7f0"] },
+      "danger": { "role": "neutral", "displayName": "Danger Red", "canonical": "#e5484d", "tonalRamp": ["#4a1416", "#6b1d20", "#93282c", "#c23a3f", "#e5484d", "#ff6369", "#ffa1a4", "#fdecec"] },
+      "warning": { "role": "neutral", "displayName": "Warning Amber", "canonical": "#d98a13", "tonalRamp": ["#3a2c14", "#5a4210", "#7d5b13", "#a6771a", "#d98a13", "#e5a13a", "#f0c88a", "#fbf1de"] }
+    },
+    "typographyMeta": {
+      "display": { "displayName": "Display", "purpose": "Auth card and page titles only." },
+      "headline": { "displayName": "Headline", "purpose": "Room header title, room card titles." },
+      "body": { "displayName": "Body", "purpose": "Message text and default reading size (15px)." },
+      "label": { "displayName": "Label", "purpose": "Sender names, form labels, status text, quiet buttons." },
+      "mono": { "displayName": "Mono", "purpose": "Device tokens and credential codes only." }
+    },
+    "shadows": [
+      { "name": "bubble", "value": "0 1px 1.5px rgba(16,18,24,0.10)", "purpose": "The one always-on shadow — lifts a bubble off the warm ground." },
+      { "name": "xs", "value": "0 1px 2px rgba(16,18,24,0.06)", "purpose": "Buttons, badges, quiet pills." },
+      { "name": "sm", "value": "0 1px 3px rgba(16,18,24,0.08), 0 1px 2px rgba(16,18,24,0.04)", "purpose": "Active tab, quiet raised controls." },
+      { "name": "md", "value": "0 6px 16px rgba(16,18,24,0.10), 0 2px 6px rgba(16,18,24,0.06)", "purpose": "Hovered cards, the floating new-messages pill." },
+      { "name": "lg", "value": "0 18px 48px rgba(16,18,24,0.16), 0 6px 16px rgba(16,18,24,0.08)", "purpose": "Auth/join card and the mobile member sheet." }
+    ],
+    "motion": [
+      { "name": "ease-emphasized", "value": "cubic-bezier(0.16, 1, 0.3, 1)", "purpose": "Bubble-in, new-message pill rise, panel slide." },
+      { "name": "ease-standard", "value": "ease", "purpose": "Default state transitions (background, border, color) at 0.14–0.18s." },
+      { "name": "pulse-dot", "value": "pulse-dot 1.2s ease-in-out infinite", "purpose": "Connecting/reconnecting status dot; gated on prefers-reduced-motion." }
+    ],
+    "breakpoints": [
+      { "name": "tablet", "value": "720px" },
+      { "name": "mobile", "value": "400px" }
+    ]
+  },
+  "components": [
+    {
+      "name": "Primary Button",
+      "kind": "button",
+      "refersTo": "button-primary",
+      "description": "Full-width blue action button; the auth/join primary action.",
+      "html": "<button class=\"ds-btn-primary\">登录</button>",
+      "css": ".ds-btn-primary { width: 100%; display: inline-flex; align-items: center; justify-content: center; gap: 6px; padding: 12px 18px; border: 1px solid transparent; border-radius: 12px; font-size: 14px; font-weight: 600; letter-spacing: -0.01em; color: #fff; background: #0a84ff; box-shadow: 0 1px 2px rgba(16,18,24,0.06); cursor: pointer; transition: background 0.16s ease, transform 0.08s ease; } .ds-btn-primary:hover { background: #0060df; } .ds-btn-primary:active { background: #0050bd; transform: translateY(1px); } .ds-btn-primary:focus-visible { outline: 2px solid #0a84ff; outline-offset: 2px; }"
+    },
+    {
+      "name": "Ghost Button",
+      "kind": "button",
+      "refersTo": "button-ghost",
+      "description": "Low-emphasis transparent control; header back-button and inline actions.",
+      "html": "<button class=\"ds-btn-ghost\">成员</button>",
+      "css": ".ds-btn-ghost { display: inline-flex; align-items: center; gap: 6px; padding: 8px 12px; border: 0; border-radius: 12px; font-size: 14px; font-weight: 600; color: #5b606b; background: transparent; cursor: pointer; transition: background 0.16s ease, color 0.16s ease; } .ds-btn-ghost:hover { background: #f5f6f8; color: #101114; } .ds-btn-ghost:active { transform: translateY(1px); }"
+    },
+    {
+      "name": "Text Input",
+      "kind": "input",
+      "refersTo": "input",
+      "description": "Standard text field with a blue focus glow.",
+      "html": "<input class=\"ds-input\" placeholder=\"用户名\" />",
+      "css": ".ds-input { width: 100%; padding: 11px 14px; border: 1px solid #d3d6dc; border-radius: 12px; font-size: 15px; background: #fff; color: #101114; outline: none; transition: border-color 0.16s ease, box-shadow 0.16s ease; } .ds-input::placeholder { color: #9096a1; } .ds-input:focus { border-color: #0a84ff; box-shadow: 0 0 0 3px #eaf3ff; }"
+    },
+    {
+      "name": "Other-Party Bubble",
+      "kind": "custom",
+      "refersTo": "bubble-other",
+      "description": "A message from someone else: white bubble, top-left corner tightened toward the author's avatar.",
+      "html": "<div class=\"ds-bubble-other\">我把设计稿发群里了</div>",
+      "css": ".ds-bubble-other { width: fit-content; max-width: 100%; padding: 8px 13px; border-radius: 20px; border-top-left-radius: 7px; font-size: 15px; line-height: 1.5; color: #101114; background: #fff; box-shadow: 0 1px 1.5px rgba(16,18,24,0.10); }"
+    },
+    {
+      "name": "Own Bubble",
+      "kind": "custom",
+      "refersTo": "bubble-self",
+      "description": "The reader's own message: right-aligned blue gradient, right corners tightened.",
+      "html": "<div class=\"ds-bubble-self\">在的，十点开始 👍</div>",
+      "css": ".ds-bubble-self { width: fit-content; max-width: 100%; margin-left: auto; padding: 8px 13px; border-radius: 20px; border-top-right-radius: 7px; border-bottom-right-radius: 7px; font-size: 15px; line-height: 1.5; color: #fff; background: linear-gradient(180deg, #3a9dff, #0a84ff); box-shadow: 0 1px 1.5px rgba(16,18,24,0.10); }"
+    },
+    {
+      "name": "AI Speaker Name + Badge",
+      "kind": "custom",
+      "refersTo": "bubble-other",
+      "description": "The group-start name row for an agent: sender name plus the reserved AI micro-badge.",
+      "html": "<div class=\"ds-agent-name\"><span>会议助手</span><span class=\"ds-agent-badge\">AI</span></div>",
+      "css": ".ds-agent-name { display: flex; align-items: center; gap: 6px; margin: 0 0 4px 12px; font-size: 12.5px; font-weight: 600; color: #5b606b; } .ds-agent-badge { font-size: 9.5px; font-weight: 800; letter-spacing: 0.04em; padding: 1.5px 5px; border-radius: 5px; background: #f0eefb; color: #6d4bd0; }"
+    },
+    {
+      "name": "Human Avatar",
+      "kind": "custom",
+      "refersTo": "bubble-other",
+      "description": "Round, name-hashed color background. Circular silhouette marks a human speaker.",
+      "html": "<span class=\"ds-avatar-human\">林</span>",
+      "css": ".ds-avatar-human { display: inline-grid; place-items: center; width: 30px; height: 30px; border-radius: 50%; font-size: 12px; font-weight: 700; line-height: 1; color: #fff; background: #ff8a3d; user-select: none; }"
+    },
+    {
+      "name": "AI Avatar",
+      "kind": "custom",
+      "refersTo": "bubble-other",
+      "description": "Rounded-square violet-wash. The non-circular silhouette is load-bearing AI identity.",
+      "html": "<span class=\"ds-avatar-agent\">AI</span>",
+      "css": ".ds-avatar-agent { display: inline-grid; place-items: center; width: 30px; height: 30px; border-radius: 30%; font-size: 11px; font-weight: 700; line-height: 1; color: #6d4bd0; background: #f0eefb; user-select: none; }"
+    },
+    {
+      "name": "Day Divider Pill",
+      "kind": "chip",
+      "refersTo": "bubble-other",
+      "description": "Centered day marker in the message stream.",
+      "html": "<div class=\"ds-day-divider\">今天</div>",
+      "css": ".ds-day-divider { width: fit-content; margin: 14px auto 10px; padding: 3px 12px; border-radius: 999px; background: #e4e6ea; color: #5b606b; font-size: 12px; font-weight: 600; letter-spacing: 0.01em; }"
+    },
+    {
+      "name": "New Messages Pill",
+      "kind": "custom",
+      "refersTo": "bubble-other",
+      "description": "Floating unread-arrival announcer shown when scrolled up.",
+      "html": "<button class=\"ds-new-msg\"><svg viewBox=\"0 0 16 16\" fill=\"none\" aria-hidden=\"true\"><path d=\"M8 3.5v9M4 8.5l4 4 4-4\" stroke=\"currentColor\" stroke-width=\"1.6\" stroke-linecap=\"round\" stroke-linejoin=\"round\"/></svg>2 条新消息</button>",
+      "css": ".ds-new-msg { display: inline-flex; align-items: center; gap: 6px; border: 1px solid #e3e5e9; border-radius: 999px; padding: 8px 16px; background: #fff; color: #0a6ad6; font-size: 13px; font-weight: 600; box-shadow: 0 6px 16px rgba(16,18,24,0.10), 0 2px 6px rgba(16,18,24,0.06); cursor: pointer; } .ds-new-msg svg { width: 14px; height: 14px; }"
+    }
+  ],
+  "narrative": {
+    "northStar": "消息工艺 (The Message Craft)",
+    "overview": "传话筒 Web is a read-only window onto a room where many humans and many AI agents talk at once. Every visual decision serves one job: make an unhurried, unambiguous conversation legible at a glance. The benchmark is set explicitly — WeChat and iMessage — and the craft of the bubble stream is where quality is spent: consecutive-message grouping, the tightened corner that points a cluster back at its author, the centered day-pill and time divider, the single avatar that anchors a group at its foot. Nothing here is decorated for its own sake; the polish lives in how messages cohere into readable clusters.\n\nThe surface is calm by construction. A warm-neutral ground floats plain white bubbles; a single iOS blue is the only chromatic voice, reserved for the reader's own bubbles, unread signals, @mentions, and the connection dot. Human and AI speakers are told apart by shape, not noise — humans wear round color-hashed avatars, agents wear a cool-violet rounded-square with an AI micro-badge. The result reads as a product you'd trust to sit quietly in a tab.\n\nThe world rejects the loud dashboard: no gradients-as-personality, no borders fighting shadows, no invented display face. Depth is one soft bubble shadow and a blurred header/footer; type is the system stack and nothing else.",
+    "keyCharacteristics": [
+      "Warm-neutral ground, plain white bubbles, a single blue accent",
+      "WeChat/iMessage-grade grouping, tails, and dividers",
+      "Human (round) vs AI (rounded-square + badge) told apart by silhouette",
+      "System type stack only; restraint over ornament",
+      "Read-only by design — the footer states it, there is no composer"
+    ],
+    "rules": [
+      { "name": "The Quiet Accent tendency", "body": "Blue is treated as a signal, not a decoration — it tends to appear only where it means something (your own bubbles, unread, @mentions, the connection dot). New surfaces should lean on the neutral ground first and reach for blue when it carries meaning, rather than using it to add visual interest.", "section": "colors" },
+      { "name": "The AI-Violet Reservation", "body": "The cool-violet pair is identity, not palette. Don't borrow it for emphasis, links, or decoration; it exists solely to mark an AI speaker apart from human blue.", "section": "colors" },
+      { "name": "The System-Face Rule", "body": "There is no decorative display font and there will not be one. Weight (up to 700) and size carry hierarchy; a custom face would break native CJK rendering and contradict the calm.", "section": "typography" },
+      { "name": "The Flat-Ground Rule", "body": "Surfaces are flat at rest and separated by tone or a 1px hairline. Shadow appears as a response — a bubble lifting off the ground, a card on hover, an overlay above the scrim — never as default decoration.", "section": "elevation" }
+    ],
+    "dos": [
+      "Do group consecutive same-author messages and tighten the cluster-facing corner to 7px; the tail is the corner, not a drawn pointer.",
+      "Do keep the warm ground (#ebecef) under white bubbles — the lift depends on the ground not being white.",
+      "Do reserve the violet pair (#6d4bd0 / #f0eefb) for AI identity only, and tell human vs AI apart by avatar silhouette.",
+      "Do use accent-ink (#0a6ad6) for blue text on light grounds so @mentions and links stay legible.",
+      "Do respect prefers-reduced-motion on every animation (bubble-in, locate-flash, pulse dot, panel slide, skeleton shimmer all already gate on it)."
+    ],
+    "donts": [
+      "Don't introduce a decorative display font; the system stack is the type system.",
+      "Don't spend blue as decoration — let it carry meaning (own bubble, unread, @mention, connection) rather than adding it for visual interest.",
+      "Don't add hard/offset shadows; depth is soft-blur + tonal layering only.",
+      "Don't add a message composer or any write affordance — this is a read-only observation window, and the footer says so.",
+      "Don't give human and AI avatars the same shape; the round/rounded-square split is how identity reads at a glance."
+    ]
+  }
+}

@@ -27,6 +27,32 @@ const migrations = [
       import.meta.url,
     ),
   ],
+  [
+    '006_room_share_history_on_join',
+    new URL(
+      '../migrations/006_room_share_history_on_join.sql',
+      import.meta.url,
+    ),
+  ],
+  [
+    '007_web_accounts_and_resources',
+    new URL(
+      '../migrations/007_web_accounts_and_resources.sql',
+      import.meta.url,
+    ),
+  ],
+  [
+    '008_message_recall',
+    new URL('../migrations/008_message_recall.sql', import.meta.url),
+  ],
+  [
+    '009_world_rooms',
+    new URL('../migrations/009_world_rooms.sql', import.meta.url),
+  ],
+  [
+    '010_world_invite_fk',
+    new URL('../migrations/010_world_invite_fk.sql', import.meta.url),
+  ],
 ];
 
 export async function runMigrations(pool, logger = console) {

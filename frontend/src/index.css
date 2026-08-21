@@ -1,0 +1,98 @@
+/* ── Tokens ──────────────────────────────────────────────── */
+:root {
+  --bg:          #F7F4EF;
+  --surface:     #FFFFFF;
+  --grouped:     #F7F4EF;
+  --text:        #2D241C;
+  --text-2:      #666666;
+  --text-3:      #9A848F;
+  --sep:         rgba(90,75,55,.1);
+  --blue:        #007AFF;
+  --brand:       #8A6B4F;
+  --danger:      #D35C4D;
+  --success:     #6FBF6C;
+  --ai-bg:       #F2EDE6;
+  --ai-text:     #8A6B4F;
+  --bub-me-bg:   #8A6B4F;
+  --bub-me-fg:   #FFFFFF;
+  --bub-other-bg:#FFFFFF;
+  --bub-other-fg:#2D241C;
+  --card-r:      16px;
+  --card-shadow: 0 2px 8px rgba(0,0,0,.04);
+  --nav-h:       76px;
+  --safe-top:    env(safe-area-inset-top, 0px);
+  --safe-bottom: env(safe-area-inset-bottom, 0px);
+  /* blur-surface: navbar / sheet / input bar backgrounds */
+  --blur-surface:     rgba(247,244,239,.88);
+  --blur-surface-dim: rgba(247,244,239,.72);
+  --nav-surface:      rgba(255,253,249,.80);
+}
+
+.dark {
+  --bg:          #1C1610;
+  --surface:     #2A2018;
+  --grouped:     #1C1610;
+  --text:        #F0E8DC;
+  --text-2:      #C8B8A8;
+  --text-3:      #8A7870;
+  --sep:         rgba(180,150,110,.15);
+  --blue:        #007AFF;
+  --brand:       #A88060;
+  --danger:      #E06858;
+  --success:     #72C870;
+  --ai-bg:       #2E2418;
+  --ai-text:     #C4A880;
+  --bub-me-bg:   #8A6B4F;
+  --bub-me-fg:   #FFFFFF;
+  --bub-other-bg:#2E2418;
+  --bub-other-fg:#F0E8DC;
+  --card-shadow: 0 2px 8px rgba(0,0,0,.15);
+  --blur-surface:     rgba(28,22,16,.88);
+  --blur-surface-dim: rgba(28,22,16,.72);
+  --nav-surface:      rgba(28,22,16,.82);
+}
+
+/* ── Reset ───────────────────────────────────────────────── */
+*, *::before, *::after {
+  box-sizing: border-box;
+  -webkit-font-smoothing: antialiased;
+  -webkit-tap-highlight-color: transparent;
+}
+
+html, body, #root {
+  height: 100%; width: 100%; margin: 0; padding: 0;
+  font-family: -apple-system, BlinkMacSystemFont, "PingFang SC",
+               "Helvetica Neue", sans-serif;
+  background: var(--bg);
+  color: var(--text);
+  font-size: 16px;
+}
+
+#root { height: 100dvh; }
+
+button, input, textarea { font-family: inherit; }
+input, textarea { -webkit-appearance: none; }
+
+/* ── Scrollbars ──────────────────────────────────────────── */
+::-webkit-scrollbar { width: 0; height: 0; }
+* { scrollbar-width: none; }
+
+/* ── Animations ──────────────────────────────────────────── */
+@keyframes fadeUp {
+  from { opacity: 0; transform: translateY(8px); }
+  to   { opacity: 1; transform: translateY(0);   }
+}
+@keyframes slideUp   { from { transform: translateY(100%); } to { transform: translateY(0); } }
+@keyframes slideInR  { from { transform: translateX(100%); } to { transform: translateX(0); } }
+
+.anim-fade-up  { animation: fadeUp  .18s ease-out both; }
+.anim-slide-up { animation: slideUp .26s ease-out; }
+.anim-slide-r  { animation: slideInR .22s ease-out; }
+
+/* ── Tap feedback ────────────────────────────────────────── */
+.tap { cursor: pointer; -webkit-user-select: none; user-select: none; }
+.tap:active { opacity: .5; }
+
+/* ── Hairline separator ──────────────────────────────────── */
+.sep { height: .5px; background: var(--sep); }
+.sep-l { height: .5px; background: var(--sep); margin-left: 16px; }
