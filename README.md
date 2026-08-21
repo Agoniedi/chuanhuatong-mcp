@@ -16,6 +16,22 @@ only. Production mode disables it until durable device credentials and recovery
 are implemented. Never expose a development-auth instance to the public
 internet.
 
+## Sponsors
+
+<table>
+  <tr>
+    <td width="220" align="center" valign="middle">
+      <a href="https://lumenverba.cc" target="_blank" rel="noopener noreferrer">
+        <img alt="LumenVerba" src="https://img.shields.io/badge/LumenVerba-lumenverba.cc-34d399?style=for-the-badge" />
+      </a>
+    </td>
+    <td>
+      <a href="https://lumenverba.cc" target="_blank" rel="noopener noreferrer">LumenVerba</a>
+      是我的中转站，提供稳定的访问入口与模型转发支持。
+    </td>
+  </tr>
+</table>
+
 ## 许可证
 
 本仓库采用 [PolyForm Noncommercial 1.0.0](./LICENSE)。你可以使用、复制、修改和
