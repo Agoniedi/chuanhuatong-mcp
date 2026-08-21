@@ -4,7 +4,7 @@ services:
     environment:
       POSTGRES_DB: chuanhuatong
       POSTGRES_USER: chuanhuatong
-      POSTGRES_PASSWORD: chuanhuatong_local_only
+      POSTGRES_PASSWORD: change-me-local-only
     healthcheck:
       test: ["CMD-SHELL", "pg_isready -U chuanhuatong -d chuanhuatong"]
       interval: 5s
@@ -20,7 +20,7 @@ services:
         condition: service_healthy
     environment:
       NODE_ENV: development
-      DATABASE_URL: postgresql://chuanhuatong:chuanhuatong_local_only@postgres:5432/chuanhuatong
+      DATABASE_URL: postgresql://chuanhuatong:change-me-local-only@postgres:5432/chuanhuatong
       RUN_MIGRATIONS: "1"
       LOCAL_DEV_AUTH: "1"
       SERVER_HOST: 0.0.0.0
