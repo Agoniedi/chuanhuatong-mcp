@@ -248,10 +248,11 @@ describe('stateless Group Chat MCP read loop', () => {
         'group_heartbeat_agent',
         'group_join_room',
         'group_list_rooms',
-        'group_poll_messages',
-        'group_publish_agent_reply',
-        'group_read_messages',
-        'group_send_message',
+      'group_poll_messages',
+      'group_publish_agent_reply',
+      'group_publish_room_to_world',
+      'group_read_messages',
+      'group_send_message',
         'group_send_message_and_agent_reply',
         'group_set_display_name',
         'group_wait_for_messages',
@@ -268,6 +269,7 @@ describe('stateless Group Chat MCP read loop', () => {
       'group_handoff_to_room',
       'group_heartbeat_agent',
       'group_join_room',
+      'group_publish_room_to_world',
       'group_publish_agent_reply',
       'group_send_message',
       'group_send_message_and_agent_reply',
@@ -378,6 +380,7 @@ describe('stateless Group Chat MCP read loop', () => {
           'group_list_rooms',
           'group_poll_messages',
           'group_publish_agent_reply',
+          'group_publish_room_to_world',
           'group_read_messages',
           'group_send_message',
           'group_send_message_and_agent_reply',
@@ -503,6 +506,47 @@ describe('stateless Group Chat MCP read loop', () => {
       JSON.parse(consumed.body.result.content[0].text).error.code,
       'conflict',
     );
+  });
+
+  it('publishes and unpublishes a room to the world through MCP', async () => {
+    const created = await callTool('group_create_room', {
+      clientRequestId: 'mcp-world-room-charlie',
+      title: 'World Publish Room',
+    }, { accessToken: users.charlie.accessToken });
+    const room = created.body.result.structuredContent;
+
+    const published = await callTool('group_publish_room_to_world', {
+      clientRequestId: 'mcp-publish-world-charlie',
+      roomId: room.id,
+      published: true,
+      summary: '用于验证世界频道发布能力',
+    }, { accessToken: users.charlie.accessToken });
+    assert.equal(published.response.status, 200);
+    assert.equal(published.body.result.isError, undefined);
+    assert.equal(published.body.result.structuredContent.room.worldPublished, true);
+    assert.equal(typeof published.body.result.structuredContent.world.inviteToken, 'string');
+    assert.equal(published.body.result.structuredContent.world.summary, '用于验证世界频道发布能力');
+    assert.equal(published.body.result.structuredContent.room.revision, room.revision + 1);
+    const publishedRoomRevision = published.body.result.structuredContent.room.revision;
+
+    const replayed = await callTool('group_publish_room_to_world', {
+      clientRequestId: 'mcp-publish-world-charlie',
+      roomId: room.id,
+      published: true,
+      summary: '用于验证世界频道发布能力',
+    }, { accessToken: users.charlie.accessToken });
+    assert.deepEqual(replayed.body.result.structuredContent, published.body.result.structuredContent);
+    assert.equal(replayed.body.result.structuredContent.room.revision, publishedRoomRevision);
+
+    const unpublished = await callTool('group_publish_room_to_world', {
+      clientRequestId: 'mcp-unpublish-world-charlie',
+      roomId: room.id,
+      published: false,
+      summary: '',
+    }, { accessToken: users.charlie.accessToken });
+    assert.equal(unpublished.body.result.isError, undefined);
+    assert.equal(unpublished.body.result.structuredContent.world, null);
+    assert.equal(unpublished.body.result.structuredContent.room.worldPublished, false);
   });
 
   it('atomically creates a room, seeds handoff context, and returns a joinable invite', async () => {

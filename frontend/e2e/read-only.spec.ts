@@ -8,6 +8,8 @@ import { createLocalServer } from '../../src/server.mjs';
 
 let server: ReturnType<typeof createLocalServer>;
 let baseUrl: string;
+let inviteToken: string;
+let joinableWorldToken: string;
 
 test.beforeAll(async () => {
   const store = new MemoryGroupChatStore();
@@ -59,6 +61,20 @@ test.beforeAll(async () => {
     key: 'e2e-accept',
     requestFingerprint: 'e2e-accept-fingerprint',
   });
+  const joinableRoom = await store.createRoom({
+    userId: guest.userId,
+    title: '待加入房间',
+    key: 'e2e-joinable-room',
+    requestFingerprint: 'e2e-joinable-room-fingerprint',
+  });
+  const joinablePublished = await store.updateWorldRoom({
+    userId: guest.userId,
+    roomId: joinableRoom.body.id,
+    published: true,
+    summary: '用于验证网页加入流程',
+  });
+  inviteToken = published.world.inviteToken;
+  joinableWorldToken = joinablePublished.world.inviteToken;
   await store.createHumanMessage({
     user: guest,
     roomId: room.body.id,
@@ -108,13 +124,20 @@ test('uses the redesigned shell for real room data and chat actions', async ({ p
   await expect(page.getByText('我的房间', { exact: true })).toHaveCount(0);
   await page.getByText('聊天验收房间', { exact: true }).click();
   await expect(page.getByText('邀请码', { exact: true })).toBeVisible();
+  await expect(page.getByText(inviteToken, { exact: true })).toBeVisible();
   const sheetZIndex = Number(await page.getByTestId('world-room-sheet').evaluate(element => getComputedStyle(element).zIndex));
   await expect(page.getByTestId('bottom-nav')).toHaveCount(0);
   expect(sheetZIndex).toBeGreaterThan(0);
   await page.getByTestId('world-room-sheet').click({ position: { x: 5, y: 5 } });
   await expect(page.getByTestId('bottom-nav')).toBeVisible();
 
-  await page.getByText('房间', { exact: true }).click();
+  await page.getByText('待加入房间', { exact: true }).click();
+  await expect(page.getByText(joinableWorldToken, { exact: true })).toBeVisible();
+  await page.getByRole('button', { name: '加入房间', exact: true }).click();
+  await expect(page.getByTestId('world-room-sheet')).toHaveCount(0);
+  await expect(page.getByText('待加入房间', { exact: true })).toBeVisible();
+
+  await page.locator('[data-testid="bottom-nav"] button').nth(1).click();
   await expect(page.getByText('聊天验收房间', { exact: true })).toBeVisible();
   await page.getByRole('button', { name: '分享到世界', exact: true }).click();
   await expect(page.getByRole('checkbox', { name: /聊天验收房间/ })).toBeChecked();
@@ -191,7 +214,7 @@ test('keeps the redesigned shell usable on a narrow mobile viewport', async ({ p
   expect(titleBox!.y).toBeLessThanOrEqual(24);
   expect(844 - navBox!.y - navBox!.height).toBeLessThanOrEqual(12);
 
-  await page.getByRole('button', { name: '房间', exact: true }).click();
+  await page.locator('[data-testid="bottom-nav"] button').nth(1).click();
   await expect(page.getByText('聊天验收房间', { exact: true })).toBeVisible();
   expect(await page.evaluate(() => document.documentElement.scrollWidth <= document.documentElement.clientWidth)).toBeTruthy();
   await page.waitForTimeout(300);

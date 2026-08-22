@@ -401,6 +401,7 @@ function isAllowedWebMutation(method, path) {
     '/v1/profile-resources',
     '/v1/me/devices',
     '/v1/agent-profiles',
+    '/v1/invites/accept',
   ].includes(path)) return true;
   if (method === 'POST' && /^\/v1\/rooms\/[^/]+\/messages$/.test(path)) return true;
   if (method === 'POST' && /^\/v1\/rooms\/[^/]+\/messages\/[^/]+\/recall$/.test(path)) {
@@ -1153,8 +1154,10 @@ async function handleRequest(
       roomId: parsePathSegment(worldRoomMatch[1]),
       published: body.published,
       summary,
+      key,
+      requestFingerprint: fingerprint(request.method, path, body),
     });
-    write(200, result);
+    write(result.status, result.body);
     return;
   }
 

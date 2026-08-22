@@ -1152,7 +1152,9 @@ export class MemoryGroupChatStore {
     );
   }
 
-  async updateWorldRoom({ userId, roomId, published, summary }) {
+  async updateWorldRoom({ userId, roomId, published, summary, key, requestFingerprint }) {
+    const replay = this._replay(userId, 'updateWorldRoom', key, requestFingerprint);
+    if (replay.response) return replay.response;
     const room = this._room(roomId);
     if (room.ownerUserId !== userId) {
       throw new HttpError(403, 'forbidden', 'Room owner required');
@@ -1167,7 +1169,9 @@ export class MemoryGroupChatStore {
       room.worldPublishedAt = null;
       room.revision += 1;
       room.updatedAt = now.toISOString();
-      return { room: webRoomSnapshot(room), world: null };
+      const body = { room: webRoomSnapshot(room), world: null };
+      this._saveReplay(replay.recordKey, requestFingerprint, 200, body);
+      return { status: 200, body };
     }
 
     let invite = room.worldInviteId ? this.invites.get(room.worldInviteId) : null;
@@ -1194,13 +1198,15 @@ export class MemoryGroupChatStore {
     room.worldPublishedAt ??= now.toISOString();
     room.revision += 1;
     room.updatedAt = now.toISOString();
-    return {
+    const body = {
       room: webRoomSnapshot(room),
       world: worldRoomSnapshot(room, this.usersById.get(userId)?.displayName ?? '未知房主', {
         ...invite,
         token,
       }),
     };
+    this._saveReplay(replay.recordKey, requestFingerprint, 200, body);
+    return { status: 200, body };
   }
 
   async deleteRoom({ userId, roomId }) {
@@ -4056,7 +4062,7 @@ export class PostgresGroupChatStore {
     return rowToWorldRoom(result.rows[0]);
   }
 
-  async updateWorldRoom({ userId, roomId, published, summary }) {
+  async updateWorldRoom({ userId, roomId, published, summary, key, requestFingerprint }) {
     return this._transaction(async (client) => {
       const roomResult = await client.query(
         'SELECT * FROM rooms WHERE id = $1 FOR UPDATE',
@@ -4069,6 +4075,14 @@ export class PostgresGroupChatStore {
       if (room.owner_user_id !== userId) {
         throw new HttpError(403, 'forbidden', 'Room owner required');
       }
+      const replay = await this._replay(
+        client,
+        userId,
+        'updateWorldRoom',
+        key,
+        requestFingerprint,
+      );
+      if (replay) return replay;
       const now = this.clock();
       if (!published) {
         if (room.world_invite_id) {
@@ -4085,7 +4099,16 @@ export class PostgresGroupChatStore {
             WHERE id = $2 RETURNING *`,
           [now, roomId],
         );
-        return { room: rowToRoom(updated.rows[0], true), world: null };
+        const body = { room: rowToRoom(updated.rows[0], true), world: null };
+        await this._saveReplay(client, {
+          principalId: userId,
+          operation: 'updateWorldRoom',
+          key,
+          requestFingerprint,
+          status: 200,
+          body,
+        });
+        return { status: 200, body };
       }
 
       let invite = null;
@@ -4121,7 +4144,7 @@ export class PostgresGroupChatStore {
         [summary, invite.id, token, now, roomId],
       );
       const owner = await client.query('SELECT display_name FROM users WHERE id = $1', [userId]);
-      return {
+      const body = {
         room: rowToRoom(updated.rows[0], true),
         world: rowToWorldRoom({
           ...updated.rows[0],
@@ -4130,6 +4153,15 @@ export class PostgresGroupChatStore {
           world_invite_remaining_uses: invite.remaining_uses,
         }),
       };
+      await this._saveReplay(client, {
+        principalId: userId,
+        operation: 'updateWorldRoom',
+        key,
+        requestFingerprint,
+        status: 200,
+        body,
+      });
+      return { status: 200, body };
     });
   }
 

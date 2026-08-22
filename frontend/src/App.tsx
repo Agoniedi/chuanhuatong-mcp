@@ -595,7 +595,7 @@ function BottomNav({ tab, setTab, unread }: {
 
 function World({ rooms, onJoined, joined, onSheetOpenChange }: {
   rooms: Room[];
-  onJoined: (room: Room) => Promise<void>;
+  onJoined: (room: Room, inviteToken?: string | null) => Promise<void>;
   joined: Set<string>;
   onSheetOpenChange?: (open: boolean) => void;
 }) {
@@ -679,7 +679,7 @@ function World({ rooms, onJoined, joined, onSheetOpenChange }: {
 
       {sheet && (
         <WorldSheet room={sheet} joined={joined.has(sheet.id)}
-          onJoin={() => onJoined(sheet)}
+          onJoin={inviteToken => onJoined(sheet, inviteToken)}
           onClose={closeSheet}/>
       )}
     </div>
@@ -687,15 +687,31 @@ function World({ rooms, onJoined, joined, onSheetOpenChange }: {
 }
 
 function WorldSheet({ room, joined, onJoin, onClose }: {
-  room: Room; joined: boolean; onJoin: () => Promise<void>; onClose: () => void;
+  room: Room; joined: boolean; onJoin: (inviteToken?: string | null) => Promise<void>; onClose: () => void;
 }) {
   const [copied, setCopied] = useState(false);
   const [joining, setJoining] = useState(false);
   const [error, setError] = useState<string | null>(null);
+  const [inviteToken, setInviteToken] = useState<string | null>(null);
+  const [inviteError, setInviteError] = useState<string | null>(null);
   const copy = () => {
-    navigator.clipboard?.writeText(room.code).catch(() => {});
+    if (!inviteToken) return;
+    navigator.clipboard?.writeText(inviteToken).catch(() => {});
     setCopied(true); setTimeout(() => setCopied(false), 2000);
   };
+
+  useEffect(() => {
+    let active = true;
+    setInviteToken(null);
+    setInviteError(null);
+    void getWorldRoom(room.id).then(detail => {
+      if (active) setInviteToken(detail.inviteToken);
+    }).catch(err => {
+      if (active) setInviteError(err instanceof Error ? err.message : '获取邀请码失败');
+    });
+    return () => { active = false; };
+  }, [room.id]);
+
   return (
     <div data-testid="world-room-sheet" onClick={onClose} style={{
       position:"fixed", inset:0, zIndex:200,
@@ -723,14 +739,16 @@ function WorldSheet({ room, joined, onJoin, onClose }: {
             <div style={{ padding:"12px 16px" }}>
               <div style={{ fontSize:12, color:"var(--text-3)", marginBottom:6 }}>邀请码</div>
               <div style={{ display:"flex", alignItems:"center", justifyContent:"space-between" }}>
-                <span style={{ fontSize:14, color:"var(--text-2)" }}>{room.code || "点击加入即可获取邀请"}</span>
+                <span style={{ fontSize:14, color:"var(--text-2)" }}>
+                  {inviteError ? inviteError : inviteToken || "正在加载邀请码..."}
+                </span>
                 <button onClick={copy} style={{
                   background:"none", border:"none", cursor:"pointer",
                   display:"flex", alignItems:"center", gap:5,
                   color:"var(--brand)", fontSize:14, fontWeight:500,
-                }}>
+                }} disabled={!inviteToken}>
                   <IC.copy/>
-                  {copied ? "已复制" : room.code ? "复制" : ""}
+                  {copied ? "已复制" : inviteToken ? "复制" : ""}
                 </button>
               </div>
             </div>
@@ -740,7 +758,7 @@ function WorldSheet({ room, joined, onJoin, onClose }: {
             if (joined || joining) return;
             setJoining(true);
             setError(null);
-            void onJoin().catch(error => setError(error instanceof Error ? error.message : "加入失败"))
+            void onJoin(inviteToken).catch(error => setError(error instanceof Error ? error.message : "加入失败"))
               .finally(() => setJoining(false));
           }} style={{
             width:"100%", border:"none", borderRadius:14, fontSize:17, fontWeight:600, padding:"15px",
@@ -1894,9 +1912,9 @@ export default function App() {
   const push = (next: View) => setView(next);
   const pop = () => setView(null);
 
-  const joinWorldRoom = useCallback(async (room: Room) => {
-    const detail = await getWorldRoom(room.id);
-    await acceptInvite(detail.inviteToken);
+  const joinWorldRoom = useCallback(async (room: Room, inviteToken?: string | null) => {
+    const token = inviteToken ?? (await getWorldRoom(room.id)).inviteToken;
+    await acceptInvite(token);
     await refreshRooms();
     setJoinedWorld(previous => new Set(previous).add(room.id));
     setTab("rooms");

@@ -39,6 +39,23 @@ const roomSchema = z.object({
   updatedAt: timestampSchema,
 }).strict();
 
+const roomWithWorldSchema = roomSchema.extend({
+  worldPublished: z.boolean(),
+  worldSummary: z.string().max(300),
+}).strict();
+
+const worldRoomSchema = z.object({
+  id: idSchema,
+  title: z.string().min(1).max(120),
+  ownerUserId: idSchema,
+  ownerDisplayName: z.string().min(1).max(80),
+  summary: z.string().max(300),
+  publishedAt: timestampSchema,
+  inviteToken: z.string().min(22).max(256),
+  inviteExpiresAt: timestampSchema,
+  remainingUses: z.number().int().min(0).max(100),
+}).strict();
+
 const inviteSchema = z.object({
   id: idSchema,
   roomId: idSchema,
@@ -168,6 +185,11 @@ const listRoomsOutputSchema = z.object({
 const joinRoomOutputSchema = z.object({
   room: roomSchema,
   membership: ownMembershipSchema,
+}).strict();
+
+const publishWorldRoomOutputSchema = z.object({
+  room: roomWithWorldSchema,
+  world: z.union([worldRoomSchema, z.null()]),
 }).strict();
 
 const roomContextOutputSchema = z.object({
@@ -710,6 +732,28 @@ export function createGroupChatMcpServer({
       inviteToken: args.inviteCode,
       key: args.clientRequestId,
       requestFingerprint: toolFingerprint('group_join_room', args),
+    });
+    return result.body;
+  }, logger));
+
+  server.registerTool('group_publish_room_to_world', {
+    description: 'Publish or unpublish one of the caller-owned rooms to the public world list. When published=true, the server returns the world room snapshot including the active invite code so the caller can share it. When published=false, the room is removed from the world list and its invite is revoked. Use summary to describe the room for world discovery.',
+    inputSchema: z.object({
+      clientRequestId: idSchema,
+      roomId: idSchema,
+      published: z.boolean(),
+      summary: z.string().max(300).default(''),
+    }).strict(),
+    outputSchema: publishWorldRoomOutputSchema,
+    annotations: WRITE_ANNOTATIONS,
+  }, toolHandler(async (args) => {
+    const result = await store.updateWorldRoom({
+      userId: user.userId,
+      roomId: args.roomId,
+      published: args.published,
+      summary: args.summary ?? '',
+      key: args.clientRequestId,
+      requestFingerprint: toolFingerprint('group_publish_room_to_world', args),
     });
     return result.body;
   }, logger));
