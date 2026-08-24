@@ -90,7 +90,7 @@ export function applyBubbleColor(color: string) {
 export async function initializeAppearance() {
   applyBubbleOpacity(readBubbleOpacity());
   applyBubbleColor(readBubbleColor());
-  displayBackground(await readBackground());
+  await readChatBackgroundUrl();
 }
 
 export async function hasChatBackground(): Promise<boolean> {
@@ -98,7 +98,10 @@ export async function hasChatBackground(): Promise<boolean> {
 }
 
 export async function readChatBackgroundUrl(): Promise<string | null> {
-  if (!activeBackgroundUrl) displayBackground(await readBackground());
+  if (!activeBackgroundUrl) {
+    const background = await readBackground();
+    if (!activeBackgroundUrl) displayBackground(background);
+  }
   return activeBackgroundUrl;
 }
 

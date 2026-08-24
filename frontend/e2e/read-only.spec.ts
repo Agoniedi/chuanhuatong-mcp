@@ -49,7 +49,7 @@ test.beforeAll(async () => {
   const invite = await store.createInvite({
     userId: owner.userId,
     roomId: room.body.id,
-    expectedRoomRevision: published.room.revision,
+    expectedRoomRevision: published.body.room.revision,
     expiresAt: new Date(Date.now() + 60_000).toISOString(),
     maxUses: 1,
     key: 'e2e-invite',
@@ -73,8 +73,8 @@ test.beforeAll(async () => {
     published: true,
     summary: '用于验证网页加入流程',
   });
-  inviteToken = published.world.inviteToken;
-  joinableWorldToken = joinablePublished.world.inviteToken;
+  inviteToken = published.body.world.inviteToken;
+  joinableWorldToken = joinablePublished.body.world.inviteToken;
   await store.createHumanMessage({
     user: guest,
     roomId: room.body.id,

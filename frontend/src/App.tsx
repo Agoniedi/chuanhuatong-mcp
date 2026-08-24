@@ -4,7 +4,7 @@ import {
 } from "react";
 import { useApp } from "./store/useApp";
 import { useRealtimeWS } from "./ws/useRealtimeWS";
-import { applyBubbleColor, applyBubbleOpacity, readBubbleColor, readBubbleOpacity, readChatBackgroundUrl } from "./appearance";
+import { applyBubbleColor, applyBubbleOpacity, readBubbleColor, readBubbleOpacity, readChatBackgroundUrl, saveChatBackground } from "./appearance";
 import { acceptInvite, deleteRoom, getWorldRoom, updateWorldRoom } from "./api/rooms";
 import { listMembers } from "./api/members";
 import { listAgentBindings } from "./api/agent-bindings";
@@ -51,6 +51,8 @@ interface Member {
   id: string; name: string; handle: string;
   isAI: boolean; online: boolean;
   initials: string; color: string; role?: "owner" | "member";
+  ownerUserId?: string;
+  participationMode?: AgentBinding["participationMode"];
 }
 
 type BackendRoom = StoredRoom;
@@ -217,14 +219,6 @@ const INIT_MSGS: Msg[] = [
     sender:"你", isMe:true, isAI:false, time:"10:38", initials:"你", color:C.brand },
   { id:"m6", text:"颜色建议使用温暖的棕色调，和品牌保持一致，用户会更有亲切感。",
     sender:"Nova", isMe:false, isAI:true, time:"10:42", initials:"N", color:C.orange },
-];
-
-const MEMBERS: Member[] = [
-  { id:"u1", name:"你",   handle:"@me",       isAI:false, online:true,  initials:"你", color:C.brand,  role:"member" },
-  { id:"u2", name:"李明", handle:"@liming",   isAI:false, online:true,  initials:"李", color:C.purple, role:"owner" },
-  { id:"u3", name:"Nova", handle:"@nova",     isAI:true,  online:true,  initials:"N",  color:C.orange, role:"member" },
-  { id:"u4", name:"陈晓", handle:"@chenxiao", isAI:false, online:false, initials:"陈", color:C.green,  role:"member" },
-  { id:"u5", name:"Cody", handle:"@cody",     isAI:true,  online:true,  initials:"C",  color:C.red,    role:"member" },
 ];
 
 const AI_AGENTS = [
@@ -883,7 +877,7 @@ function ShareSheet({ rooms, onClose, onToggle }: {
    CHAT
 ══════════════════════════════════════════════════════════ */
 
-function Chat({ room, onBack, bubColor, bubOpacity, chatBg, msgs, onSend, onRecall,
+export function Chat({ room, onBack, bubColor, bubOpacity, chatBg, msgs, onSend, onRecall,
   hasMoreBefore, onLoadOlder, onReachedLatest, wsStatus, canDelete, onDelete }: {
   room: Room; onBack: () => void;
   bubColor: string; bubOpacity: number; chatBg: string | null;
@@ -900,6 +894,7 @@ function Chat({ room, onBack, bubColor, bubOpacity, chatBg, msgs, onSend, onReca
   const [input, setInput] = useState("");
   const [showMembers, setShowMembers] = useState(false);
   const [members, setMembers] = useState<Member[]>([]);
+  const [membersLoading, setMembersLoading] = useState(false);
   const [memberError, setMemberError] = useState<string | null>(null);
   const [sending, setSending] = useState(false);
   const [sendError, setSendError] = useState<string | null>(null);
@@ -941,6 +936,7 @@ function Chat({ room, onBack, bubColor, bubOpacity, chatBg, msgs, onSend, onReca
 
   const openMembers = useCallback(async () => {
     setShowMembers(true);
+    setMembersLoading(true);
     setMemberError(null);
     try {
       const [humanResult, bindings] = await Promise.all([
@@ -966,12 +962,18 @@ function Chat({ room, onBack, bubColor, bubOpacity, chatBg, msgs, onSend, onReca
         initials: initialsFor(binding.displayName),
         color: colorFor(binding.agentProfileId),
         role: "member" as const,
+        ownerUserId: binding.ownerUserId,
+        participationMode: binding.participationMode,
       }));
       setMembers([...humanMembers, ...aiMembers]);
     } catch (error) {
       setMemberError(error instanceof Error ? error.message : "成员加载失败");
+    } finally {
+      setMembersLoading(false);
     }
   }, [room.id]);
+
+  const humanMembers = members.filter(member => !member.isAI);
 
   const send = useCallback(() => {
     const text = input.trim();
@@ -1167,41 +1169,66 @@ function Chat({ room, onBack, bubColor, bubOpacity, chatBg, msgs, onSend, onReca
           display:"flex", justifyContent:"flex-end",
         }}>
           <div onClick={e => e.stopPropagation()} className="anim-slide-r" style={{
-            width:"72%", maxWidth:290, height:"100%",
-            background:"var(--surface)", overflowY:"auto",
+            width:"min(84vw, 320px)", height:"100%",
+            background:"var(--surface)", display:"flex", flexDirection:"column", overflow:"hidden",
+            boxShadow:"-10px 0 30px rgba(29,24,20,.10)",
           }}>
-            <div style={{ padding:"max(8px, var(--safe-top)) 16px 8px", display:"flex", alignItems:"center", justifyContent:"space-between", color:"var(--text)" }}>
+            <div style={{ padding:"max(8px, var(--safe-top)) 12px 8px 16px", display:"flex", alignItems:"center", justifyContent:"space-between", color:"var(--text)", flexShrink:0, borderBottom:".5px solid var(--sep)" }}>
               <span style={{ fontSize:17, fontWeight:600 }}>成员 ({members.length})</span>
-              <button type="button" onClick={() => setShowMembers(false)} aria-label="关闭成员" style={{ border:0, background:"transparent", color:"var(--text-3)", cursor:"pointer", fontSize:13 }}>关闭</button>
+              <button type="button" onClick={() => setShowMembers(false)} aria-label="关闭成员" style={{ minWidth:44, minHeight:44, border:0, background:"transparent", color:"var(--text-3)", cursor:"pointer", fontSize:13 }}>关闭</button>
             </div>
             {memberError && <div role="alert" style={{ color:"var(--danger)", fontSize:13, padding:"0 16px 12px" }}>{memberError}</div>}
-            {members.map((m, i) => (
-              <div key={m.id}>
-                <div style={{ display:"flex", alignItems:"center", padding:"11px 16px", gap:12 }}>
-                  <div style={{ position:"relative" }}>
-                    <Avi ch={m.initials} color={m.color} size={38}/>
-                    <div style={{
-                      position:"absolute", bottom:0, right:0,
-                      width:9, height:9, borderRadius:"50%",
-                      background: m.online ? "var(--success)" : "var(--text-3)",
-                      border:"1.5px solid var(--surface)", opacity: m.online ? 1 : .5,
-                    }}/>
-                  </div>
-                  <div style={{ flex:1, minWidth:0 }}>
-                    <div style={{ display:"flex", alignItems:"center", gap:5 }}>
-                      <span style={{ fontSize:14, fontWeight:500, color:"var(--text)" }}>{m.name}</span>
-                      {m.isAI && <AITag/>}
-                      {m.role === "owner" && (
-                        <span style={{ fontSize:10, color:C.orange, background:"rgba(224,162,74,.12)",
-                          borderRadius:4, padding:"1px 5px", fontWeight:600 }}>房主</span>
-                      )}
+            <div role="list" aria-label="房间成员" style={{ flex:1, overflowY:"auto", paddingBottom:"max(12px, var(--safe-bottom))" }}>
+              {membersLoading ? (
+                <div style={{ color:"var(--text-3)", fontSize:13, padding:"20px 16px" }}>正在加载成员...</div>
+              ) : humanMembers.length === 0 && !memberError ? (
+                <div style={{ color:"var(--text-3)", fontSize:13, padding:"20px 16px" }}>暂无成员</div>
+              ) : humanMembers.map((member, index) => {
+                const agents = members.filter(item => item.isAI && item.ownerUserId === member.id);
+                return (
+                  <div key={member.id} role="listitem" aria-label={member.name}>
+                    <div style={{ display:"flex", alignItems:"center", padding:"12px 16px 9px", gap:12 }}>
+                      <div style={{ position:"relative", flexShrink:0 }}>
+                        <Avi ch={member.initials} color={member.color} size={38}/>
+                        <div style={{
+                          position:"absolute", bottom:0, right:0,
+                          width:9, height:9, borderRadius:"50%",
+                          background: member.online ? "var(--success)" : "var(--text-3)",
+                          border:"1.5px solid var(--surface)", opacity: member.online ? 1 : .5,
+                        }}/>
+                      </div>
+                      <div style={{ flex:1, minWidth:0 }}>
+                        <div style={{ display:"flex", alignItems:"center", gap:5, minWidth:0 }}>
+                          <span style={{ minWidth:0, overflow:"hidden", textOverflow:"ellipsis", whiteSpace:"nowrap", fontSize:14, fontWeight:500, color:"var(--text)" }}>{member.name}</span>
+                          {member.role === "owner" && (
+                            <span style={{ flexShrink:0, fontSize:10, color:C.orange, background:"rgba(224,162,74,.12)",
+                              borderRadius:4, padding:"1px 5px", fontWeight:600 }}>房主</span>
+                          )}
+                        </div>
+                        <div style={{ overflow:"hidden", textOverflow:"ellipsis", whiteSpace:"nowrap", fontSize:12, color:"var(--text-3)" }}>{member.handle}</div>
+                      </div>
                     </div>
-                    <div style={{ fontSize:12, color:"var(--text-3)" }}>{m.handle}</div>
+                    {agents.length > 0 && (
+                      <div role="list" aria-label={`${member.name} 的 AI`} style={{ margin:"0 16px 10px 35px", paddingLeft:14, borderLeft:"1px solid var(--sep)" }}>
+                        {agents.map(agent => (
+                          <div key={agent.id} role="listitem" style={{ display:"flex", alignItems:"center", gap:10, minHeight:42, padding:"5px 0" }}>
+                            <Avi ch={agent.initials} color={agent.color} size={30}/>
+                            <div style={{ flex:1, minWidth:0, display:"flex", alignItems:"center", gap:5 }}>
+                              <span style={{ minWidth:0, overflow:"hidden", textOverflow:"ellipsis", whiteSpace:"nowrap", fontSize:13.5, fontWeight:500, color:"var(--text)" }}>{agent.name}</span>
+                              <AITag/>
+                            </div>
+                            <span style={{ flexShrink:0, fontSize:11, color:agent.participationMode === "off" ? "var(--text-3)" : "var(--text-2)" }}>
+                              {agent.participationMode === "automatic" ? "自动" : agent.participationMode === "manual" ? "手动" : "停用"}
+                            </span>
+                          </div>
+                        ))}
+                      </div>
+                    )}
+                    {index < humanMembers.length - 1 && <SepL/>}
                   </div>
-                </div>
-                {i < MEMBERS.length - 1 && <SepL/>}
-              </div>
-            ))}
+                );
+              })}
+            </div>
           </div>
         </div>
       )}
@@ -1605,7 +1632,7 @@ const BG_OPTIONS: { label: string; value: string | null; preview: string }[] = [
   { label:"樱花", value:"https://images.unsplash.com/photo-1522383225653-ed111181a951?w=800&q=80", preview:"#f4c5c5" },
 ];
 
-function AppearancePage({ onBack, color, setColor, opacity, setOpacity, chatBg, setChatBg, dark, setDark }: {
+export function AppearancePage({ onBack, color, setColor, opacity, setOpacity, chatBg, setChatBg, dark, setDark }: {
   onBack: () => void;
   color: string; setColor: (v: string) => void;
   opacity: number; setOpacity: (v: number) => void;
@@ -1614,20 +1641,24 @@ function AppearancePage({ onBack, color, setColor, opacity, setOpacity, chatBg, 
 }) {
   const palette = [C.brand, C.green, C.orange, C.blue, C.red, C.purple];
   const fileRef = useRef<HTMLInputElement>(null);
-  const [customBg, setCustomBg] = useState<string | null>(null);
+  const [customBg, setCustomBg] = useState<string | null>(() => chatBg?.startsWith("blob:") ? chatBg : null);
+  const [backgroundError, setBackgroundError] = useState<string | null>(null);
 
-  const handleUpload = (e: React.ChangeEvent<HTMLInputElement>) => {
+  const handleUpload = async (e: React.ChangeEvent<HTMLInputElement>) => {
     const file = e.target.files?.[0];
     if (!file) return;
-    const reader = new FileReader();
-    reader.onload = ev => {
-      const url = ev.target?.result as string;
+    setBackgroundError(null);
+    try {
+      await saveChatBackground(file);
+      const url = await readChatBackgroundUrl();
       setCustomBg(url);
       setChatBg(url);
-    };
-    reader.readAsDataURL(file);
-    // reset so same file can be re-selected
-    e.target.value = "";
+    } catch (error) {
+      setBackgroundError(error instanceof Error ? error.message : "聊天背景更新失败");
+    } finally {
+      // reset so same file can be re-selected
+      e.target.value = "";
+    }
   };
 
   return (
@@ -1754,10 +1785,11 @@ function AppearancePage({ onBack, color, setColor, opacity, setOpacity, chatBg, 
               </span>
             </div>
             {/* Hidden file input */}
-            <input ref={fileRef} type="file" accept="image/*" onChange={handleUpload}
+            <input ref={fileRef} type="file" accept="image/*" onChange={e => void handleUpload(e)}
               style={{ display:"none" }}/>
           </div>
         </Card>
+        {backgroundError && <div role="alert" style={{ color:"var(--danger)", fontSize:12, padding:"8px 4px 0" }}>{backgroundError}</div>}
       </div>
     </SubShell>
   );
