@@ -6,9 +6,12 @@ const COLOR_KEY = 'chuanhuatong_bubble_color';
 const DATABASE_NAME = 'chuanhuatong-appearance';
 const STORE_NAME = 'assets';
 const BACKGROUND_KEY = 'chat-background';
+const BACKGROUND_PRESET_KEY = 'chuanhuatong_chat_background_preset';
 const MAX_BACKGROUND_SIZE = 10 * 1024 * 1024;
 
 let activeBackgroundUrl: string | null = null;
+let backgroundLoaded = false;
+let backgroundLoadPromise: Promise<string | null> | null = null;
 
 function openDatabase(): Promise<IDBDatabase> {
   return new Promise((resolve, reject) => {
@@ -98,11 +101,17 @@ export async function hasChatBackground(): Promise<boolean> {
 }
 
 export async function readChatBackgroundUrl(): Promise<string | null> {
-  if (!activeBackgroundUrl) {
-    const background = await readBackground();
-    if (!activeBackgroundUrl) displayBackground(background);
-  }
-  return activeBackgroundUrl;
+  const preset = localStorage.getItem(BACKGROUND_PRESET_KEY);
+  if (preset) return preset;
+  if (backgroundLoaded) return activeBackgroundUrl;
+  backgroundLoadPromise ??= readBackground().then(background => {
+    if (!backgroundLoaded) displayBackground(background);
+    backgroundLoaded = true;
+    return activeBackgroundUrl;
+  }).finally(() => {
+    backgroundLoadPromise = null;
+  });
+  return backgroundLoadPromise;
 }
 
 export async function saveChatBackground(file: File) {
@@ -114,7 +123,9 @@ export async function saveChatBackground(file: File) {
   transaction.objectStore(STORE_NAME).put(file, BACKGROUND_KEY);
   await transactionComplete(transaction);
   database.close();
+  localStorage.removeItem(BACKGROUND_PRESET_KEY);
   displayBackground(file);
+  backgroundLoaded = true;
 }
 
 export async function clearChatBackground() {
@@ -123,5 +134,13 @@ export async function clearChatBackground() {
   transaction.objectStore(STORE_NAME).delete(BACKGROUND_KEY);
   await transactionComplete(transaction);
   database.close();
+  localStorage.removeItem(BACKGROUND_PRESET_KEY);
   displayBackground(null);
+  backgroundLoaded = true;
+}
+
+export async function selectChatBackgroundPreset(value: string | null) {
+  await clearChatBackground();
+  if (value) localStorage.setItem(BACKGROUND_PRESET_KEY, value);
+  return value;
 }

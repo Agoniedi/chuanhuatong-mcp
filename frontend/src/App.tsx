@@ -1,13 +1,14 @@
 import {
-  useState, useRef, useEffect, useCallback,
+  useState, useRef, useEffect, useCallback, useId,
   type CSSProperties, type ReactNode,
 } from "react";
 import { useApp } from "./store/useApp";
 import { useRealtimeWS } from "./ws/useRealtimeWS";
-import { applyBubbleColor, applyBubbleOpacity, readBubbleColor, readBubbleOpacity, readChatBackgroundUrl, saveChatBackground } from "./appearance";
+import { applyBubbleColor, applyBubbleOpacity, readBubbleColor, readBubbleOpacity, readChatBackgroundUrl, saveChatBackground, selectChatBackgroundPreset } from "./appearance";
 import { acceptInvite, deleteRoom, getWorldRoom, updateWorldRoom } from "./api/rooms";
-import { listMembers } from "./api/members";
+import { leaveRoom, listMembers, removeRoomMember } from "./api/members";
 import { listAgentBindings } from "./api/agent-bindings";
+import { ApiError } from "./api/client";
 import { changePassword, resetPassword } from "./api/auth";
 import { listWorldRooms } from "./api/rooms";
 import { markRoomRead, recallMessage, sendMessage } from "./api/messages";
@@ -19,6 +20,7 @@ import {
 import type {
   AgentBinding, AgentProfile, Member as BackendMember,
   Message as BackendMessage, ProfileUpdatedEvent, Room as StoredRoom,
+  RoomMembershipRemovedEvent,
   User, WsEvent, WorldRoom, McpDeviceCreation,
 } from "./types";
 
@@ -38,7 +40,7 @@ type View =
 interface Room {
   id: string; name: string; desc: string;
   lastMsg: string; lastTime: string; unread: number;
-  members: number; owner: string; code: string;
+  members: number; ownerUserId?: string; ownerLabel: string; code: string;
   initials: string; color: string;
 }
 interface Msg {
@@ -49,7 +51,7 @@ interface Msg {
 }
 interface Member {
   id: string; name: string; handle: string;
-  isAI: boolean; online: boolean;
+  isAI: boolean;
   initials: string; color: string; role?: "owner" | "member";
   ownerUserId?: string;
   participationMode?: AgentBinding["participationMode"];
@@ -94,7 +96,8 @@ function toUiRoom(room: BackendRoom): Room {
     lastTime: clockLabel(room.updatedAt),
     unread: room.unreadCount,
     members: room.memberCount ?? 0,
-    owner: room.ownerUserId,
+    ownerUserId: room.ownerUserId,
+    ownerLabel: room.ownerUserId,
     code: "",
     initials: initialsFor(room.title),
     color: colorFor(room.id),
@@ -110,7 +113,7 @@ function toWorldRoom(room: WorldRoom): Room {
     lastTime: clockLabel(room.publishedAt),
     unread: 0,
     members: room.memberCount ?? 0,
-    owner: room.ownerDisplayName,
+    ownerLabel: room.ownerDisplayName,
     code: "",
     initials: initialsFor(room.title),
     color: colorFor(room.id),
@@ -163,33 +166,33 @@ const AVATAR_ME      = "https://images.unsplash.com/photo-1522598829964-8453b265
 const MY_ROOMS: Room[] = [
   { id:"r1", name:"产品设计",  desc:"一起讨论产品方向与体验",
     lastMsg:"Nova：这个方案很不错", lastTime:"10:42", unread:3,
-    members:12, owner:"李明", code:"PDX-2024", initials:"产", color:C.purple },
+    members:12, ownerLabel:"李明", code:"PDX-2024", initials:"产", color:C.purple },
   { id:"r2", name:"AI 研究",   desc:"探索大语言模型的最新进展",
     lastMsg:"你：这篇论文值得一读", lastTime:"昨天", unread:0,
-    members:8, owner:"你", code:"AIR-8832", initials:"研", color:C.orange },
+    members:8, ownerLabel:"你", code:"AIR-8832", initials:"研", color:C.orange },
   { id:"r3", name:"日常闲聊",  desc:"随便聊聊，放松一下",
     lastMsg:"陈晓：今天天气真好啊", lastTime:"周二", unread:0,
-    members:5, owner:"王芳", code:"CHAT-5519", initials:"聊", color:C.green },
+    members:5, ownerLabel:"王芳", code:"CHAT-5519", initials:"聊", color:C.green },
   { id:"r4", name:"前端开发",  desc:"技术分享与问题讨论",
     lastMsg:"Cody：试试 React 19 的新特性吧", lastTime:"周一", unread:7,
-    members:24, owner:"张伟", code:"FED-0721", initials:"前", color:C.red },
+    members:24, ownerLabel:"张伟", code:"FED-0721", initials:"前", color:C.red },
 ];
 
 const WORLD_ROOMS: Room[] = [
   { id:"w1", name:"AI 爱好者",   desc:"聚集对人工智能感兴趣的朋友们",
-    lastMsg:"", lastTime:"", unread:0, members:1240, owner:"Alex Chen",
+    lastMsg:"", lastTime:"", unread:0, members:1240, ownerLabel:"Alex Chen",
     code:"AI-FANS", initials:"爱", color:C.brand },
   { id:"w2", name:"创业者茶馆", desc:"创业路上互相交流，寻找志同道合",
-    lastMsg:"", lastTime:"", unread:0, members:843, owner:"Maya Liu",
+    lastMsg:"", lastTime:"", unread:0, members:843, ownerLabel:"Maya Liu",
     code:"STARTUP", initials:"创", color:C.orange },
   { id:"w3", name:"读书俱乐部", desc:"每月共读一本书，一起慢慢成长",
-    lastMsg:"", lastTime:"", unread:0, members:412, owner:"小字",
+    lastMsg:"", lastTime:"", unread:0, members:412, ownerLabel:"小字",
     code:"BOOK-R", initials:"读", color:C.blue },
   { id:"w4", name:"摄影爱好者", desc:"分享你的作品，交流拍摄技巧",
-    lastMsg:"", lastTime:"", unread:0, members:677, owner:"镜头里的世界",
+    lastMsg:"", lastTime:"", unread:0, members:677, ownerLabel:"镜头里的世界",
     code:"PHOTO1", initials:"摄", color:C.purple },
   { id:"w5", name:"健身打卡",   desc:"互相监督，坚持运动，过健康生活",
-    lastMsg:"", lastTime:"", unread:0, members:289, owner:"运动达人",
+    lastMsg:"", lastTime:"", unread:0, members:289, ownerLabel:"运动达人",
     code:"FIT365", initials:"健", color:C.red },
 ];
 
@@ -398,6 +401,95 @@ function Card({ children, style }: { children: ReactNode; style?: CSSProperties 
       overflow:"hidden",
       ...style,
     }}>{children}</div>
+  );
+}
+
+function confirmErrorMessage(error: unknown) {
+  if (!(error instanceof ApiError)) return "操作失败，请重试";
+  if (error.code === "forbidden") return "你没有执行此操作的权限";
+  if (error.code === "room_owner_cannot_leave") return "房主不能直接退出，请解散房间";
+  if (error.code === "room_owner_cannot_be_removed") return "不能将房主踢出房间";
+  if (error.code === "resource_not_found") return "目标已不存在，请刷新后重试";
+  if (error.code === "request_version_conflict" || error.code === "conflict") {
+    return "数据已更新，请刷新后重试";
+  }
+  return "操作失败，请重试";
+}
+
+function ConfirmDialog({ title, message, confirmLabel, onCancel, onConfirm }: {
+  title: string;
+  message: string;
+  confirmLabel: string;
+  onCancel: () => void;
+  onConfirm: () => Promise<void>;
+}) {
+  const [busy, setBusy] = useState(false);
+  const [error, setError] = useState<string | null>(null);
+  const titleId = useId();
+  const dialogRef = useRef<HTMLDivElement>(null);
+  const cancelButtonRef = useRef<HTMLButtonElement>(null);
+
+  useEffect(() => {
+    const previousOverflow = document.body.style.overflow;
+    document.body.style.overflow = "hidden";
+    cancelButtonRef.current?.focus();
+    return () => { document.body.style.overflow = previousOverflow; };
+  }, []);
+
+  const handleKeyDown = (event: React.KeyboardEvent<HTMLDivElement>) => {
+    if (event.key === "Escape" && !busy) {
+      event.preventDefault();
+      onCancel();
+      return;
+    }
+    if (event.key !== "Tab") return;
+    const controls = [...(dialogRef.current?.querySelectorAll<HTMLElement>("button:not([disabled])") ?? [])];
+    if (controls.length === 0) return;
+    const first = controls[0];
+    const last = controls.at(-1)!;
+    if (event.shiftKey && document.activeElement === first) {
+      event.preventDefault();
+      last.focus();
+    } else if (!event.shiftKey && document.activeElement === last) {
+      event.preventDefault();
+      first.focus();
+    }
+  };
+
+  return (
+    <div role="presentation" onClick={busy ? undefined : onCancel} style={{
+      position:"fixed", inset:0, zIndex:300, background:"rgba(0,0,0,.32)",
+      display:"grid", placeItems:"center", padding:24,
+    }}>
+      <div ref={dialogRef} role="alertdialog" aria-modal="true" aria-labelledby={titleId}
+        onKeyDown={handleKeyDown} onClick={event => event.stopPropagation()} className="anim-fade-up" style={{
+          width:"100%", maxWidth:340, borderRadius:18, background:"var(--surface)",
+          boxShadow:"0 18px 48px rgba(0,0,0,.22)", overflow:"hidden",
+        }}>
+        <div style={{ padding:"22px 22px 18px", textAlign:"center" }}>
+          <div id={titleId} style={{ fontSize:18, fontWeight:700, color:"var(--text)" }}>{title}</div>
+          <div style={{ marginTop:9, fontSize:14, lineHeight:1.6, color:"var(--text-2)" }}>{message}</div>
+          {error && <div role="alert" style={{ marginTop:10, fontSize:13, color:"var(--danger)" }}>{error}</div>}
+        </div>
+        <div style={{ display:"grid", gridTemplateColumns:"1fr 1fr", borderTop:".5px solid var(--sep)" }}>
+          <button ref={cancelButtonRef} type="button" onClick={onCancel} disabled={busy} style={{
+            minHeight:48, border:0, borderRight:".5px solid var(--sep)",
+            background:"transparent", color:"var(--text-2)", fontSize:16, cursor:"pointer",
+          }}>取消</button>
+          <button type="button" onClick={() => {
+            if (busy) return;
+            setBusy(true); setError(null);
+            void onConfirm().catch(error => {
+              setError(confirmErrorMessage(error));
+              setBusy(false);
+            });
+          }} disabled={busy} style={{
+            minHeight:48, border:0, background:"transparent", color:"var(--danger)",
+            fontSize:16, fontWeight:600, cursor:"pointer",
+          }}>{busy ? "处理中..." : confirmLabel}</button>
+        </div>
+      </div>
+    </div>
   );
 }
 
@@ -653,7 +745,7 @@ function World({ rooms, onJoined, joined, onSheetOpenChange }: {
                     {room.desc}
                   </div>
                   <div style={{ fontSize:12, color:"var(--text-3)" }}>
-                    {room.members.toLocaleString()} 人 · {room.owner}
+                    {room.members.toLocaleString()} 人 · {room.ownerLabel}
                   </div>
                 </div>
                 {joined.has(room.id) || state.rooms.some(item => item.id === room.id)
@@ -724,7 +816,7 @@ function WorldSheet({ room, joined, onJoin, onClose }: {
             <div>
               <div style={{ fontSize:20, fontWeight:700, color:"var(--text)" }}>{room.name}</div>
               <div style={{ fontSize:14, color:"var(--text-3)", marginTop:3 }}>
-                {room.members.toLocaleString()} 名成员 · {room.owner}
+                {room.members.toLocaleString()} 名成员 · {room.ownerLabel}
               </div>
             </div>
           </div>
@@ -770,9 +862,52 @@ function WorldSheet({ room, joined, onJoin, onClose }: {
    ROOMS
 ══════════════════════════════════════════════════════════ */
 
-function Rooms({ rooms, onRoom, onShareSheet }: {
-  rooms: Room[]; onRoom: (r: Room) => void; onShareSheet: () => void;
+export function Rooms({ rooms, currentUserId, pinnedRoomIds, onRoom, onShareSheet, onTogglePin, onExit }: {
+  rooms: Room[];
+  currentUserId: string;
+  pinnedRoomIds: Set<string>;
+  onRoom: (r: Room) => void;
+  onShareSheet: () => void;
+  onTogglePin: (roomId: string) => void;
+  onExit: (room: Room) => Promise<void>;
 }) {
+  const [actionRoom, setActionRoom] = useState<Room | null>(null);
+  const [exitRoom, setExitRoom] = useState<Room | null>(null);
+  const longPressTimerRef = useRef<number | null>(null);
+  const longPressOriginRef = useRef<{ x: number; y: number } | null>(null);
+  const actionButtonRef = useRef<HTMLButtonElement>(null);
+  const suppressClickRef = useRef(false);
+  const orderedRooms = [...rooms].sort((left, right) =>
+    Number(pinnedRoomIds.has(right.id)) - Number(pinnedRoomIds.has(left.id)));
+
+  const cancelLongPress = () => {
+    if (longPressTimerRef.current !== null) window.clearTimeout(longPressTimerRef.current);
+    longPressTimerRef.current = null;
+    longPressOriginRef.current = null;
+  };
+
+  useEffect(() => cancelLongPress, []);
+  useEffect(() => { if (actionRoom) actionButtonRef.current?.focus(); }, [actionRoom]);
+
+  const beginLongPress = (room: Room, clientX: number, clientY: number) => {
+    cancelLongPress();
+    suppressClickRef.current = false;
+    longPressOriginRef.current = { x: clientX, y: clientY };
+    longPressTimerRef.current = window.setTimeout(() => {
+      suppressClickRef.current = true;
+      setActionRoom(room);
+      longPressTimerRef.current = null;
+    }, 500);
+  };
+
+  const moveLongPress = (clientX: number, clientY: number) => {
+    const origin = longPressOriginRef.current;
+    if (origin && Math.hypot(clientX - origin.x, clientY - origin.y) > 10) {
+      suppressClickRef.current = true;
+      cancelLongPress();
+    }
+  };
+
   return (
     <PageShell title="房间" right={
       <button className="tap" onClick={onShareSheet} aria-label="分享到世界" title="分享到世界"
@@ -782,9 +917,29 @@ function Rooms({ rooms, onRoom, onShareSheet }: {
     }>
       {/* Each room is an independent card capsule — mirrors World list style */}
       <div style={{ padding:"4px 16px 0", display:"flex", flexDirection:"column", gap:10 }}>
-        {rooms.map(room => (
+        {orderedRooms.map(room => (
           <Card key={room.id}>
-            <div className="tap" onClick={() => onRoom(room)} style={{
+            <div className="tap" role="button" tabIndex={0}
+              aria-label={`${room.name}${room.unread > 0 ? `，${room.unread} 条未读` : ""}${room.lastMsg ? `，最后消息：${room.lastMsg}` : ""}`}
+              onPointerDown={event => beginLongPress(room, event.clientX, event.clientY)}
+              onPointerMove={event => moveLongPress(event.clientX, event.clientY)}
+              onPointerLeave={cancelLongPress}
+              onPointerUp={cancelLongPress}
+              onPointerCancel={cancelLongPress}
+              onContextMenu={event => { event.preventDefault(); cancelLongPress(); setActionRoom(room); }}
+              onClick={() => {
+                if (suppressClickRef.current) {
+                  suppressClickRef.current = false;
+                  return;
+                }
+                onRoom(room);
+              }}
+              onKeyDown={event => {
+                if (event.key === "Enter" || event.key === " ") {
+                  event.preventDefault();
+                  onRoom(room);
+                }
+              }} style={{
               display:"flex", alignItems:"center", padding:"13px 16px", gap:13,
             }}>
               <div style={{ position:"relative" }}>
@@ -805,6 +960,7 @@ function Rooms({ rooms, onRoom, onShareSheet }: {
                   <span style={{ fontSize:17, fontWeight: room.unread > 0 ? 600 : 400, color:"var(--text)" }}>
                     {room.name}
                   </span>
+                  {pinnedRoomIds.has(room.id) && <span style={{ marginLeft:7, fontSize:11, color:"var(--brand)" }}>已置顶</span>}
                   <span style={{ fontSize:12, color:"var(--text-3)", flexShrink:0, marginLeft:8 }}>
                     {room.lastTime}
                   </span>
@@ -818,6 +974,54 @@ function Rooms({ rooms, onRoom, onShareSheet }: {
           </Card>
         ))}
       </div>
+      {actionRoom && (
+        <div onClick={() => setActionRoom(null)} style={{
+          position:"fixed", inset:0, zIndex:220, background:"rgba(0,0,0,.28)",
+          display:"flex", alignItems:"flex-end", justifyContent:"center",
+        }}>
+          <div role="dialog" aria-modal="true" aria-label={`${actionRoom.name} 房间操作`}
+            onKeyDown={event => { if (event.key === "Escape") setActionRoom(null); }}
+            onClick={event => event.stopPropagation()} className="anim-slide-up" style={{
+            width:"100%", maxWidth:480, padding:"12px 16px max(24px, var(--safe-bottom))",
+            background:"var(--grouped)", borderRadius:"20px 20px 0 0",
+          }}>
+            <div style={{ width:36, height:4, borderRadius:2, background:"var(--text-3)", margin:"0 auto 14px", opacity:.3 }}/>
+            <Card>
+              <button ref={actionButtonRef} type="button" onClick={() => {
+                onTogglePin(actionRoom.id);
+                setActionRoom(null);
+              }} style={{ width:"100%", minHeight:52, border:0, background:"transparent", color:"var(--text)", fontSize:16, cursor:"pointer" }}>
+                {pinnedRoomIds.has(actionRoom.id) ? "取消置顶" : "置顶"}
+              </button>
+              <SepL/>
+              <button type="button" onClick={() => {
+                setExitRoom(actionRoom);
+                setActionRoom(null);
+              }} style={{ width:"100%", minHeight:52, border:0, background:"transparent", color:"var(--danger)", fontSize:16, cursor:"pointer" }}>
+                {actionRoom.ownerUserId === currentUserId ? "解散房间" : "退出"}
+              </button>
+            </Card>
+            <button type="button" onClick={() => setActionRoom(null)} style={{
+              width:"100%", minHeight:50, marginTop:10, border:0, borderRadius:14,
+              background:"var(--surface)", color:"var(--text-2)", fontSize:16, cursor:"pointer",
+            }}>取消</button>
+          </div>
+        </div>
+      )}
+      {exitRoom && (
+        <ConfirmDialog
+          title={exitRoom.ownerUserId === currentUserId ? "解散房间？" : "退出房间？"}
+          message={exitRoom.ownerUserId === currentUserId
+            ? "你是房主，退出将解散房间并永久删除全部消息，此操作无法撤销。"
+            : "退出后，此房间会从房间列表中删除，并且你将退出房间。"}
+          confirmLabel={exitRoom.ownerUserId === currentUserId ? "确认解散" : "退出房间"}
+          onCancel={() => setExitRoom(null)}
+          onConfirm={async () => {
+            await onExit(exitRoom);
+            setExitRoom(null);
+          }}
+        />
+      )}
     </PageShell>
   );
 }
@@ -878,7 +1082,8 @@ function ShareSheet({ rooms, onClose, onToggle }: {
 ══════════════════════════════════════════════════════════ */
 
 export function Chat({ room, onBack, bubColor, bubOpacity, chatBg, msgs, onSend, onRecall,
-  hasMoreBefore, onLoadOlder, onReachedLatest, wsStatus, canDelete, onDelete }: {
+  hasMoreBefore, onLoadOlder, onReachedLatest, wsStatus, currentUserId,
+  canDelete, canManageMembers, membersRefreshVersion = 0, onDelete, onRemoveMember }: {
   room: Room; onBack: () => void;
   bubColor: string; bubOpacity: number; chatBg: string | null;
   msgs: Msg[];
@@ -888,8 +1093,12 @@ export function Chat({ room, onBack, bubColor, bubOpacity, chatBg, msgs, onSend,
   onLoadOlder: () => Promise<void>;
   onReachedLatest: (seq: number) => void;
   wsStatus: string;
+  currentUserId: string;
   canDelete: boolean;
+  canManageMembers: boolean;
+  membersRefreshVersion?: number;
   onDelete: () => Promise<void>;
+  onRemoveMember: (userId: string) => Promise<void>;
 }) {
   const [input, setInput] = useState("");
   const [showMembers, setShowMembers] = useState(false);
@@ -902,9 +1111,11 @@ export function Chat({ room, onBack, bubColor, bubOpacity, chatBg, msgs, onSend,
   const [recallError, setRecallError] = useState<string | null>(null);
   const [pendingCount, setPendingCount] = useState(0);
   const [loadingOlder, setLoadingOlder] = useState(false);
+  const [memberToRemove, setMemberToRemove] = useState<Member | null>(null);
   const listRef = useRef<HTMLDivElement>(null);
   const atBottomRef = useRef(true);
   const previousLastIdRef = useRef<string | null>(null);
+  const previousMembersRefreshVersionRef = useRef(membersRefreshVersion);
   const onReachedLatestRef = useRef(onReachedLatest);
   onReachedLatestRef.current = onReachedLatest;
 
@@ -948,7 +1159,6 @@ export function Chat({ room, onBack, bubColor, bubOpacity, chatBg, msgs, onSend,
         name: member.displayName,
         handle: `@${member.userId.slice(-8)}`,
         isAI: false,
-        online: true,
         initials: initialsFor(member.displayName),
         color: colorFor(member.userId),
         role: member.role === "owner" ? "owner" as const : "member" as const,
@@ -958,7 +1168,6 @@ export function Chat({ room, onBack, bubColor, bubOpacity, chatBg, msgs, onSend,
         name: binding.displayName,
         handle: "AI Agent",
         isAI: true,
-        online: binding.participationMode !== "off",
         initials: initialsFor(binding.displayName),
         color: colorFor(binding.agentProfileId),
         role: "member" as const,
@@ -972,6 +1181,12 @@ export function Chat({ room, onBack, bubColor, bubOpacity, chatBg, msgs, onSend,
       setMembersLoading(false);
     }
   }, [room.id]);
+
+  useEffect(() => {
+    if (previousMembersRefreshVersionRef.current === membersRefreshVersion) return;
+    previousMembersRefreshVersionRef.current = membersRefreshVersion;
+    if (showMembers) void openMembers();
+  }, [membersRefreshVersion, openMembers, showMembers]);
 
   const humanMembers = members.filter(member => !member.isAI);
 
@@ -1190,12 +1405,6 @@ export function Chat({ room, onBack, bubColor, bubOpacity, chatBg, msgs, onSend,
                     <div style={{ display:"flex", alignItems:"center", padding:"12px 16px 9px", gap:12 }}>
                       <div style={{ position:"relative", flexShrink:0 }}>
                         <Avi ch={member.initials} color={member.color} size={38}/>
-                        <div style={{
-                          position:"absolute", bottom:0, right:0,
-                          width:9, height:9, borderRadius:"50%",
-                          background: member.online ? "var(--success)" : "var(--text-3)",
-                          border:"1.5px solid var(--surface)", opacity: member.online ? 1 : .5,
-                        }}/>
                       </div>
                       <div style={{ flex:1, minWidth:0 }}>
                         <div style={{ display:"flex", alignItems:"center", gap:5, minWidth:0 }}>
@@ -1207,6 +1416,14 @@ export function Chat({ room, onBack, bubColor, bubOpacity, chatBg, msgs, onSend,
                         </div>
                         <div style={{ overflow:"hidden", textOverflow:"ellipsis", whiteSpace:"nowrap", fontSize:12, color:"var(--text-3)" }}>{member.handle}</div>
                       </div>
+                      {canManageMembers && member.id !== currentUserId && (
+                        <button type="button" aria-label={`将 ${member.name} 移出房间`}
+                          onClick={() => setMemberToRemove(member)} style={{
+                            flexShrink:0, border:"1px solid color-mix(in srgb, var(--danger) 35%, transparent)",
+                            borderRadius:8, background:"transparent", color:"var(--danger)",
+                            padding:"5px 9px", fontSize:12, cursor:"pointer",
+                          }}>移出</button>
+                      )}
                     </div>
                     {agents.length > 0 && (
                       <div role="list" aria-label={`${member.name} 的 AI`} style={{ margin:"0 16px 10px 35px", paddingLeft:14, borderLeft:"1px solid var(--sep)" }}>
@@ -1231,6 +1448,20 @@ export function Chat({ room, onBack, bubColor, bubOpacity, chatBg, msgs, onSend,
             </div>
           </div>
         </div>
+      )}
+      {memberToRemove && (
+        <ConfirmDialog
+          title={`将“${memberToRemove.name}”移出房间？`}
+          message="该成员会立即退出房间，之后无法继续查看或发送房间消息。"
+          confirmLabel="确认移出"
+          onCancel={() => setMemberToRemove(null)}
+          onConfirm={async () => {
+            await onRemoveMember(memberToRemove.id);
+            setMembers(current => current.filter(member =>
+              member.id !== memberToRemove.id && member.ownerUserId !== memberToRemove.id));
+            setMemberToRemove(null);
+          }}
+        />
       )}
     </div>
     </div>
@@ -1661,6 +1892,17 @@ export function AppearancePage({ onBack, color, setColor, opacity, setOpacity, c
     }
   };
 
+  const handlePreset = async (value: string | null) => {
+    setBackgroundError(null);
+    try {
+      const selected = await selectChatBackgroundPreset(value);
+      setCustomBg(null);
+      setChatBg(selected);
+    } catch {
+      setBackgroundError("聊天背景更新失败");
+    }
+  };
+
   return (
     <SubShell title="聊天外观" onBack={onBack}>
       {/* Dark mode */}
@@ -1745,7 +1987,7 @@ export function AppearancePage({ onBack, color, setColor, opacity, setOpacity, c
           <div style={{ padding:14, display:"flex", gap:10, overflowX:"auto" }}>
             {/* Preset options */}
             {BG_OPTIONS.map(opt => (
-              <div key={opt.label} className="tap" onClick={() => setChatBg(opt.value)}
+              <div key={opt.label} className="tap" onClick={() => void handlePreset(opt.value)}
                 style={{ flexShrink:0, display:"flex", flexDirection:"column", alignItems:"center", gap:6 }}>
                 <div style={{
                   width:64, height:96, borderRadius:12,
@@ -1886,9 +2128,33 @@ export default function App() {
   const [devices, setDevices] = useState<Array<{ deviceId: string; label: string; active: boolean; kind: string }>>([]);
   const [profiles, setProfiles] = useState<AgentProfile[]>([]);
   const [historyMeta, setHistoryMeta] = useState<Record<string, boolean>>({});
+  const [membersRefreshVersions, setMembersRefreshVersions] = useState<Record<string, number>>({});
+  const [pinnedRoomIds, setPinnedRoomIds] = useState<Set<string>>(new Set());
+  const [pinnedStorageUserId, setPinnedStorageUserId] = useState<string | null>(null);
 
   useEffect(() => { document.documentElement.classList.toggle("dark", dark); localStorage.setItem("chuanhuatong_dark_mode", dark ? "1" : "0"); }, [dark]);
   useEffect(() => { void readChatBackgroundUrl().then(setChatBg); }, []);
+  useEffect(() => {
+    if (!state.me) {
+      setPinnedRoomIds(new Set());
+      setPinnedStorageUserId(null);
+      return;
+    }
+    try {
+      const stored = JSON.parse(localStorage.getItem(`chuanhuatong_pinned_rooms:${state.me.userId}`) ?? "[]");
+      setPinnedRoomIds(new Set(Array.isArray(stored) ? stored.filter(value => typeof value === "string") : []));
+    } catch {
+      setPinnedRoomIds(new Set());
+    }
+    setPinnedStorageUserId(state.me.userId);
+  }, [state.me]);
+  useEffect(() => {
+    if (!state.me || pinnedStorageUserId !== state.me.userId) return;
+    localStorage.setItem(
+      `chuanhuatong_pinned_rooms:${state.me.userId}`,
+      JSON.stringify([...pinnedRoomIds]),
+    );
+  }, [pinnedRoomIds, pinnedStorageUserId, state.me]);
   const setDark = useCallback((value: boolean) => setDarkState(value), []);
   const setBubColor = useCallback((value: string) => { applyBubbleColor(value); setBubColorState(value); }, []);
   const setBubOpacity = useCallback((value: number) => { applyBubbleOpacity(value); setBubOpacityState(value); }, []);
@@ -1903,6 +2169,15 @@ export default function App() {
       });
   }, [state.authStatus, state.profileVersion]);
 
+  const removePinnedRoom = useCallback((roomId: string) => {
+    setPinnedRoomIds(current => {
+      if (!current.has(roomId)) return current;
+      const next = new Set(current);
+      next.delete(roomId);
+      return next;
+    });
+  }, []);
+
   const handleWsEvent = useCallback((event: WsEvent) => {
     if (event.type === "connection.ready") {
       void refreshRooms();
@@ -1913,7 +2188,21 @@ export default function App() {
       dispatch({ type: "REPLACE_MESSAGE", roomId: event.roomId, message: event.payload });
     } else if (event.type === "room.deleted" && event.roomId) {
       dispatch({ type: "REMOVE_ROOM", roomId: event.roomId });
+      removePinnedRoom(event.roomId);
       if (view?.v === "chat" && view.room.id === event.roomId) setView(null);
+    } else if (event.type === "room.membership_removed" && event.roomId) {
+      const membershipEvent = event as RoomMembershipRemovedEvent;
+      if (membershipEvent.payload.userId === state.me?.userId) {
+        dispatch({ type: "REMOVE_ROOM", roomId: membershipEvent.roomId });
+        removePinnedRoom(membershipEvent.roomId);
+        if (view?.v === "chat" && view.room.id === membershipEvent.roomId) setView(null);
+      } else {
+        void refreshRooms();
+        setMembersRefreshVersions(current => ({
+          ...current,
+          [membershipEvent.roomId]: (current[membershipEvent.roomId] ?? 0) + 1,
+        }));
+      }
     } else if (event.type === "profile.updated") {
       const profileEvent = event as ProfileUpdatedEvent;
       if (profileEvent.payload.profileType === "human" && profileEvent.payload.ownerUserId === state.me?.userId) {
@@ -1921,7 +2210,7 @@ export default function App() {
       }
       dispatch({ type: "PROFILE_UPDATED" });
     }
-  }, [dispatch, loadMessagesAfter, refreshRooms, state.lastSeqs, state.me?.userId, state.rooms, view]);
+  }, [dispatch, loadMessagesAfter, refreshRooms, removePinnedRoom, state.lastSeqs, state.me?.userId, state.rooms, view]);
 
   useRealtimeWS(handleWsEvent, status => dispatch({ type: "SET_WS_STATUS", status }), state.authStatus === "authenticated");
 
@@ -1944,6 +2233,23 @@ export default function App() {
   const push = (next: View) => setView(next);
   const pop = () => setView(null);
 
+  const togglePinnedRoom = useCallback((roomId: string) => {
+    if (!state.me) return;
+    setPinnedRoomIds(current => {
+      const next = new Set(current);
+      if (next.has(roomId)) next.delete(roomId); else next.add(roomId);
+      return next;
+    });
+  }, [state.me]);
+
+  const exitRoomFromList = useCallback(async (room: Room) => {
+    if (!state.me) return;
+    if (room.ownerUserId === state.me.userId) await deleteRoom(room.id);
+    else await leaveRoom(room.id);
+    dispatch({ type: "REMOVE_ROOM", roomId: room.id });
+    removePinnedRoom(room.id);
+  }, [dispatch, removePinnedRoom, state.me]);
+
   const joinWorldRoom = useCallback(async (room: Room, inviteToken?: string | null) => {
     const token = inviteToken ?? (await getWorldRoom(room.id)).inviteToken;
     await acceptInvite(token);
@@ -1963,9 +2269,19 @@ export default function App() {
       const backendMessages = state.messages[view.room.id] ?? [];
       const byId = new Map(backendMessages.map(message => [message.id, message]));
       const messages = backendMessages.map(message => toUiMessage(message, state.me!.userId, message.replyToMessageId ? byId.get(message.replyToMessageId) : undefined));
-      return <Chat room={view.room} onBack={pop} bubColor={bubColor} bubOpacity={bubOpacity} chatBg={chatBg}
-        canDelete={view.room.owner === state.me!.userId}
+      return <Chat key={view.room.id} room={view.room} onBack={pop} bubColor={bubColor} bubOpacity={bubOpacity} chatBg={chatBg}
+        currentUserId={state.me!.userId}
+        canDelete={view.room.ownerUserId === state.me!.userId}
+        canManageMembers={view.room.ownerUserId === state.me!.userId}
+        membersRefreshVersion={membersRefreshVersions[view.room.id] ?? 0}
         onDelete={async () => { await deleteRoom(view.room.id); dispatch({ type: "REMOVE_ROOM", roomId: view.room.id }); pop(); }}
+        onRemoveMember={async userId => {
+          await removeRoomMember(view.room.id, userId);
+          await refreshRooms();
+          setView(current => current?.v === "chat" && current.room.id === view.room.id
+            ? { ...current, room: { ...current.room, members: Math.max(0, current.room.members - 1) } }
+            : current);
+        }}
         hasMoreBefore={historyMeta[view.room.id] ?? false}
         onLoadOlder={async () => {
           const oldest = state.messages[view.room.id]?.[0]?.seq;
@@ -2019,7 +2335,10 @@ export default function App() {
       <div style={{ width:"100%", maxWidth:480, display:"flex", flexDirection:"column", position:"relative", overflow:"hidden", background:"var(--grouped)" }}>
         <div style={{ flex:1, position:"relative", overflow:"hidden" }}>
           {tab === "world" && <World rooms={worldRooms} onJoined={joinWorldRoom} joined={joinedWorld} onSheetOpenChange={setWorldSheetOpen}/>}
-          {tab === "rooms" && <Rooms rooms={uiRooms} onRoom={room => push({v:"chat", room})} onShareSheet={() => setShareOpen(true)}/>}
+          {tab === "rooms" && <Rooms rooms={uiRooms} currentUserId={state.me!.userId}
+            pinnedRoomIds={pinnedRoomIds} onRoom={room => push({v:"chat", room})}
+            onShareSheet={() => setShareOpen(true)} onTogglePin={togglePinnedRoom}
+            onExit={exitRoomFromList}/>}
           {tab === "me" && <Me user={state.me!} deviceCount={devices.filter(device => device.kind !== "web").length} activeAgentCount={profiles.length} onView={push} onLogout={() => void logout()}/>}
           {renderView()}
           {shareOpen && <ShareSheet rooms={ownedRooms} onClose={() => setShareOpen(false)} onToggle={toggleWorldPublished}/>}

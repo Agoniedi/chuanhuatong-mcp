@@ -345,6 +345,165 @@ describe('PostgreSQL group chat storage', () => {
   );
 
   it(
+    'removes memberships and member-owned room bindings transactionally',
+    { skip: !process.env.TEST_DATABASE_URL },
+    async () => {
+      const baseUrl = process.env.TEST_DATABASE_URL;
+      const schema = `chuanhuatong_test_${randomBytes(8).toString('hex')}`;
+      const admin = new pg.Pool({ connectionString: baseUrl });
+      await admin.query(`CREATE SCHEMA "${schema}"`);
+
+      const isolatedUrl = new URL(baseUrl);
+      isolatedUrl.searchParams.set('options', `-csearch_path=${schema}`);
+      let store;
+      try {
+        store = await PostgresGroupChatStore.connect({
+          connectionString: isolatedUrl.toString(),
+          migrate: true,
+          logger: { info() {} },
+        });
+        const owner = await store.createGuestSession({
+          deviceId: 'postgres-membership-owner-device',
+          displayName: 'Postgres Membership Owner',
+        });
+        const member = await store.createGuestSession({
+          deviceId: 'postgres-membership-member-device',
+          displayName: 'Postgres Membership Member',
+        });
+        const memberUser = await store.authenticate(member.accessToken);
+        const room = await store.createRoom({
+          userId: owner.user.userId,
+          title: 'Membership lifecycle room',
+          key: 'postgres-membership-room',
+          requestFingerprint: 'postgres-membership-room-fingerprint',
+        });
+        const invite = await store.createInvite({
+          userId: owner.user.userId,
+          roomId: room.body.id,
+          expectedRoomRevision: room.body.revision,
+          expiresAt: new Date(Date.now() + 60 * 60 * 1000).toISOString(),
+          maxUses: 2,
+          key: 'postgres-membership-invite',
+          requestFingerprint: 'postgres-membership-invite-fingerprint',
+        });
+        await store.acceptInvite({
+          userId: member.user.userId,
+          inviteToken: invite.body.inviteToken,
+          key: 'postgres-membership-join',
+          requestFingerprint: 'postgres-membership-join-fingerprint',
+        });
+        const profile = await store.createAgentProfile({
+          userId: member.user.userId,
+          displayName: 'Leaving member agent',
+          avatarResourceId: null,
+          shortBio: '',
+          key: 'postgres-membership-agent',
+          requestFingerprint: 'postgres-membership-agent-fingerprint',
+        });
+        const binding = await store.putMyRoomAgentBinding({
+          userId: member.user.userId,
+          roomId: room.body.id,
+          agentProfileId: profile.body.id,
+          participationMode: 'manual',
+          publishMode: 'reviewRequired',
+          triggerScope: 'mentionsOnly',
+          preferredRuntimeDeviceId: null,
+          generationLimitPer24h: 20,
+          expectedPolicyRevision: null,
+          key: 'postgres-membership-binding',
+          requestFingerprint: 'postgres-membership-binding-fingerprint',
+        });
+        const trigger = await store.createHumanMessage({
+          user: memberUser,
+          roomId: room.body.id,
+          clientMessageId: 'postgres-membership-trigger',
+          text: 'Cancel this generation request when the member leaves.',
+          mentions: [],
+          replyToMessageId: null,
+          key: 'postgres-membership-trigger',
+          requestFingerprint: 'postgres-membership-trigger-fingerprint',
+        });
+        const generation = await store.createManualGenerationRequest({
+          user: memberUser,
+          roomId: room.body.id,
+          clientGenerationRequestId: 'postgres-membership-generation',
+          triggerMessageIds: [trigger.body.id],
+          expectedBindingPolicyRevision: binding.body.policyRevision,
+          key: 'postgres-membership-generation',
+          requestFingerprint: 'postgres-membership-generation-fingerprint',
+        });
+        await store.pool.query(
+          `UPDATE generation_requests
+              SET status = 'claimed', claimed_device_id = $1, lease_id = $2,
+                  lease_expires_at = $3, draft_device_id = $1
+            WHERE id = $4`,
+          [
+            memberUser.deviceId,
+            'postgres-membership-lease',
+            new Date(Date.now() + 60_000),
+            generation.body.id,
+          ],
+        );
+
+        await store.leaveRoom({ userId: member.user.userId, roomId: room.body.id });
+        await store.leaveRoom({ userId: member.user.userId, roomId: room.body.id });
+        assert.deepEqual(await store.listRooms(member.user.userId), []);
+        const cancelled = await store.getGenerationRequest({
+          userId: member.user.userId,
+          generationRequestId: generation.body.id,
+        });
+        assert.equal(cancelled.status, 'cancelled');
+        assert.equal(cancelled.requestVersion, 2);
+        assert.equal('claimedDeviceId' in cancelled, false);
+        assert.equal('leaseId' in cancelled, false);
+        assert.equal('leaseExpiresAt' in cancelled, false);
+        assert.equal('draftDeviceId' in cancelled, false);
+        assert.deepEqual(
+          (await store.listRoomAgentBindings({
+            userId: owner.user.userId,
+            roomId: room.body.id,
+          })).items,
+          [],
+        );
+        await assert.rejects(
+          store.leaveRoom({ userId: owner.user.userId, roomId: room.body.id }),
+          (error) => error.status === 409 && error.code === 'room_owner_cannot_leave',
+        );
+
+        await store.acceptInvite({
+          userId: member.user.userId,
+          inviteToken: invite.body.inviteToken,
+          key: 'postgres-membership-rejoin',
+          requestFingerprint: 'postgres-membership-rejoin-fingerprint',
+        });
+        await store.removeRoomMember({
+          userId: owner.user.userId,
+          roomId: room.body.id,
+          targetUserId: member.user.userId,
+        });
+        await store.removeRoomMember({
+          userId: owner.user.userId,
+          roomId: room.body.id,
+          targetUserId: member.user.userId,
+        });
+        await assert.rejects(
+          store.removeRoomMember({
+            userId: member.user.userId,
+            roomId: room.body.id,
+            targetUserId: owner.user.userId,
+          }),
+          (error) => error.status === 403 && error.code === 'forbidden',
+        );
+        assert.deepEqual(await store.listRooms(member.user.userId), []);
+      } finally {
+        await store?.close().catch(() => {});
+        await admin.query(`DROP SCHEMA "${schema}" CASCADE`);
+        await admin.end();
+      }
+    },
+  );
+
+  it(
     'persists identity, rooms, messages, agent bindings, idempotency, and outbox',
     { skip: !process.env.TEST_DATABASE_URL },
     async () => {

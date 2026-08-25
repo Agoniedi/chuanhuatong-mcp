@@ -200,6 +200,8 @@ describe('local group chat REST loop', () => {
     await mkdir(assets);
     await writeFile(join(frontendDist, 'index.html'), '<main>read-only web</main>', 'utf8');
     await writeFile(join(assets, 'app.js'), 'globalThis.loaded = true;', 'utf8');
+    await writeFile(join(frontendDist, 'sw.js'), 'self.skipWaiting();', 'utf8');
+    await writeFile(join(frontendDist, 'manifest.webmanifest'), '{"name":"test"}', 'utf8');
     const isolated = await startIsolatedServer({
       store: new MemoryGroupChatStore(),
       frontendDist: `${frontendDist}${sep}`,
@@ -216,7 +218,15 @@ describe('local group chat REST loop', () => {
 
       const asset = await fetch(`${isolated.baseUrl}/assets/app.js`);
       assert.equal(asset.headers.get('content-type'), 'application/javascript; charset=utf-8');
+      assert.equal(asset.headers.get('cache-control'), 'public, max-age=31536000, immutable');
       assert.equal(await asset.text(), 'globalThis.loaded = true;');
+
+      const serviceWorker = await fetch(`${isolated.baseUrl}/sw.js`);
+      assert.equal(serviceWorker.headers.get('cache-control'), 'no-cache');
+
+      const manifest = await fetch(`${isolated.baseUrl}/manifest.webmanifest`);
+      assert.equal(manifest.headers.get('content-type'), 'application/manifest+json; charset=utf-8');
+      assert.equal(manifest.headers.get('cache-control'), 'no-cache');
     } finally {
       await isolated.server.shutdown();
       await rm(frontendDist, { recursive: true, force: true });
@@ -866,6 +876,89 @@ describe('local group chat REST loop', () => {
       await closeRealtime(socket);
       await realtimeServer.shutdown();
     }
+  });
+
+  it('lets members leave and lets only the room owner remove another member', async () => {
+    const aliceAuth = { Authorization: `Bearer ${users.alice.accessToken}` };
+    const bobAuth = { Authorization: `Bearer ${users.bob.accessToken}` };
+    const charlieAuth = { Authorization: `Bearer ${users.charlie.accessToken}` };
+    const room = await json('/v1/rooms', 'POST', { title: 'Membership removal room' }, {
+      ...aliceAuth,
+      'Idempotency-Key': 'membership-removal-room',
+    });
+    const invite = await json(`/v1/rooms/${room.body.id}/invites`, 'POST', {
+      expectedRoomRevision: room.body.revision,
+      expiresAt: new Date(Date.now() + 60 * 60 * 1000).toISOString(),
+      maxUses: 2,
+    }, {
+      ...aliceAuth,
+      'Idempotency-Key': 'membership-removal-invite',
+    });
+    await json('/v1/invites/accept', 'POST', { inviteToken: invite.body.inviteToken }, {
+      ...bobAuth,
+      'Operation-Id': 'membership-removal-join-bob',
+    });
+
+    const forbidden = await request(
+      `/v1/rooms/${room.body.id}/members/${users.bob.user.userId}`,
+      { method: 'DELETE', headers: charlieAuth },
+    );
+    assert.equal(forbidden.response.status, 403);
+
+    const aliceSocket = await openRealtime(users.alice.accessToken);
+    const bobSocket = await openRealtime(users.bob.accessToken);
+    try {
+      const aliceEvent = waitForRealtimeEvent(aliceSocket, 'room.membership_removed');
+      const bobEvent = waitForRealtimeEvent(bobSocket, 'room.membership_removed');
+      const removed = await request(
+        `/v1/rooms/${room.body.id}/members/${users.bob.user.userId}`,
+        { method: 'DELETE', headers: aliceAuth },
+      );
+      assert.equal(removed.response.status, 204);
+      const [forAlice, forBob] = await Promise.all([aliceEvent, bobEvent]);
+      assert.deepEqual(forAlice.payload, { userId: users.bob.user.userId });
+      assert.deepEqual(forBob.payload, { userId: users.bob.user.userId });
+    } finally {
+      await Promise.all([closeRealtime(aliceSocket), closeRealtime(bobSocket)]);
+    }
+    const repeatedRemoval = await request(
+      `/v1/rooms/${room.body.id}/members/${users.bob.user.userId}`,
+      { method: 'DELETE', headers: aliceAuth },
+    );
+    assert.equal(repeatedRemoval.response.status, 204);
+    assert.equal((await request(`/v1/rooms/${room.body.id}`, {
+      headers: bobAuth,
+    })).response.status, 403);
+
+    const roomAfterRemoval = await request(`/v1/rooms/${room.body.id}`, { headers: aliceAuth });
+    const secondInvite = await json(`/v1/rooms/${room.body.id}/invites`, 'POST', {
+      expectedRoomRevision: roomAfterRemoval.body.revision,
+      expiresAt: new Date(Date.now() + 60 * 60 * 1000).toISOString(),
+      maxUses: 1,
+    }, {
+      ...aliceAuth,
+      'Idempotency-Key': 'membership-removal-second-invite',
+    });
+    await json('/v1/invites/accept', 'POST', { inviteToken: secondInvite.body.inviteToken }, {
+      ...bobAuth,
+      'Operation-Id': 'membership-removal-rejoin-bob',
+    });
+    const left = await request(`/v1/rooms/${room.body.id}/members/me`, {
+      method: 'DELETE',
+      headers: bobAuth,
+    });
+    assert.equal(left.response.status, 204);
+    const repeatedLeave = await request(`/v1/rooms/${room.body.id}/members/me`, {
+      method: 'DELETE',
+      headers: bobAuth,
+    });
+    assert.equal(repeatedLeave.response.status, 204);
+    const ownerLeave = await request(`/v1/rooms/${room.body.id}/members/me`, {
+      method: 'DELETE',
+      headers: aliceAuth,
+    });
+    assert.equal(ownerLeave.response.status, 409);
+    assert.equal(ownerLeave.body.error.code, 'room_owner_cannot_leave');
   });
 
   it('keeps generation pagination valid when the cursor item changes status', async () => {
@@ -1586,6 +1679,147 @@ describe('local group chat REST loop', () => {
       headers: { Authorization: `Bearer ${users.bob.accessToken}` },
     });
     assert.equal(forbidden.response.status, 403);
+  });
+
+  it('cancels open generation requests when their binding, profile, or membership is deleted', async () => {
+    const bindingFixture = await createManualGenerationFixture('generation-delete-binding', {
+      ready: false,
+    });
+    const bindingDeleted = await request(
+      `/v1/rooms/${bindingFixture.room.id}/my-agent?expectedPolicyRevision=${bindingFixture.binding.policyRevision}`,
+      {
+        method: 'DELETE',
+        headers: { ...bindingFixture.auth, 'Operation-Id': 'generation-delete-binding' },
+      },
+    );
+    assert.equal(bindingDeleted.response.status, 204);
+    const afterBindingDelete = await request(
+      `/v1/generation-requests/${bindingFixture.generation.id}`,
+      { headers: bindingFixture.auth },
+    );
+    assert.equal(afterBindingDelete.body.status, 'cancelled');
+    assert.equal(afterBindingDelete.body.requestVersion, 2);
+
+    const profileFixture = await createManualGenerationFixture('generation-delete-profile', {
+      ready: false,
+    });
+    const profileDeleted = await request(`/v1/agent-profiles/${profileFixture.profile.id}`, {
+      method: 'DELETE',
+      headers: profileFixture.auth,
+    });
+    assert.equal(profileDeleted.response.status, 204);
+    const afterProfileDelete = await request(
+      `/v1/generation-requests/${profileFixture.generation.id}`,
+      { headers: profileFixture.auth },
+    );
+    assert.equal(afterProfileDelete.body.status, 'cancelled');
+    assert.equal(afterProfileDelete.body.requestVersion, 2);
+
+    const membershipStore = new MemoryGroupChatStore();
+    const owner = await membershipStore.createGuestSession({
+      deviceId: 'generation-membership-owner-device',
+      displayName: 'Generation Membership Owner',
+    });
+    const member = await membershipStore.createGuestSession({
+      deviceId: 'generation-membership-member-device',
+      displayName: 'Generation Membership Member',
+    });
+    const memberUser = await membershipStore.authenticate(member.accessToken);
+    const room = await membershipStore.createRoom({
+      userId: owner.user.userId,
+      title: 'Generation membership room',
+      key: 'generation-membership-room',
+      requestFingerprint: 'generation-membership-room-fingerprint',
+    });
+    const invite = await membershipStore.createInvite({
+      userId: owner.user.userId,
+      roomId: room.body.id,
+      expectedRoomRevision: room.body.revision,
+      expiresAt: new Date(Date.now() + 60 * 60 * 1000).toISOString(),
+      maxUses: 1,
+      key: 'generation-membership-invite',
+      requestFingerprint: 'generation-membership-invite-fingerprint',
+    });
+    await membershipStore.acceptInvite({
+      userId: member.user.userId,
+      inviteToken: invite.body.inviteToken,
+      key: 'generation-membership-join',
+      requestFingerprint: 'generation-membership-join-fingerprint',
+    });
+    const profile = await membershipStore.createAgentProfile({
+      userId: member.user.userId,
+      displayName: 'Generation Membership Agent',
+      avatarResourceId: null,
+      shortBio: '',
+      key: 'generation-membership-profile',
+      requestFingerprint: 'generation-membership-profile-fingerprint',
+    });
+    const binding = await membershipStore.putMyRoomAgentBinding({
+      userId: member.user.userId,
+      roomId: room.body.id,
+      agentProfileId: profile.body.id,
+      participationMode: 'manual',
+      publishMode: 'reviewRequired',
+      triggerScope: 'mentionsOnly',
+      preferredRuntimeDeviceId: null,
+      generationLimitPer24h: 20,
+      expectedPolicyRevision: null,
+      key: 'generation-membership-binding',
+      requestFingerprint: 'generation-membership-binding-fingerprint',
+    });
+    const trigger = await membershipStore.createHumanMessage({
+      user: memberUser,
+      roomId: room.body.id,
+      clientMessageId: 'generation-membership-trigger',
+      text: 'Cancel this request when I leave.',
+      mentions: [],
+      replyToMessageId: null,
+      key: 'generation-membership-trigger',
+      requestFingerprint: 'generation-membership-trigger-fingerprint',
+    });
+    const generation = await membershipStore.createManualGenerationRequest({
+      user: memberUser,
+      roomId: room.body.id,
+      clientGenerationRequestId: 'generation-membership-request',
+      triggerMessageIds: [trigger.body.id],
+      expectedBindingPolicyRevision: binding.body.policyRevision,
+      key: 'generation-membership-request',
+      requestFingerprint: 'generation-membership-request-fingerprint',
+    });
+    const terminalGeneration = await membershipStore.createManualGenerationRequest({
+      user: memberUser,
+      roomId: room.body.id,
+      clientGenerationRequestId: 'generation-membership-terminal',
+      triggerMessageIds: [trigger.body.id],
+      expectedBindingPolicyRevision: binding.body.policyRevision,
+      key: 'generation-membership-terminal',
+      requestFingerprint: 'generation-membership-terminal-fingerprint',
+    });
+    membershipStore.generationRequests.get(terminalGeneration.body.id).status = 'failed';
+    const activeRequest = membershipStore.generationRequests.get(generation.body.id);
+    activeRequest.status = 'claimed';
+    activeRequest.claimedDeviceId = memberUser.deviceId;
+    activeRequest.leaseId = 'membership-lease';
+    activeRequest.leaseExpiresAt = new Date(Date.now() + 60_000).toISOString();
+    activeRequest.draftDeviceId = memberUser.deviceId;
+
+    await membershipStore.leaveRoom({ userId: member.user.userId, roomId: room.body.id });
+    const afterLeave = await membershipStore.getGenerationRequest({
+      userId: member.user.userId,
+      generationRequestId: generation.body.id,
+    });
+    assert.equal(afterLeave.status, 'cancelled');
+    assert.equal(afterLeave.requestVersion, 2);
+    assert.equal('claimedDeviceId' in afterLeave, false);
+    assert.equal('leaseId' in afterLeave, false);
+    assert.equal('leaseExpiresAt' in afterLeave, false);
+    assert.equal('draftDeviceId' in afterLeave, false);
+    const terminalAfterLeave = await membershipStore.getGenerationRequest({
+      userId: member.user.userId,
+      generationRequestId: terminalGeneration.body.id,
+    });
+    assert.equal(terminalAfterLeave.status, 'failed');
+    assert.equal(terminalAfterLeave.requestVersion, 1);
   });
 
   it('claims, starts, reviews, and publishes one immutable agent message', async () => {

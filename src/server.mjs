@@ -37,6 +37,7 @@ const STATIC_MIME_TYPES = new Map([
   ['.json', 'application/json; charset=utf-8'],
   ['.png', 'image/png'],
   ['.svg', 'image/svg+xml; charset=utf-8'],
+  ['.webmanifest', 'application/manifest+json; charset=utf-8'],
   ['.webp', 'image/webp'],
 ]);
 const USERNAME_PATTERN = /^[A-Za-z0-9_]{3,32}$/;
@@ -408,6 +409,9 @@ function isAllowedWebMutation(method, path) {
     return true;
   }
   if (method === 'DELETE' && /^\/v1\/rooms\/[^/]+$/.test(path)) return true;
+  if (method === 'DELETE' && /^\/v1\/rooms\/[^/]+\/members\/[^/]+$/.test(path)) {
+    return true;
+  }
   if (method === 'PUT' && /^\/v1\/rooms\/[^/]+\/world$/.test(path)) return true;
   if (method === 'PATCH' && path === '/v1/me') return true;
   if (['PATCH', 'DELETE'].includes(method) && /^\/v1\/agent-profiles\/[^/]+$/.test(path)) {
@@ -442,7 +446,9 @@ async function serveFrontend(
     'content-type',
     STATIC_MIME_TYPES.get(extname(filePath).toLowerCase()) ?? 'application/octet-stream',
   );
-  response.setHeader('cache-control', filePath === frontendIndex
+  const requiresRevalidation = filePath === frontendIndex ||
+    path === '/sw.js' || path === '/manifest.webmanifest';
+  response.setHeader('cache-control', requiresRevalidation
     ? 'no-cache'
     : 'public, max-age=31536000, immutable');
   if (request.method === 'HEAD') {
@@ -562,6 +568,9 @@ function attachRealtimeServer(server, store, logger, pollIntervalMs) {
           } else if (event.type === 'room.deleted') {
             recipientUserIds = event.payload.recipientUserIds;
             publicEvent = { ...event, payload: { roomId: event.roomId } };
+          } else if (event.type === 'room.membership_removed') {
+            recipientUserIds = event.payload.recipientUserIds;
+            publicEvent = { ...event, payload: { userId: event.payload.userId } };
           } else if (event.type === 'profile.updated') {
             recipientUserIds = await store.listProfileRecipientUserIds(
               event.payload.ownerUserId,
@@ -1576,6 +1585,24 @@ async function handleRequest(
     });
     wakeOutbox();
     write(result.status, result.body);
+    return;
+  }
+
+  const roomMemberRemovalMatch = path.match(/^\/v1\/rooms\/([^/]+)\/members\/([^/]+)$/);
+  if (request.method === 'DELETE' && roomMemberRemovalMatch) {
+    const roomId = parsePathSegment(roomMemberRemovalMatch[1]);
+    const target = parsePathSegment(roomMemberRemovalMatch[2]);
+    if (target === 'me') {
+      await store.leaveRoom({ userId: user.userId, roomId });
+    } else {
+      await store.removeRoomMember({
+        userId: user.userId,
+        roomId,
+        targetUserId: target,
+      });
+    }
+    wakeOutbox();
+    write(204);
     return;
   }
 

@@ -156,6 +156,12 @@ describe('MCP identity and optional Web account', () => {
       body: JSON.stringify({ readSeq: 0 }),
     });
     assert.equal(markedRead.response.status, 200);
+    const ownerLeave = await request(`/v1/rooms/${bearerRoomWrite.body.id}/members/me`, {
+      method: 'DELETE',
+      headers: { Cookie: cookie },
+    });
+    assert.equal(ownerLeave.response.status, 409);
+    assert.equal(ownerLeave.body.error.code, 'room_owner_cannot_leave');
 
     const cookieAgent = await request('/v1/agent-profiles', {
       method: 'POST',

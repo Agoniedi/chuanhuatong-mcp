@@ -29,7 +29,7 @@ SPA 路由回退到 `index.html`。
 
 ---
 
-## 当前实现（2026-08-21）
+## 当前实现（2026-08-25）
 
 ### 后端与认证
 
@@ -44,11 +44,12 @@ SPA 路由回退到 `index.html`。
 
 ### Web 前端
 
-- Vite 8 + React 19 + TypeScript + react-router-dom 7。
-- 6 个页面：AuthPage、RoomListPage、RoomPage、JoinPage、WorldPage、SettingsPage。
+- Vite 8 + React 19 + TypeScript；生产入口由单个 `App` 壳层承载，`BrowserRouter` 仍作为入口包装。
+- `src/pages/` 中保留的旧页面组件当前未接入生产入口；修改线上界面时以 `frontend/src/App.tsx` 为准。
 - 全局状态使用 React Context + useReducer；一个 WebSocket 连接覆盖全部房间。
 - 消息按 `seq` 升序，REST 初始加载和 WS 推送按 `message.id` 去重。
 - 支持亮色、暗色和系统主题，以及用户气泡颜色与透明度设置。
+- 房间列表支持本地置顶、主动退出/房主解散；房主可在成员面板移出成员。
 - 前端只调用 REST `/v1/*` 和 WebSocket，不直接调用 `/mcp`。
 
 ### 已完成阶段
@@ -61,10 +62,10 @@ SPA 路由回退到 `index.html`。
 
 ### 验证基线
 
-- `npm.cmd test`：73 项，默认内存模式 66 pass、0 fail、7 skip；配置独立
-  `TEST_DATABASE_URL` 后 73 pass、0 fail、0 skip。
+- `npm.cmd test`：77 项，默认内存模式 69 pass、0 fail、8 skip；配置独立
+  `TEST_DATABASE_URL` 后 77 pass、0 fail、0 skip。
 - `npm.cmd run check`：通过。
-- `npm.cmd test --prefix frontend`：5 个测试文件、13 项测试通过。
+- `npm.cmd test --prefix frontend`：7 个测试文件、24 项测试通过。
 - `npm.cmd run lint --prefix frontend`：通过。
 - `npm.cmd run test:e2e --prefix frontend`：Playwright E2E 通过。
 - PostgreSQL 17 Compose 烟测：迁移 001-010、同源 SPA 回退、建房、消息写读和删房均通过。
@@ -84,6 +85,8 @@ SPA 路由回退到 `index.html`。
 | `/v1/auth/reset-password` | POST | 重置码 | 无 | 使用 MCP 签发的重置码设置新密码 |
 | `/v1/me` | GET/PATCH | Session | 无 | 获取或修改当前用户资料 |
 | `/v1/invites/preview?token=X` | GET | Session | 无 | 邀请预览 |
+| `/v1/rooms/:roomId/members/me` | DELETE | Session | 无 | 主动退出房间，重复调用返回 204 |
+| `/v1/rooms/:roomId/members/:userId` | DELETE | Session | 无 | 房主移出成员，重复调用返回 204 |
 
 `PUBLIC_REGISTRATION=0` 默认关闭 Web 账号绑定；`TRUST_PROXY=0` 默认不信任
 `X-Forwarded-For`。只在受控反向代理后启用 `TRUST_PROXY=1`。
@@ -92,11 +95,12 @@ SPA 路由回退到 `index.html`。
 
 | 文件 | 行数 | 说明 |
 |------|------|------|
-| `src/server.mjs` | ~1821 | HTTP、REST、静态托管与 WebSocket |
-| `src/group_chat_store.mjs` | ~6112 | MemoryStore + PostgresStore |
-| `frontend/src/store/AppContext.tsx` | ~99 | 全局状态协调 |
+| `src/server.mjs` | ~1955 | HTTP、REST、静态托管与 WebSocket |
+| `src/group_chat_store.mjs` | ~6590 | MemoryStore + PostgresStore |
+| `frontend/src/App.tsx` | ~2350 | 当前生产 Web UI 壳层与页面交互 |
+| `frontend/src/store/AppContext.tsx` | ~111 | 全局状态协调 |
 | `frontend/src/store/reducer.ts` | — | 状态 reducer 与消息去重 |
-| `frontend/src/ws/useRealtimeWS.ts` | ~60 | WebSocket 连接管理 |
+| `frontend/src/ws/useRealtimeWS.ts` | ~75 | WebSocket 连接管理 |
 | `docs/development-report.md` | — | 当前实现与验证报告 |
 
 ---

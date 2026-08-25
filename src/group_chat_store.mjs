@@ -21,6 +21,13 @@ const REGENERATABLE_GENERATION_STATUSES = new Set([
   'cancelled',
   'expired',
 ]);
+const OPEN_GENERATION_STATUSES = new Set([
+  'queued',
+  'claimed',
+  'generating',
+  'review_pending',
+  'execution_uncertain',
+]);
 
 function newId(prefix) {
   return `${prefix}_${randomBytes(12).toString('base64url')}`;
@@ -523,6 +530,23 @@ export class MemoryGroupChatStore {
       throw new HttpError(404, 'resource_not_found', 'Generation request not found');
     }
     return request;
+  }
+
+  _cancelGenerationRequestsForBindings(bindingIds) {
+    if (bindingIds.size === 0) return;
+    const updatedAt = this.clock().toISOString();
+    for (const request of this.generationRequests.values()) {
+      if (!bindingIds.has(request.bindingId) || !OPEN_GENERATION_STATUSES.has(request.status)) {
+        continue;
+      }
+      request.status = 'cancelled';
+      request.requestVersion += 1;
+      request.claimedDeviceId = null;
+      request.leaseId = null;
+      request.leaseExpiresAt = null;
+      request.draftDeviceId = null;
+      request.updatedAt = updatedAt;
+    }
   }
 
   _rememberDevice(userId, deviceId, kind, label) {
@@ -1081,8 +1105,15 @@ export class MemoryGroupChatStore {
     if (profile.ownerUserId !== userId) {
       throw new HttpError(403, 'forbidden', 'Agent profile owner required');
     }
-    for (const [bindingKey, binding] of this.roomAgentBindings) {
-      if (binding.agentProfileId === agentProfileId) this.roomAgentBindings.delete(bindingKey);
+    const bindings = [...this.roomAgentBindings.entries()].filter(
+      ([, binding]) => binding.agentProfileId === agentProfileId,
+    );
+    this._cancelGenerationRequestsForBindings(new Set(bindings.map(([, binding]) => binding.id)));
+    for (const [bindingKey, binding] of bindings) {
+      this.roomAgentBindings.delete(bindingKey);
+      for (const [runtimeKey, runtime] of this.agentRuntimes) {
+        if (runtime.bindingId === binding.id) this.agentRuntimes.delete(runtimeKey);
+      }
     }
     this.agentProfiles.delete(agentProfileId);
     return { status: 204 };
@@ -1153,12 +1184,12 @@ export class MemoryGroupChatStore {
   }
 
   async updateWorldRoom({ userId, roomId, published, summary, key, requestFingerprint }) {
-    const replay = this._replay(userId, 'updateWorldRoom', key, requestFingerprint);
-    if (replay.response) return replay.response;
     const room = this._room(roomId);
     if (room.ownerUserId !== userId) {
       throw new HttpError(403, 'forbidden', 'Room owner required');
     }
+    const replay = this._replay(userId, 'updateWorldRoom', key, requestFingerprint);
+    if (replay.response) return replay.response;
     const now = this.clock();
     if (!published) {
       const invite = room.worldInviteId ? this.invites.get(room.worldInviteId) : null;
@@ -1249,6 +1280,56 @@ export class MemoryGroupChatStore {
       occurredAt: this.clock().toISOString(),
       dispatchedAt: null,
     });
+  }
+
+  _removeRoomMember(room, targetUserId) {
+    const recipientUserIds = [...room.members.keys()];
+    const bindingKey = this._bindingKey(room.id, targetUserId);
+    const binding = this.roomAgentBindings.get(bindingKey);
+    room.members.delete(targetUserId);
+    room.revision += 1;
+    room.updatedAt = this.clock().toISOString();
+    this.webRoomReads.delete(`${targetUserId}:${room.id}`);
+    if (binding) {
+      this._cancelGenerationRequestsForBindings(new Set([binding.id]));
+      this.roomAgentBindings.delete(bindingKey);
+      for (const [runtimeKey, runtime] of this.agentRuntimes) {
+        if (runtime.bindingId === binding.id) this.agentRuntimes.delete(runtimeKey);
+      }
+    }
+    this.outbox.push({
+      id: String(this.nextOutboxId++),
+      eventId: newId('evt'),
+      type: 'room.membership_removed',
+      roomId: room.id,
+      payload: { userId: targetUserId, recipientUserIds },
+      occurredAt: this.clock().toISOString(),
+      dispatchedAt: null,
+    });
+  }
+
+  async leaveRoom({ userId, roomId }) {
+    const room = this._room(roomId);
+    const membership = room.members.get(userId);
+    if (!membership) return;
+    if (membership.role === 'owner') {
+      throw new HttpError(409, 'room_owner_cannot_leave', 'Room owner must delete the room');
+    }
+    this._removeRoomMember(room, userId);
+  }
+
+  async removeRoomMember({ userId, roomId, targetUserId }) {
+    const room = this._room(roomId);
+    // Product contract keeps member removal owner-only; admins manage invitations only.
+    if (room.ownerUserId !== userId) {
+      throw new HttpError(403, 'forbidden', 'Room owner required');
+    }
+    const membership = room.members.get(targetUserId);
+    if (!membership) return;
+    if (membership.role === 'owner') {
+      throw new HttpError(409, 'room_owner_cannot_be_removed', 'Room owner cannot be removed');
+    }
+    this._removeRoomMember(room, targetUserId);
   }
 
   async getMembership({ userId, roomId }) {
@@ -1400,7 +1481,11 @@ export class MemoryGroupChatStore {
     if (expectedPolicyRevision !== binding.policyRevision) {
       throw new HttpError(409, 'request_version_conflict', 'Binding revision does not match');
     }
+    this._cancelGenerationRequestsForBindings(new Set([binding.id]));
     this.roomAgentBindings.delete(bindingKey);
+    for (const [runtimeKey, runtime] of this.agentRuntimes) {
+      if (runtime.bindingId === binding.id) this.agentRuntimes.delete(runtimeKey);
+    }
     this._saveReplay(replay.recordKey, requestFingerprint, 204, null);
     return { status: 204, body: null };
   }
@@ -2917,6 +3002,18 @@ export class PostgresGroupChatStore {
     }
   }
 
+  async _cancelGenerationRequestsForBindings(client, bindingIds) {
+    if (bindingIds.length === 0) return;
+    await client.query(
+      `UPDATE generation_requests
+          SET status = 'cancelled', request_version = request_version + 1,
+              claimed_device_id = NULL, lease_id = NULL, lease_expires_at = NULL,
+              draft_device_id = NULL, updated_at = $1
+        WHERE binding_id = ANY($2::text[]) AND status = ANY($3::text[])`,
+      [this.clock(), bindingIds, [...OPEN_GENERATION_STATUSES]],
+    );
+  }
+
   async _replay(client, principalId, operation, key, requestFingerprint) {
     await client.query(
       'SELECT pg_advisory_xact_lock(hashtextextended($1, 0))',
@@ -3969,10 +4066,15 @@ export class PostgresGroupChatStore {
       if (profile.rows[0].owner_user_id !== userId) {
         throw new HttpError(403, 'forbidden', 'Agent profile owner required');
       }
-      await client.query(
-        'DELETE FROM room_agent_bindings WHERE agent_profile_id = $1',
+      const bindings = await client.query(
+        'SELECT id FROM room_agent_bindings WHERE agent_profile_id = $1 FOR UPDATE',
         [agentProfileId],
       );
+      await this._cancelGenerationRequestsForBindings(
+        client,
+        bindings.rows.map((binding) => binding.id),
+      );
+      await client.query('DELETE FROM room_agent_bindings WHERE agent_profile_id = $1', [agentProfileId]);
       await client.query('DELETE FROM agent_profiles WHERE id = $1', [agentProfileId]);
       return { status: 204 };
     });
@@ -4191,6 +4293,86 @@ export class PostgresGroupChatStore {
         [newId('evt'), roomId, { recipientUserIds }, this.clock()],
       );
     });
+  }
+
+  async leaveRoom({ userId, roomId }) {
+    await this._transaction(async (client) => {
+      const room = await this._room(client, roomId, { lock: true });
+      const membershipResult = await client.query(
+        'SELECT * FROM room_members WHERE room_id = $1 AND user_id = $2 FOR UPDATE',
+        [roomId, userId],
+      );
+      if (membershipResult.rowCount === 0) return;
+      const membership = membershipResult.rows[0];
+      if (membership.role === 'owner') {
+        throw new HttpError(409, 'room_owner_cannot_leave', 'Room owner must delete the room');
+      }
+      await this._removeRoomMember(client, room, userId);
+    });
+  }
+
+  async removeRoomMember({ userId, roomId, targetUserId }) {
+    await this._transaction(async (client) => {
+      const room = await this._room(client, roomId, { lock: true });
+      // Product contract keeps member removal owner-only; admins manage invitations only.
+      if (room.owner_user_id !== userId) {
+        throw new HttpError(403, 'forbidden', 'Room owner required');
+      }
+      const target = await client.query(
+        'SELECT * FROM room_members WHERE room_id = $1 AND user_id = $2 FOR UPDATE',
+        [roomId, targetUserId],
+      );
+      if (target.rowCount === 0) return;
+      if (target.rows[0].role === 'owner') {
+        throw new HttpError(409, 'room_owner_cannot_be_removed', 'Room owner cannot be removed');
+      }
+      await this._removeRoomMember(client, room, targetUserId);
+    });
+  }
+
+  async _removeRoomMember(client, room, targetUserId) {
+    const members = await client.query(
+      'SELECT user_id FROM room_members WHERE room_id = $1',
+      [room.id],
+    );
+    const recipientUserIds = members.rows.map((row) => row.user_id);
+    const bindings = await client.query(
+      `SELECT id FROM room_agent_bindings
+        WHERE room_id = $1 AND owner_user_id = $2
+        FOR UPDATE`,
+      [room.id, targetUserId],
+    );
+    await this._cancelGenerationRequestsForBindings(
+      client,
+      bindings.rows.map((binding) => binding.id),
+    );
+    await client.query(
+      'DELETE FROM room_agent_bindings WHERE room_id = $1 AND owner_user_id = $2',
+      [room.id, targetUserId],
+    );
+    await client.query(
+      'DELETE FROM web_room_reads WHERE room_id = $1 AND user_id = $2',
+      [room.id, targetUserId],
+    );
+    await client.query(
+      'DELETE FROM room_members WHERE room_id = $1 AND user_id = $2',
+      [room.id, targetUserId],
+    );
+    await client.query(
+      'UPDATE rooms SET revision = revision + 1, updated_at = $1 WHERE id = $2',
+      [this.clock(), room.id],
+    );
+    await client.query(
+      `INSERT INTO outbox_events(
+         event_id, event_type, room_id, payload, occurred_at, dispatched_at
+       ) VALUES ($1, 'room.membership_removed', $2, $3, $4, NULL)`,
+      [
+        newId('evt'),
+        room.id,
+        { userId: targetUserId, recipientUserIds },
+        this.clock(),
+      ],
+    );
   }
 
   async getMembership({ userId, roomId }) {
@@ -4442,6 +4624,7 @@ export class PostgresGroupChatStore {
           safeInteger(binding.policy_revision, 'room_agent_bindings.policy_revision')) {
         throw new HttpError(409, 'request_version_conflict', 'Binding revision does not match');
       }
+      await this._cancelGenerationRequestsForBindings(client, [binding.id]);
       await client.query('DELETE FROM room_agent_bindings WHERE id = $1', [binding.id]);
       await this._saveReplay(client, {
         principalId: userId,

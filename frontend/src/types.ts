@@ -161,6 +161,12 @@ export interface RoomDeletedEvent extends WsEvent {
   payload: { roomId: string };
 }
 
+export interface RoomMembershipRemovedEvent extends WsEvent {
+  type: 'room.membership_removed';
+  roomId: string;
+  payload: { userId: string };
+}
+
 export interface ProfileUpdatedEvent extends WsEvent {
   type: 'profile.updated';
   payload: {
